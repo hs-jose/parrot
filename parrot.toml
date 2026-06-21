@@ -1,0 +1,28 @@
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+api_type = "anthropic"
+api_key = "${ANTHROPIC_API_KEY}"
+default_model = "deepseek-v4-flash"
+base_url = "https://api.deepseek.com/anthropic"
+models = ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+denylist = ["rm -rf /", "sudo", "chmod 777"]
+require_confirmation = ["git push", "rm"]
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6

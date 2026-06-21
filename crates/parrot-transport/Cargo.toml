@@ -1,0 +1,16 @@
+[package]
+name = "parrot-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+parrot-protocol = { path = "../parrot-protocol" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

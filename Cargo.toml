@@ -1,0 +1,77 @@
+[package]
+name = "parrot"
+version.workspace = true
+edition.workspace = true
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/parrot-protocol",
+    "crates/parrot-config",
+    "crates/parrot-transport",
+    "crates/parrot-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.9"
+hex = "0.4"
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+dirs = "6"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+async-stream = "0.3"
+glob = "0.3"
+regex = "1"
+rustyline = "15"
+atty = "0.2"
+
+[[bin]]
+name = "parrotd"
+path = "src/daemon/main.rs"
+
+[[bin]]
+name = "parrot"
+path = "src/cli/main.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/integration/e2e_test.rs"
+
+[dependencies]
+parrot-core = { path = "crates/parrot-core" }
+parrot-protocol = { path = "crates/parrot-protocol" }
+parrot-transport = { path = "crates/parrot-transport" }
+parrot-config = { path = "crates/parrot-config" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+futures-util = { workspace = true }
+glob = { workspace = true }
+rustyline = { workspace = true }
+atty = { workspace = true }
+regex = { workspace = true }

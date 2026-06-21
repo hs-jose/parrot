@@ -1,0 +1,26 @@
+# Rust build
+/target
+**/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets & config
+.env
+parrot-token
+
+# Rust
+*.rs.bk
+
+# Project
+.claude/
+.superpowers/
+*.log
+CLAUDE.md
