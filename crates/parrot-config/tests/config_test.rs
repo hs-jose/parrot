@@ -19,7 +19,7 @@ port = 9999
 auth_token_file = "/tmp/test-token"
 
 [[providers]]
-api_type = "anthropic"
+id = "anthropic"
 api_key = "sk-test-key"
 default_model = "claude-sonnet-4-6"
 
@@ -43,7 +43,7 @@ keep_recent_turns = 4
     let config: AppConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(config.daemon.port, 9999);
     assert_eq!(config.providers.len(), 1);
-    assert_eq!(config.providers[0].api_type, "anthropic");
+    assert_eq!(config.providers[0].id, "anthropic");
     assert!(config.tools.file_write_allowed);
     assert_eq!(config.tools.max_file_size_mb, 20);
     assert_eq!(config.session.keep_recent_turns, 4);
@@ -59,7 +59,7 @@ port = 9876
 auth_token_file = "/tmp/token"
 
 [[providers]]
-api_type = "anthropic"
+id = "anthropic"
 api_key = "${TEST_PARROT_KEY}"
 default_model = "claude-sonnet-4-6"
 

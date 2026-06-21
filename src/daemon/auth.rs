@@ -18,6 +18,11 @@ impl Auth {
                 fs::create_dir_all(parent).await?;
             }
             fs::write(token_path, &token).await?;
+            // Restrict the token file to owner-only (0600 on Unix). Required
+            // by the security model (spec §8): the token gates access to the
+            // daemon, so it must not be world/group-readable on multi-user
+            // systems. On Windows this is a no-op (ACLs govern access there).
+            restrict_token_file_permissions(token_path)?;
             info!("Generated new auth token at {:?}", token_path);
             token
         };
@@ -34,6 +39,19 @@ impl Auth {
         let bytes: [u8; 32] = rng.random();
         hex::encode(bytes)
     }
+}
+
+#[cfg(unix)]
+fn restrict_token_file_permissions(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_token_file_permissions(_path: &Path) -> Result<(), std::io::Error> {
+    // Windows uses ACLs, not mode bits. The file is created in the user's
+    // profile dir which is already owner-restricted by default on modern NTFS.
+    Ok(())
 }
 
 #[cfg(test)]

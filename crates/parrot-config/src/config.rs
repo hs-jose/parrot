@@ -20,7 +20,7 @@ pub struct DaemonConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    pub api_type: String,
+    pub id: String,
     pub api_key: String,
     pub default_model: String,
     #[serde(default)]

@@ -4,7 +4,7 @@ port = 9876
 auth_token_file = ""
 
 [[providers]]
-api_type = "anthropic"
+id = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "deepseek-v4-flash"
 base_url = "https://api.deepseek.com/anthropic"

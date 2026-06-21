@@ -180,7 +180,7 @@ fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Pa
     // run_with derives the default GenerateConfig.model from the first provider
     // config, so supply a stub pointing at the mock model.
     config.providers.push(parrot_config::ProviderConfig {
-        api_type: "mock".to_string(),
+        id: "mock".to_string(),
         api_key: String::new(),
         default_model: "mock-model".to_string(),
         base_url: None,
