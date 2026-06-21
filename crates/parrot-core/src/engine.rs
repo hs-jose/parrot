@@ -15,6 +15,7 @@ pub struct ReActEngine {
     provider_registry: Arc<ProviderRegistry>,
     config: GenerateConfig,
     data_dir: std::path::PathBuf,
+    working_dir: std::path::PathBuf,
 }
 
 impl ReActEngine {
@@ -23,8 +24,9 @@ impl ReActEngine {
         provider_registry: Arc<ProviderRegistry>,
         config: GenerateConfig,
         data_dir: std::path::PathBuf,
+        working_dir: std::path::PathBuf,
     ) -> Self {
-        Self { tool_registry, provider_registry, config, data_dir }
+        Self { tool_registry, provider_registry, config, data_dir, working_dir }
     }
 
     pub async fn run(
@@ -40,6 +42,7 @@ impl ReActEngine {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 crate::session::SessionCmd::Chat { message } => {
+                    let ctx_len = context.len();
                     if let Err(e) = self.handle_chat(
                         &message,
                         &mut context,
@@ -48,6 +51,10 @@ impl ReActEngine {
                         &mut event_log,
                     ).await {
                         tracing::error!("Chat handling error: {}", e);
+                        context.truncate(ctx_len);
+                        let _ = event_tx.send(StreamEvent::TextDelta {
+                            delta: format!("\nError: {}\n", e),
+                        }).await;
                         let _ = event_tx.send(StreamEvent::Finish {
                             stop_reason: StopReason::Aborted,
                             usage: Usage { input_tokens: 0, output_tokens: 0 },
@@ -79,6 +86,7 @@ impl ReActEngine {
             content: message.to_string(),
             tool_call_id: None,
             tool_name: None,
+            tool_calls: None,
         });
 
         let _ = event_log.append(EventLogEntry::UserMessage {
@@ -134,13 +142,20 @@ impl ReActEngine {
                         }
                         let _ = event_tx.send(StreamEvent::ToolCallDelta { id, args_delta }).await;
                     }
-                    StreamEvent::ToolCallEnd { id, arguments } => {
-                        // Store the final arguments
-                        if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
-                            tc.arguments_json = Some(arguments.clone());
-                        }
-                        // Merge any accumulated delta arguments
-                        let _ = event_tx.send(StreamEvent::ToolCallEnd { id, arguments }).await;
+                    StreamEvent::ToolCallEnd { id, arguments: _ } => {
+                        // Parse accumulated delta string as JSON (provider may send empty args)
+                        let parsed_args = if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
+                            let parsed = serde_json::from_str(&tc.arguments)
+                                .unwrap_or(serde_json::Value::Object(Default::default()));
+                            tc.arguments_json = Some(parsed.clone());
+                            parsed
+                        } else {
+                            serde_json::Value::Object(Default::default())
+                        };
+                        let _ = event_tx.send(StreamEvent::ToolCallEnd {
+                            id,
+                            arguments: parsed_args,
+                        }).await;
                     }
                     StreamEvent::Finish { stop_reason: sr, usage: u } => {
                         stop_reason = sr;
@@ -153,26 +168,43 @@ impl ReActEngine {
                 }
             }
 
-            // 5. If there's accumulated text, add it to context
-            if !accumulated_text.is_empty() {
+            // 5. Handle tool calls if stop reason is ToolUse
+            if stop_reason == StopReason::ToolUse && !tool_calls.is_empty() {
+                // Send ToolUse finish to signal tool execution phase
+                let _ = event_tx.send(StreamEvent::Finish {
+                    stop_reason: StopReason::ToolUse,
+                    usage: usage.clone(),
+                }).await;
+
+                // Build tool call info for the assistant message
+                let tc_info: Vec<crate::types::ToolCallInfo> = tool_calls
+                    .iter()
+                    .map(|tc| crate::types::ToolCallInfo {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments_json.clone().unwrap_or(serde_json::Value::Null),
+                    })
+                    .collect();
+
+                // Add assistant message with text + tool_use blocks
                 context.push(ChatMessage {
                     role: ChatRole::Assistant,
                     content: accumulated_text.clone(),
                     tool_call_id: None,
                     tool_name: None,
+                    tool_calls: if tc_info.is_empty() { None } else { Some(tc_info) },
                 });
-                let _ = event_log.append(EventLogEntry::AssistantText {
-                    content: accumulated_text,
-                });
-            }
 
-            // 6. Handle tool calls if stop reason is ToolUse
-            if stop_reason == StopReason::ToolUse && !tool_calls.is_empty() {
-                // Add assistant message with tool calls to context
-                // We process each tool call
+                if !accumulated_text.is_empty() {
+                    let _ = event_log.append(EventLogEntry::AssistantText {
+                        content: accumulated_text.clone(),
+                    });
+                }
+
+                // Process each tool call
                 for tc in &tool_calls {
                     let tool_ctx = ToolContext {
-                        working_dir: self.data_dir.clone(),
+                        working_dir: self.working_dir.clone(),
                         max_file_size_bytes: 10 * 1024 * 1024,
                     };
 
@@ -214,13 +246,27 @@ impl ReActEngine {
                         content: output.content,
                         tool_call_id: Some(tc.id.clone()),
                         tool_name: Some(tc.name.clone()),
+                        tool_calls: None,
                     });
                 }
                 // Continue the loop to get the next response
                 continue;
             }
 
-            // 7. End of turn
+            // 7. End of turn — push any accumulated text as assistant message
+            if !accumulated_text.is_empty() {
+                context.push(ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: accumulated_text.clone(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                });
+                let _ = event_log.append(EventLogEntry::AssistantText {
+                    content: accumulated_text,
+                });
+            }
+
             let _ = event_tx.send(StreamEvent::Finish {
                 stop_reason: stop_reason.clone(),
                 usage: usage.clone(),

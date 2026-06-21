@@ -18,7 +18,7 @@ pub enum SessionCmd {
 pub struct SessionHandle {
     pub id: Uuid,
     pub cmd_tx: mpsc::Sender<SessionCmd>,
-    pub event_rx: mpsc::Receiver<StreamEvent>,
+    event_rx: Option<mpsc::Receiver<StreamEvent>>,
     pub abort_handle: AbortHandle,
 }
 
@@ -28,6 +28,7 @@ pub struct SessionManager {
     provider_registry: Arc<ProviderRegistry>,
     default_config: GenerateConfig,
     data_dir: std::path::PathBuf,
+    working_dir: std::path::PathBuf,
 }
 
 impl SessionManager {
@@ -36,6 +37,7 @@ impl SessionManager {
         provider_registry: Arc<ProviderRegistry>,
         default_config: GenerateConfig,
         data_dir: std::path::PathBuf,
+        working_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             sessions: HashMap::new(),
@@ -43,6 +45,7 @@ impl SessionManager {
             provider_registry,
             default_config,
             data_dir,
+            working_dir,
         }
     }
 
@@ -73,6 +76,7 @@ impl SessionManager {
             Arc::clone(&self.provider_registry),
             gen_config,
             session_dir,
+            self.working_dir.clone(),
         );
 
         let abort_handle = tokio::spawn(async move {
@@ -82,7 +86,7 @@ impl SessionManager {
         self.sessions.insert(id, SessionHandle {
             id,
             cmd_tx,
-            event_rx,
+            event_rx: Some(event_rx),
             abort_handle,
         });
 
@@ -97,14 +101,9 @@ impl SessionManager {
         self.sessions.get_mut(id)
     }
 
-    /// Takes the event receiver for a session, leaving `None` in its place.
-    /// This is used by the server to relay events to the client.
+    /// Takes the event receiver for a session. Returns None if already taken or session not found.
     pub fn take_event_receiver(&mut self, id: &Uuid) -> Option<mpsc::Receiver<StreamEvent>> {
-        // We need to temporarily remove and reinsert the handle to take the receiver
-        let mut handle = self.sessions.remove(id)?;
-        let rx = std::mem::replace(&mut handle.event_rx, mpsc::channel::<StreamEvent>(64).1);
-        self.sessions.insert(*id, handle);
-        Some(rx)
+        self.sessions.get_mut(id)?.event_rx.take()
     }
 
     /// Get tool definitions from the tool registry

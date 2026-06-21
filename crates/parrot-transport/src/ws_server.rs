@@ -3,6 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use parrot_protocol::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::accept_hdr_async;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -33,15 +35,70 @@ impl TransportServer for WsTransportServer {
     }
 }
 
+/// Check the `Origin` header on the WebSocket upgrade request.
+///
+/// Per the security model: reject non-empty origins that are not localhost.
+/// An absent Origin is allowed (our own CLI client doesn't send one). This
+/// defends against DNS-rebinding and browser CSRF attacks, where a malicious
+/// web page would issue a cross-origin WS handshake carrying its own Origin.
+///
+/// Allowed when present: `http://localhost:*`, `http://127.0.0.1:*`.
+fn origin_allowed(origin: &str) -> bool {
+    let (scheme, rest) = match origin.split_once("://") {
+        Some(pair) => pair,
+        None => return false, // malformed origin
+    };
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    let host = rest.split('/').next().unwrap_or(rest);
+    let (hostname, _port) = match host.split_once(':') {
+        Some(pair) => pair,
+        None => (host, ""),
+    };
+    hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
+}
+
 /// Accept a single connection on the given listener and upgrade to WebSocket.
 /// Call in a loop after binding.
+///
+/// Validates the `Origin` header during the WS handshake (see `origin_allowed`).
+/// Rejected origins yield `TransportError::OriginRejected`.
 pub async fn accept_connection(
     listener: &tokio::net::TcpListener,
 ) -> Result<ClientConnection, TransportError> {
     let (stream, remote_addr) = listener.accept().await?;
     info!("New connection from {}", remote_addr);
 
-    let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+    let origin_check = |req: &Request, response: Response| {
+        match req.headers().get("Origin").and_then(|v| v.to_str().ok()) {
+            None => Ok(response), // no origin header — allow (local CLI doesn't send one)
+            Some(origin) if origin_allowed(origin) => Ok(response),
+            Some(origin) => {
+                warn!("Rejecting WS upgrade from {}: bad origin {:?}", remote_addr, origin);
+                // Build a 403 response body to signal rejection.
+                let body = format!("Origin not allowed: {origin}\n");
+                let reject = Response::builder()
+                    .status(403)
+                    .body(Some(body))
+                    .expect("valid 403 response");
+                Err(reject)
+            }
+        }
+    };
+
+    let ws_stream = match accept_hdr_async(stream, origin_check).await {
+        Ok(s) => s,
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            // Our callback returns a 403 when the Origin is rejected; the
+            // handshake surfaces that as an Http error carrying the response.
+            let status = resp.status().as_u16();
+            return Err(TransportError::OriginRejected(format!(
+                "WS handshake rejected (status {status})"
+            )));
+        }
+        Err(e) => return Err(TransportError::WsError(e)),
+    };
     let (ws_sink, ws_stream) = ws_stream.split();
 
     let (client_tx, mut client_rx) = mpsc::channel::<ServerMessage>(CHANNEL_BUFFER);

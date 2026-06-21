@@ -53,6 +53,9 @@ path = "src/cli/main.rs"
 name = "e2e"
 path = "tests/integration/e2e_test.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 parrot-core = { path = "crates/parrot-core" }
 parrot-protocol = { path = "crates/parrot-protocol" }

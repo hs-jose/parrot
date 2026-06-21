@@ -26,6 +26,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     crate::tools::register_all(&tool_registry, &config).await;
     crate::providers::register_all(&provider_registry, &config).await;
 
+    run_with(config, auth, provider_registry, tool_registry).await
+}
+
+/// Run the daemon with pre-built registries. Exposed so integration tests can
+/// inject a mock `LlmProvider` (and custom tools) instead of loading real
+/// providers from config.
+pub async fn run_with(
+    config: AppConfig,
+    auth: Arc<Auth>,
+    provider_registry: Arc<ProviderRegistry>,
+    tool_registry: Arc<ToolRegistry>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Create default generate config from first provider
     let default_config = config.providers.first()
         .map(|p| GenerateConfig {
@@ -39,6 +51,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::path::PathBuf::from(&config.session.data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let token_path = std::path::PathBuf::from(&config.daemon.auth_token_file);
     info!("Parrot daemon starting on {}:{}; token file at {:?}",
           config.daemon.host, config.daemon.port, token_path);
 
@@ -48,6 +63,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&provider_registry),
         default_config,
         data_dir,
+        working_dir,
     )));
 
     // Create the WS transport server and bind

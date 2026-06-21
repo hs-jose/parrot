@@ -14,4 +14,6 @@ pub enum TransportError {
     Io(#[from] std::io::Error),
     #[error("connection refused: {0}")]
     ConnectionRefused(String),
+    #[error("origin rejected: {0}")]
+    OriginRejected(String),
 }
