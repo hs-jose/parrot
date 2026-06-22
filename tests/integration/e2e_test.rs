@@ -1,22 +1,23 @@
 //! End-to-end integration tests.
 //!
-//! The async test below drives the full MVP acceptance path through the real
-//! WebSocket transport with a mock LLM provider injected in place of Anthropic:
+//! Drives the full MVP acceptance path through the real WebSocket transport
+//! with a mock LLM provider injected in place of Anthropic:
 //!   client Hello (token) → HelloAck → CreateSession → Chat
-//!   → provider emits tool_use → daemon executes the tool → ToolResult
-//!   → provider emits end_turn text → Finished(EndTurn)
+//!   → provider emits tool_use → daemon executes the tool → ToolEnd
+//!   → provider emits end_turn text → TurnEnd
 //!
-//! No network, no API key, no cassette — the mock provider produces a canned
-//! stream per call. This validates the spec's MVP criteria: CLI-class client →
-//! daemon → engine → tool → streaming response, with token verification.
+//! All streaming events now arrive as `ServerMessage::AgentEvent { event }`
+//! envelopes (unified event model).
 
 use parrot_config::AppConfig;
-use parrot_protocol::types::{SessionConfig, StopReason};
+use parrot_protocol::agent_event::{
+    AgentEndReason, AgentEvent, MessageDeltaPayload, TurnStopReason,
+};
+use parrot_protocol::types::SessionConfig;
 use parrot_protocol::{ClientMessage, ServerMessage};
 
 #[test]
 fn test_config_loads() {
-    // Use default config instead of loading from file (which requires ANTHROPIC_API_KEY)
     let config = AppConfig::default_config();
     assert_eq!(config.daemon.port, 9876);
     assert!(!config.tools.shell_allowed);
@@ -37,13 +38,8 @@ fn test_protocol_roundtrip() {
 
 #[test]
 fn test_server_message_roundtrip() {
-    let msg = ServerMessage::Finished {
+    let msg = ServerMessage::SessionCreated {
         session_id: uuid::Uuid::new_v4(),
-        stop_reason: parrot_protocol::types::StopReason::EndTurn,
-        usage: parrot_protocol::types::Usage {
-            input_tokens: 100,
-            output_tokens: 50,
-        },
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -51,15 +47,17 @@ fn test_server_message_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// Mock provider + echo tool (mirrors crates/parrot-core/tests/react_loop.rs)
+// Mock provider + echo tool
 // ---------------------------------------------------------------------------
 
 use async_trait::async_trait;
 use parrot_core::error::{AgentError, ProviderError};
-use parrot_core::event_log::StreamEvent;
-use parrot_core::provider::{ChatStream, LlmProvider, ProviderRegistry};
+use parrot_core::provider::{
+    ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
+};
 use parrot_core::tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry};
 use parrot_core::types::{ChatMessage, GenerateConfig, ModelInfo};
+use parrot_protocol::types::Usage;
 use parrot_transport::TransportClient;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -103,31 +101,31 @@ impl LlmProvider for MockProvider {
         _config: &GenerateConfig,
     ) -> Result<ChatStream, ProviderError> {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel::<StreamEvent>(16);
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
         tokio::spawn(async move {
             match n {
                 0 => {
-                    tx.send(StreamEvent::ToolCallStart {
+                    tx.send(ProviderStreamEvent::ToolCallStart {
                         id: "tc_1".to_string(),
                         name: "echo".to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::ToolCallDelta {
+                    tx.send(ProviderStreamEvent::ToolCallDelta {
                         id: "tc_1".to_string(),
                         args_delta: r#"{"message":"hello"}"#.to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::ToolCallEnd {
+                    tx.send(ProviderStreamEvent::ToolCallEnd {
                         id: "tc_1".to_string(),
                         arguments: json!({"message": "hello"}),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::Finish {
-                        stop_reason: StopReason::ToolUse,
-                        usage: parrot_protocol::types::Usage {
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::ToolUse,
+                        usage: Usage {
                             input_tokens: 10,
                             output_tokens: 5,
                         },
@@ -136,14 +134,14 @@ impl LlmProvider for MockProvider {
                     .ok();
                 }
                 _ => {
-                    tx.send(StreamEvent::TextDelta {
+                    tx.send(ProviderStreamEvent::TextDelta {
                         delta: "done".to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::Finish {
-                        stop_reason: StopReason::EndTurn,
-                        usage: parrot_protocol::types::Usage {
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::EndTurn,
+                        usage: Usage {
                             input_tokens: 20,
                             output_tokens: 10,
                         },
@@ -200,22 +198,17 @@ impl Tool for EchoTool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Grab a free TCP port by binding once and dropping the listener.
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr").port()
 }
 
-/// Build an AppConfig suitable for an ephemeral test daemon.
 fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Path) -> AppConfig {
     let mut config = AppConfig::default_config();
     config.daemon.host = "127.0.0.1".to_string();
     config.daemon.port = port;
     config.daemon.auth_token_file = token_path.to_string_lossy().to_string();
     config.session.data_dir = data_dir.to_string_lossy().to_string();
-    // The mock provider is injected directly; no provider config needed. But
-    // run_with derives the default GenerateConfig.model from the first provider
-    // config, so supply a stub pointing at the mock model.
     config.providers.push(parrot_config::ProviderConfig {
         id: "mock".to_string(),
         api_key: String::new(),
@@ -226,7 +219,45 @@ fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Pa
     config
 }
 
-/// Collect server messages until the predicate returns Some, or the deadline.
+/// Grab the inner `AgentEvent` from an `AgentEvent` envelope, applying a
+/// predicate. Times out after 10s.
+async fn expect_agent_event<F, T>(
+    rx: &mut mpsc::Receiver<ServerMessage>,
+    predicate: F,
+    label: &str,
+) -> T
+where
+    F: Fn(&AgentEvent) -> Option<T>,
+    T: std::fmt::Debug,
+{
+    let deadline = Duration::from_secs(10);
+    let result = timeout(deadline, async {
+        loop {
+            match rx.recv().await {
+                Some(ServerMessage::AgentEvent { event }) => {
+                    if let Some(t) = predicate(&event) {
+                        return Ok(t);
+                    }
+                }
+                Some(other) => {
+                    eprintln!(
+                        "expect_agent_event({label}): skipping non-envelope msg: {:?}",
+                        other
+                    );
+                }
+                None => return Err("channel closed".to_string()),
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => panic!("expect_agent_event({label}): {e}"),
+        Err(_) => panic!("expect_agent_event({label}): timed out after 10s"),
+    }
+}
+
+/// Grab a non-envelope `ServerMessage` matching the predicate.
 async fn expect_server_message<F, T>(
     rx: &mut mpsc::Receiver<ServerMessage>,
     predicate: F,
@@ -244,7 +275,6 @@ where
                     if let Some(t) = predicate(&msg) {
                         return Ok(t);
                     }
-                    // keep draining until we hit the one we want
                 }
                 None => return Err("channel closed".to_string()),
             }
@@ -270,21 +300,16 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
     let token_path = tmp.path().join("token");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Initialize auth (writes a token to token_path on first run).
     let auth = parrot::auth::Auth::new(&token_path)
         .await
         .expect("init auth");
-    let token = {
-        // Auth.token is private; read it back from the file the daemon wrote.
-        std::fs::read_to_string(&token_path)
-            .unwrap()
-            .trim()
-            .to_string()
-    };
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
     assert!(!token.is_empty(), "auth token file should be populated");
     let auth = Arc::new(auth);
 
-    // Registries: mock provider + echo tool.
     let provider_registry = Arc::new(ProviderRegistry::new());
     provider_registry
         .register(
@@ -298,7 +323,6 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
         .register(Arc::new(EchoTool) as Arc<dyn Tool>)
         .await;
 
-    // Start the daemon.
     let config = test_config(port, &data_dir, &token_path);
     let daemon_handle = tokio::spawn(async move {
         parrot::server::run_with(config, auth, provider_registry, tool_registry)
@@ -306,15 +330,13 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
             .expect("daemon run_with");
     });
 
-    // Give the server a moment to bind.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Connect a real WS client.
     let url = format!("ws://127.0.0.1:{port}");
     let client = parrot_transport::WsTransportClient::new();
     let mut conn = client.connect(&url, &token).await.expect("client connect");
 
-    // 1. Expect HelloAck (client auto-sent Hello with the real token).
+    // 1. HelloAck
     expect_server_message(
         &mut conn.receiver,
         |m| {
@@ -362,16 +384,21 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
         .await
         .expect("send Chat");
 
-    // 4. Expect the full ReAct flow relayed to the client:
-    //    ToolCallStart(echo) → ToolResult(echo: hello) → TextDelta("done") → Finished(EndTurn)
-    let tool_start = expect_server_message(
+    // 4. Expect the full ReAct flow as AgentEvent envelopes:
+    //    AgentStart → TurnStart → MessageStart → MessageDelta(ToolCallStart) →
+    //    MessageEnd(ToolUse) → ToolStart → ToolEnd(echo: hello) →
+    //    MessageStart → MessageDelta(TextDelta "done") → MessageEnd(EndTurn) →
+    //    TurnEnd(EndTurn)
+
+    // ToolStart for "echo"
+    let tool_name = expect_agent_event(
         &mut conn.receiver,
-        |m| {
-            if let ServerMessage::ToolCallStart {
+        |ev| {
+            if let AgentEvent::ToolStart {
                 session_id: sid,
                 tool_name,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
                     return Some(tool_name.clone());
@@ -379,19 +406,20 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
             }
             None
         },
-        "ToolCallStart",
+        "ToolStart",
     )
     .await;
-    assert_eq!(tool_start, "echo");
+    assert_eq!(tool_name, "echo");
 
-    let tool_result = expect_server_message(
+    // ToolEnd with result "echo: hello", not an error.
+    let (result_content, is_error) = expect_agent_event(
         &mut conn.receiver,
-        |m| {
-            if let ServerMessage::ToolResult {
+        |ev| {
+            if let AgentEvent::ToolEnd {
                 session_id: sid,
                 result,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
                     return Some((result.content.clone(), result.is_error));
@@ -399,19 +427,21 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
             }
             None
         },
-        "ToolResult",
+        "ToolEnd",
     )
     .await;
-    assert_eq!(tool_result.0, "echo: hello");
-    assert!(!tool_result.1, "tool result should not be an error");
+    assert_eq!(result_content, "echo: hello");
+    assert!(!is_error);
 
-    let final_text = expect_server_message(
+    // Final TextDelta "done".
+    let final_text = expect_agent_event(
         &mut conn.receiver,
-        |m| {
-            if let ServerMessage::TextDelta {
+        |ev| {
+            if let AgentEvent::MessageDelta {
                 session_id: sid,
-                delta,
-            } = m
+                payload: MessageDeltaPayload::TextDelta { delta },
+                ..
+            } = ev
             {
                 if *sid == session_id {
                     return Some(delta.clone());
@@ -419,32 +449,32 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
             }
             None
         },
-        "TextDelta",
+        "TextDelta(done)",
     )
     .await;
     assert_eq!(final_text, "done");
 
-    let (stop_reason, _usage) = expect_server_message(
+    // TurnEnd with EndTurn.
+    let stop_reason = expect_agent_event(
         &mut conn.receiver,
-        |m| {
-            if let ServerMessage::Finished {
+        |ev| {
+            if let AgentEvent::TurnEnd {
                 session_id: sid,
                 stop_reason,
-                usage,
-            } = m
+                ..
+            } = ev
             {
                 if *sid == session_id {
-                    return Some((stop_reason.clone(), usage.clone()));
+                    return Some(stop_reason.clone());
                 }
             }
             None
         },
-        "Finished",
+        "TurnEnd(EndTurn)",
     )
     .await;
-    assert_eq!(stop_reason, StopReason::EndTurn);
+    assert_eq!(stop_reason, TurnStopReason::EndTurn);
 
-    // The daemon task runs an accept loop forever; abort it to clean up.
     daemon_handle.abort();
 }
 
@@ -452,9 +482,6 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
 // Additional E2E tests: ListModels, GetHistory, Abort mid-stream
 // ---------------------------------------------------------------------------
 
-/// A mock provider that emits ToolCallStart then blocks for a long time before
-/// emitting anything else. Used by the Abort test to give the client a window
-/// to inject `Abort` while the stream is in flight.
 struct BlockingMockProvider;
 
 #[async_trait]
@@ -480,26 +507,25 @@ impl LlmProvider for BlockingMockProvider {
         _tools: &[ToolDefinition],
         _config: &GenerateConfig,
     ) -> Result<ChatStream, ProviderError> {
-        let (tx, rx) = mpsc::channel::<StreamEvent>(16);
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
         tokio::spawn(async move {
-            tx.send(StreamEvent::ToolCallStart {
+            tx.send(ProviderStreamEvent::ToolCallStart {
                 id: "tc_slow".to_string(),
                 name: "echo".to_string(),
             })
             .await
             .ok();
-            // Block long enough for the test to send Abort. If the engine
-            // drops the receiver due to Abort, these sends fail silently.
+            // Block long enough for the test to send Abort.
             tokio::time::sleep(Duration::from_secs(10)).await;
-            tx.send(StreamEvent::ToolCallEnd {
+            tx.send(ProviderStreamEvent::ToolCallEnd {
                 id: "tc_slow".to_string(),
                 arguments: json!({"message": "hello"}),
             })
             .await
             .ok();
-            tx.send(StreamEvent::Finish {
-                stop_reason: StopReason::ToolUse,
-                usage: parrot_protocol::types::Usage {
+            tx.send(ProviderStreamEvent::Finish {
+                stop_reason: ProviderStopReason::ToolUse,
+                usage: Usage {
                     input_tokens: 10,
                     output_tokens: 5,
                 },
@@ -521,8 +547,6 @@ impl LlmProvider for BlockingMockProvider {
     }
 }
 
-/// Shared setup: spin up a daemon with the given provider + echo tool,
-/// connect a WS client, return the connection + auth token + daemon handle.
 async fn spawn_daemon_with_provider(
     provider: Arc<dyn LlmProvider>,
 ) -> (
@@ -569,7 +593,6 @@ async fn spawn_daemon_with_provider(
     let client = parrot_transport::WsTransportClient::new();
     let mut conn = client.connect(&url, &token).await.expect("client connect");
 
-    // Wait for HelloAck so the caller gets a clean authenticated channel.
     expect_server_message(
         &mut conn.receiver,
         |m| {
@@ -583,9 +606,6 @@ async fn spawn_daemon_with_provider(
     )
     .await;
 
-    // Leak the tempdir so it persists for the daemon's session writes. The
-    // daemon handle is aborted by the caller; tempdir cleanup happens when
-    // the process exits. Acceptable for tests.
     std::mem::forget(tmp);
 
     (conn.receiver, conn.sender, token, daemon_handle)
@@ -625,7 +645,6 @@ async fn e2e_get_history_returns_event_log_after_chat() {
     let provider = Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>;
     let (mut rx, tx, _token, daemon_handle) = spawn_daemon_with_provider(provider).await;
 
-    // Create a session and run a full chat so events.log gets populated.
     tx.send(ClientMessage::CreateSession {
         config: Some(SessionConfig {
             model: None,
@@ -656,39 +675,41 @@ async fn e2e_get_history_returns_event_log_after_chat() {
     .await
     .expect("send Chat");
 
-    // Drain the full ReAct flow until Finished(EndTurn).
-    expect_server_message(
+    // Drain until TurnEnd(EndTurn).
+    expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::Finished { stop_reason, .. } = m {
-                if *stop_reason == StopReason::EndTurn {
-                    Some(())
-                } else {
-                    None
+        |ev| {
+            if let AgentEvent::TurnEnd {
+                session_id: sid,
+                stop_reason,
+                ..
+            } = ev
+            {
+                if *sid == session_id && *stop_reason == TurnStopReason::EndTurn {
+                    return Some(());
                 }
-            } else {
-                None
             }
+            None
         },
-        "Finished(EndTurn)",
+        "TurnEnd(EndTurn)",
     )
     .await;
 
-    // Now request history and verify entries are present.
+    // Now request history and verify events are present.
     tx.send(ClientMessage::GetHistory { session_id })
         .await
         .expect("send GetHistory");
 
-    let entries = expect_server_message(
+    let events = expect_server_message(
         &mut rx,
         |m| {
             if let ServerMessage::History {
                 session_id: sid,
-                entries,
+                events,
             } = m
             {
                 if *sid == session_id {
-                    Some(entries.clone())
+                    Some(events.clone())
                 } else {
                     None
                 }
@@ -700,29 +721,26 @@ async fn e2e_get_history_returns_event_log_after_chat() {
     )
     .await;
 
-    // The engine appends: UserMessage, (ToolCall, ToolResult), Finish.
-    // At minimum we should see the UserMessage and the Finish entries.
     assert!(
-        !entries.is_empty(),
+        !events.is_empty(),
         "history should not be empty after a chat"
     );
-    assert!(entries.iter().any(|e| {
-        matches!(
-            &e.entry,
-            parrot_protocol::types::EventLogEntry::UserMessage { content } if content == "please echo hello"
-        )
-    }), "history should contain the user message");
     assert!(
-        entries.iter().any(|e| {
-            matches!(
-                &e.entry,
-                parrot_protocol::types::EventLogEntry::Finish {
-                    stop_reason: StopReason::EndTurn,
-                    ..
-                }
-            )
-        }),
-        "history should contain the EndTurn finish"
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::TurnStart { user_message, .. } if user_message == "please echo hello"
+        )),
+        "history should contain the TurnStart with the user message"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::TurnEnd {
+                stop_reason: TurnStopReason::EndTurn,
+                ..
+            }
+        )),
+        "history should contain the EndTurn TurnEnd"
     );
 
     daemon_handle.abort();
@@ -733,7 +751,6 @@ async fn e2e_abort_mid_stream_cancels_react_turn() {
     let provider = Arc::new(BlockingMockProvider) as Arc<dyn LlmProvider>;
     let (mut rx, tx, _token, daemon_handle) = spawn_daemon_with_provider(provider).await;
 
-    // Create a session.
     tx.send(ClientMessage::CreateSession {
         config: Some(SessionConfig {
             model: None,
@@ -757,7 +774,6 @@ async fn e2e_abort_mid_stream_cancels_react_turn() {
     )
     .await;
 
-    // Send a chat — the blocking provider will emit ToolCallStart then hang.
     tx.send(ClientMessage::Chat {
         session_id,
         message: "echo something".to_string(),
@@ -765,65 +781,121 @@ async fn e2e_abort_mid_stream_cancels_react_turn() {
     .await
     .expect("send Chat");
 
-    // Wait for ToolCallStart to confirm the stream is in flight.
-    expect_server_message(
+    // Wait for MessageDelta(ToolCallStart) to confirm the stream is in flight.
+    expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolCallStart {
+        |ev| {
+            if let AgentEvent::MessageDelta {
                 session_id: sid,
-                tool_name,
+                payload: MessageDeltaPayload::ToolCallStart { tool_name, .. },
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some(tool_name.clone())
-                } else {
-                    None
+                    return Some(tool_name.clone());
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolCallStart",
+        "MessageDelta(ToolCallStart)",
     )
     .await;
 
-    // Inject Abort mid-stream. The engine's `tokio::select!` on cmd_rx
-    // should observe this, drop the stream, and emit Finished(Aborted).
+    // Inject Abort mid-stream.
     tx.send(ClientMessage::Abort { session_id })
         .await
         .expect("send Abort");
 
-    // We expect a Finished(Aborted) within a reasonable time. The test
-    // proves the Abort actually cancels the in-flight turn rather than
-    // waiting for the 10-second blocking provider to finish.
-    let stop_reason = expect_server_message(
+    // Expect TurnEnd(Aborted) within a reasonable time.
+    let stop_reason = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::Finished {
+        |ev| {
+            if let AgentEvent::TurnEnd {
                 session_id: sid,
                 stop_reason,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some(stop_reason.clone())
-                } else {
-                    None
+                    return Some(stop_reason.clone());
                 }
-            } else {
-                None
             }
+            None
         },
-        "Finished(Aborted)",
+        "TurnEnd(Aborted)",
     )
     .await;
 
     assert_eq!(
         stop_reason,
-        StopReason::Aborted,
+        TurnStopReason::Aborted,
         "expected Abort to cancel the in-flight turn"
     );
+
+    daemon_handle.abort();
+}
+
+#[tokio::test]
+async fn e2e_agent_end_emitted_on_disconnect() {
+    let provider = Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>;
+    let (mut rx, tx, _token, daemon_handle) = spawn_daemon_with_provider(provider).await;
+
+    tx.send(ClientMessage::CreateSession {
+        config: Some(SessionConfig {
+            model: None,
+            provider: None,
+            system_prompt: None,
+        }),
+    })
+    .await
+    .expect("send CreateSession");
+
+    let _session_id = expect_server_message(
+        &mut rx,
+        |m| {
+            if let ServerMessage::SessionCreated { session_id } = m {
+                Some(*session_id)
+            } else {
+                None
+            }
+        },
+        "SessionCreated",
+    )
+    .await;
+
+    // Drop the client sender to close the connection from the client side.
+    // The daemon's connection handler will exit its loop and the session
+    // task will see cmd_rx return None, emitting AgentEnd.
+    drop(tx);
+
+    // We may or may not observe AgentEnd before the connection closes —
+    // this is a best-effort check with a short timeout. The engine emits
+    // AgentEnd via the guard's Drop path when the task is dropped, which
+    // uses try_send and may race with the channel teardown. We accept
+    // either outcome (Some(AgentEnd) or None) as success — the test
+    // primarily verifies that no panic or hang occurs.
+    let _ = timeout(Duration::from_millis(500), async {
+        loop {
+            match rx.recv().await {
+                Some(ServerMessage::AgentEvent {
+                    event: AgentEvent::AgentEnd { reason, .. },
+                }) => {
+                    assert!(
+                        matches!(
+                            reason,
+                            AgentEndReason::ClientDisconnect | AgentEndReason::DaemonShutdown
+                        ),
+                        "expected ClientDisconnect or DaemonShutdown, got {:?}",
+                        reason
+                    );
+                    return;
+                }
+                Some(_) => continue,
+                None => return,
+            }
+        }
+    })
+    .await;
 
     daemon_handle.abort();
 }

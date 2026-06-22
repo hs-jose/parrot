@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use parrot_core::error::ProviderError;
-use parrot_core::event_log::StreamEvent;
-use parrot_core::provider::{ChatStream, LlmProvider};
+use parrot_core::provider::{ChatStream, LlmProvider, ProviderStopReason, ProviderStreamEvent};
 use parrot_core::tool::ToolDefinition;
 use parrot_core::types::{ChatMessage, ChatRole, GenerateConfig, ModelInfo, ToolCallInfo};
-use parrot_protocol::types::{StopReason, Usage};
+use parrot_protocol::types::Usage;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -355,18 +354,13 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
-fn parse_stop_reason(reason: &str) -> StopReason {
-    match reason {
-        "end_turn" => StopReason::EndTurn,
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::MaxTokens,
-        _ => StopReason::EndTurn,
-    }
+fn parse_stop_reason(reason: &str) -> ProviderStopReason {
+    ProviderStopReason::from_anthropic(reason)
 }
 
 async fn parse_sse_stream(
     response: reqwest::Response,
-    tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    tx: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
 ) -> Result<(), ProviderError> {
     use futures_util::StreamExt;
 
@@ -442,7 +436,9 @@ async fn parse_sse_stream(
                                 .unwrap_or("")
                                 .to_string();
                             tool_index_to_id.insert(index, id.clone());
-                            let _ = tx.send(StreamEvent::ToolCallStart { id, name }).await;
+                            let _ = tx
+                                .send(ProviderStreamEvent::ToolCallStart { id, name })
+                                .await;
                         }
                     }
                 }
@@ -456,7 +452,7 @@ async fn parse_sse_stream(
                             "text_delta" => {
                                 if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                                     let _ = tx
-                                        .send(StreamEvent::TextDelta {
+                                        .send(ProviderStreamEvent::TextDelta {
                                             delta: text.to_string(),
                                         })
                                         .await;
@@ -472,7 +468,7 @@ async fn parse_sse_stream(
                                             .or_default()
                                             .push_str(partial);
                                         let _ = tx
-                                            .send(StreamEvent::ToolCallDelta {
+                                            .send(ProviderStreamEvent::ToolCallDelta {
                                                 id: tool_id.clone(),
                                                 args_delta: partial.to_string(),
                                             })
@@ -494,7 +490,7 @@ async fn parse_sse_stream(
                         let arguments = serde_json::from_str(args_str)
                             .unwrap_or(Value::Object(serde_json::Map::new()));
                         let _ = tx
-                            .send(StreamEvent::ToolCallEnd {
+                            .send(ProviderStreamEvent::ToolCallEnd {
                                 id: tool_id.clone(),
                                 arguments,
                             })
@@ -515,7 +511,7 @@ async fn parse_sse_stream(
                             .and_then(|v| v.as_str())
                             .unwrap_or("end_turn");
                         let _ = tx
-                            .send(StreamEvent::Finish {
+                            .send(ProviderStreamEvent::Finish {
                                 stop_reason: parse_stop_reason(stop_reason),
                                 usage: current_usage.clone(),
                             })

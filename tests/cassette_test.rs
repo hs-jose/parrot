@@ -25,11 +25,9 @@
 
 use async_trait::async_trait;
 use parrot_core::error::{AgentError, ProviderError};
-use parrot_core::event_log::StreamEvent;
-use parrot_core::provider::{ChatStream, LlmProvider};
+use parrot_core::provider::{ChatStream, LlmProvider, ProviderStreamEvent};
 use parrot_core::tool::{Tool, ToolContext, ToolDefinition, ToolOutput};
 use parrot_core::types::{ChatMessage, GenerateConfig, ModelInfo};
-use parrot_protocol::types::StopReason;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -46,7 +44,7 @@ struct Cassette {
     name: String,
     #[allow(dead_code)]
     description: Option<String>,
-    events: Vec<StreamEvent>,
+    events: Vec<ProviderStreamEvent>,
 }
 
 fn load_cassette(name: &str) -> Cassette {
@@ -117,7 +115,7 @@ impl LlmProvider for CassetteProvider {
         let idx = (n as usize).min(self.cassettes.len() - 1);
         let events = self.cassettes[idx].events.clone();
 
-        let (tx, rx) = mpsc::channel::<StreamEvent>(16);
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
         tokio::spawn(async move {
             for event in events {
                 if tx.send(event).await.is_err() {
@@ -193,50 +191,47 @@ async fn cassette_simple_text_turn() {
     .await
     .expect("send Chat");
 
-    let text = expect_server_message(
+    // Expect a TextDelta via the AgentEvent envelope.
+    let text = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::TextDelta {
+        |ev| {
+            if let AgentEvent::MessageDelta {
                 session_id: sid,
-                delta,
-            } = m
+                payload: MessageDeltaPayload::TextDelta { delta },
+                ..
+            } = ev
             {
                 if *sid == session_id {
-                    Some(delta.clone())
-                } else {
-                    None
+                    return Some(delta.clone());
                 }
-            } else {
-                None
             }
+            None
         },
         "TextDelta",
     )
     .await;
     assert_eq!(text, "Hello from the cassette.");
 
-    let stop = expect_server_message(
+    // Expect TurnEnd(EndTurn).
+    let stop = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::Finished {
+        |ev| {
+            if let AgentEvent::TurnEnd {
                 session_id: sid,
                 stop_reason,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some(stop_reason.clone())
-                } else {
-                    None
+                    return Some(stop_reason.clone());
                 }
-            } else {
-                None
             }
+            None
         },
-        "Finished",
+        "TurnEnd(EndTurn)",
     )
     .await;
-    assert_eq!(stop, StopReason::EndTurn);
+    assert_eq!(stop, TurnStopReason::EndTurn);
 
     daemon_handle.abort();
 }
@@ -259,101 +254,90 @@ async fn cassette_react_loop_with_tool_use() {
     .await
     .expect("send Chat");
 
-    // 1. ToolCallStart(echo)
-    let tool_name = expect_server_message(
+    // 1. ToolStart(echo)
+    let tool_name = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolCallStart {
+        |ev| {
+            if let AgentEvent::ToolStart {
                 session_id: sid,
                 tool_name,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some(tool_name.clone())
-                } else {
-                    None
+                    return Some(tool_name.clone());
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolCallStart",
+        "ToolStart",
     )
     .await;
     assert_eq!(tool_name, "echo");
 
-    // 2. ToolResult(echo: hello)
-    let (result_content, is_error) = expect_server_message(
+    // 2. ToolEnd(echo: hello)
+    let (result_content, is_error) = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolResult {
+        |ev| {
+            if let AgentEvent::ToolEnd {
                 session_id: sid,
                 result,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some((result.content.clone(), result.is_error))
-                } else {
-                    None
+                    return Some((result.content.clone(), result.is_error));
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolResult",
+        "ToolEnd",
     )
     .await;
     assert_eq!(result_content, "echo: hello");
     assert!(!is_error);
 
     // 3. Final TextDelta("done") from the second cassette
-    let final_text = expect_server_message(
+    let final_text = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::TextDelta {
+        |ev| {
+            if let AgentEvent::MessageDelta {
                 session_id: sid,
-                delta,
-            } = m
+                payload: MessageDeltaPayload::TextDelta { delta },
+                ..
+            } = ev
             {
                 if *sid == session_id {
-                    Some(delta.clone())
-                } else {
-                    None
+                    return Some(delta.clone());
                 }
-            } else {
-                None
             }
+            None
         },
         "TextDelta(done)",
     )
     .await;
     assert_eq!(final_text, "done");
 
-    // 4. Finished(EndTurn)
-    let stop = expect_server_message(
+    // 4. TurnEnd(EndTurn)
+    let stop = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::Finished {
+        |ev| {
+            if let AgentEvent::TurnEnd {
                 session_id: sid,
                 stop_reason,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some(stop_reason.clone())
-                } else {
-                    None
+                    return Some(stop_reason.clone());
                 }
-            } else {
-                None
             }
+            None
         },
-        "Finished(EndTurn)",
+        "TurnEnd(EndTurn)",
     )
     .await;
-    assert_eq!(stop, StopReason::EndTurn);
+    assert_eq!(stop, TurnStopReason::EndTurn);
 
     daemon_handle.abort();
 }
@@ -367,6 +351,7 @@ async fn cassette_react_loop_with_tool_use() {
 use parrot_config::AppConfig;
 use parrot_core::provider::ProviderRegistry;
 use parrot_core::tool::ToolRegistry;
+use parrot_protocol::agent_event::{AgentEvent, MessageDeltaPayload, TurnStopReason};
 use parrot_protocol::types::SessionConfig;
 use parrot_protocol::{ClientMessage, ServerMessage};
 use parrot_transport::TransportClient;
@@ -513,5 +498,38 @@ where
         Ok(Ok(t)) => t,
         Ok(Err(e)) => panic!("expect_server_message({label}): {e}"),
         Err(_) => panic!("expect_server_message({label}): timed out after 10s"),
+    }
+}
+
+async fn expect_agent_event<F, T>(
+    rx: &mut mpsc::Receiver<ServerMessage>,
+    predicate: F,
+    label: &str,
+) -> T
+where
+    F: Fn(&AgentEvent) -> Option<T>,
+    T: std::fmt::Debug,
+{
+    let deadline = Duration::from_secs(10);
+    let result = timeout(deadline, async {
+        loop {
+            match rx.recv().await {
+                Some(ServerMessage::AgentEvent { event }) => {
+                    if let Some(t) = predicate(&event) {
+                        return Ok(t);
+                    }
+                }
+                Some(other) => {
+                    eprintln!("expect_agent_event({label}): skipping: {:?}", other);
+                }
+                None => return Err("channel closed".to_string()),
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => panic!("expect_agent_event({label}): {e}"),
+        Err(_) => panic!("expect_agent_event({label}): timed out after 10s"),
     }
 }

@@ -3,15 +3,7 @@ use uuid::Uuid;
 
 pub type SessionId = Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum StopReason {
-    EndTurn,
-    ToolUse,
-    MaxTokens,
-    Aborted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -51,54 +43,6 @@ pub struct ModelInfo {
     pub provider: String,
     pub context_window: u32,
     pub max_output_tokens: u32,
-}
-
-/// One event in a session's append-only event log. Persisted to
-/// `{data_dir}/sessions/{id}/events.log` as one JSON line per entry (wrapped
-/// in `EventLogEntryWithMeta`), and replayed both for `GetHistory` responses
-/// and for session recovery.
-///
-/// Tagged `#[serde(tag = "type")]` so each serialized line carries its variant
-/// name at the top level — `events.log` is human-greppable.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub enum EventLogEntry {
-    SessionCreated {
-        model: String,
-        provider: String,
-    },
-    UserMessage {
-        content: String,
-    },
-    AssistantText {
-        content: String,
-    },
-    ToolCall {
-        tool_id: String,
-        tool_name: String,
-        arguments: serde_json::Value,
-    },
-    ToolResult {
-        tool_id: String,
-        output: ToolOutput,
-    },
-    Finish {
-        stop_reason: StopReason,
-        usage: Usage,
-    },
-}
-
-
-/// An `EventLogEntry` plus the metadata required to reconstruct ordering and
-/// timing on replay. This is the unit that's both:
-///   - persisted to `events.log` (one JSON line per entry), and
-///   - sent over the wire in `ServerMessage::History`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EventLogEntryWithMeta {
-    pub seq: u64,
-    pub ts: chrono::DateTime<chrono::Utc>,
-    #[serde(flatten)]
-    pub entry: EventLogEntry,
 }
 
 /// Client's decision on a `ToolCallConfirmationRequired` request. See

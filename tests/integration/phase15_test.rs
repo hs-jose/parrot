@@ -1,19 +1,19 @@
 //! Phase 1.5 integration tests: ListSessions, ResumeSession, ToolList, and
 //! the ConfirmToolCall flow (approve / reject / timeout).
 //!
-//! Each test spins up a daemon with a mock provider + echo tool (and for the
-//! confirm tests, a `require_confirmation` pattern matching `echo` plus a
-//! short timeout). A real WS client drives the protocol end-to-end. No
-//! network, no API key.
+//! All streaming events arrive as `ServerMessage::AgentEvent { event }`
+//! envelopes (unified event model).
 
 use async_trait::async_trait;
 use parrot_config::AppConfig;
 use parrot_core::error::{AgentError, ProviderError};
-use parrot_core::event_log::StreamEvent;
-use parrot_core::provider::{ChatStream, LlmProvider, ProviderRegistry};
+use parrot_core::provider::{
+    ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
+};
 use parrot_core::tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry};
 use parrot_core::types::{ChatMessage, GenerateConfig, ModelInfo};
-use parrot_protocol::types::{ConfirmDecision, SessionConfig, StopReason};
+use parrot_protocol::agent_event::{AgentEvent, TurnStopReason};
+use parrot_protocol::types::{ConfirmDecision, SessionConfig};
 use parrot_protocol::{ClientMessage, ServerMessage};
 use parrot_transport::TransportClient;
 use serde_json::{json, Value};
@@ -22,10 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-
-// ---------------------------------------------------------------------------
-// Mock provider + echo tool
-// ---------------------------------------------------------------------------
 
 struct MockProvider {
     call_count: AtomicU32,
@@ -63,30 +59,30 @@ impl LlmProvider for MockProvider {
         _config: &GenerateConfig,
     ) -> Result<ChatStream, ProviderError> {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel::<StreamEvent>(16);
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
         tokio::spawn(async move {
             match n {
                 0 => {
-                    tx.send(StreamEvent::ToolCallStart {
+                    tx.send(ProviderStreamEvent::ToolCallStart {
                         id: "tc_1".to_string(),
                         name: "echo".to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::ToolCallDelta {
+                    tx.send(ProviderStreamEvent::ToolCallDelta {
                         id: "tc_1".to_string(),
                         args_delta: r#"{"message":"hello"}"#.to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::ToolCallEnd {
+                    tx.send(ProviderStreamEvent::ToolCallEnd {
                         id: "tc_1".to_string(),
                         arguments: json!({"message": "hello"}),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::Finish {
-                        stop_reason: StopReason::ToolUse,
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::ToolUse,
                         usage: parrot_protocol::types::Usage {
                             input_tokens: 10,
                             output_tokens: 5,
@@ -96,13 +92,13 @@ impl LlmProvider for MockProvider {
                     .ok();
                 }
                 _ => {
-                    tx.send(StreamEvent::TextDelta {
+                    tx.send(ProviderStreamEvent::TextDelta {
                         delta: "done".to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::Finish {
-                        stop_reason: StopReason::EndTurn,
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::EndTurn,
                         usage: parrot_protocol::types::Usage {
                             input_tokens: 20,
                             output_tokens: 10,
@@ -152,10 +148,6 @@ impl Tool for EchoTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr").port()
@@ -175,6 +167,38 @@ fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Pa
         models: vec!["mock-model".to_string()],
     });
     config
+}
+
+async fn expect_agent_event<F, T>(
+    rx: &mut mpsc::Receiver<ServerMessage>,
+    predicate: F,
+    label: &str,
+) -> T
+where
+    F: Fn(&AgentEvent) -> Option<T>,
+    T: std::fmt::Debug,
+{
+    let result = timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Some(ServerMessage::AgentEvent { event }) => {
+                    if let Some(t) = predicate(&event) {
+                        return Ok(t);
+                    }
+                }
+                Some(other) => {
+                    eprintln!("expect_agent_event({label}): skipping: {:?}", other);
+                }
+                None => return Err("channel closed".to_string()),
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => panic!("expect_agent_event({label}): {e}"),
+        Err(_) => panic!("expect_agent_event({label}): timed out after 10s"),
+    }
 }
 
 async fn expect_server_message<F, T>(
@@ -206,9 +230,6 @@ where
     }
 }
 
-/// Spin up a daemon with the mock provider + echo tool. `confirm_patterns`
-/// controls `require_confirmation` (empty = no confirmations); `confirm_timeout`
-/// controls how long the engine waits for a `ConfirmToolCall` response.
 async fn spawn_daemon(
     confirm_patterns: Vec<String>,
     confirm_timeout: Duration,
@@ -308,46 +329,33 @@ async fn create_session(
     .await
 }
 
-/// Drain the full ReAct flow for one chat turn until the final EndTurn
-/// Finished. The engine may emit an intermediate `Finish{ToolUse}` before
-/// tool execution; this skips those and returns only on EndTurn. All other
-/// messages (ToolCall*, ToolResult, TextDelta, intermediate ToolUse
-/// finishes) are consumed and discarded.
+/// Drain the full ReAct flow for one chat turn until TurnEnd(EndTurn).
+/// All other AgentEvent envelopes are consumed and discarded.
 async fn drain_until_end_turn(rx: &mut mpsc::Receiver<ServerMessage>, session_id: uuid::Uuid) {
     loop {
-        let stop = expect_server_message(
+        let stop = expect_agent_event(
             rx,
-            |m| {
-                if let ServerMessage::Finished {
+            |ev| {
+                if let AgentEvent::TurnEnd {
                     session_id: sid,
                     stop_reason,
                     ..
-                } = m
+                } = ev
                 {
                     if *sid == session_id {
-                        Some(stop_reason.clone())
-                    } else {
-                        None
+                        return Some(stop_reason.clone());
                     }
-                } else {
-                    None
                 }
+                None
             },
-            "Finished(EndTurn)",
+            "TurnEnd",
         )
         .await;
-        if stop == StopReason::EndTurn {
+        if stop == TurnStopReason::EndTurn {
             return;
         }
-        // Intermediate ToolUse/Aborted/MaxTokens finishes are consumed; keep
-        // waiting for EndTurn. (Aborted would break the loop in practice
-        // since the engine returns, but for our mock that won't happen.)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn e2e_tool_list_returns_dedicated_message() {
@@ -421,10 +429,6 @@ async fn e2e_resume_session_replays_event_log() {
     let (mut rx, tx, daemon) = spawn_daemon(Vec::new(), Duration::from_secs(60)).await;
     let session_id = create_session(&tx, &mut rx).await;
 
-    // Run a full chat turn so events.log has content. The engine emits an
-    // intermediate Finish{ToolUse} before tool execution, then loops and
-    // emits Finish{EndTurn} after the second provider call. Drain until
-    // EndTurn to flush the whole turn.
     tx.send(ClientMessage::Chat {
         session_id,
         message: "please echo hello".to_string(),
@@ -437,16 +441,16 @@ async fn e2e_resume_session_replays_event_log() {
     tx.send(ClientMessage::GetHistory { session_id })
         .await
         .expect("send GetHistory");
-    let entries = expect_server_message(
+    let events = expect_server_message(
         &mut rx,
         |m| {
             if let ServerMessage::History {
                 session_id: sid,
-                entries,
+                events,
             } = m
             {
                 if *sid == session_id {
-                    Some(entries.clone())
+                    Some(events.clone())
                 } else {
                     None
                 }
@@ -458,13 +462,11 @@ async fn e2e_resume_session_replays_event_log() {
     )
     .await;
     assert!(
-        !entries.is_empty(),
+        !events.is_empty(),
         "history should not be empty after a chat turn"
     );
 
-    // Now resume the session. The daemon should acknowledge and the session
-    // should accept a new Chat (proving the engine task was spawned with the
-    // replayed context).
+    // Now resume the session.
     tx.send(ClientMessage::ResumeSession { session_id })
         .await
         .expect("send ResumeSession");
@@ -485,9 +487,7 @@ async fn e2e_resume_session_replays_event_log() {
     )
     .await;
 
-    // Send a follow-up chat; the resumed engine should respond. The mock
-    // provider's call_count is now >0 so it returns "done"+EndTurn directly
-    // (no tool_use), so a single drain flushes the turn.
+    // Send a follow-up chat; the resumed engine should respond.
     tx.send(ClientMessage::Chat {
         session_id,
         message: "thanks".to_string(),
@@ -501,8 +501,6 @@ async fn e2e_resume_session_replays_event_log() {
 
 #[tokio::test]
 async fn e2e_confirm_tool_call_approve_executes_tool() {
-    // require_confirmation matches "echo"; timeout is generous so the test
-    // must respond before it fires.
     let (mut rx, tx, daemon) =
         spawn_daemon(vec!["echo".to_string()], Duration::from_secs(10)).await;
     let session_id = create_session(&tx, &mut rx).await;
@@ -514,27 +512,24 @@ async fn e2e_confirm_tool_call_approve_executes_tool() {
     .await
     .expect("send Chat");
 
-    // Expect a confirmation request for the echo tool call.
-    let (tool_id, tool_name) = expect_server_message(
+    // Expect a ToolConfirmRequired for the echo tool call.
+    let (tool_call_id, tool_name) = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolCallConfirmationRequired {
+        |ev| {
+            if let AgentEvent::ToolConfirmRequired {
                 session_id: sid,
-                tool_id,
+                tool_call_id,
                 tool_name,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some((tool_id.clone(), tool_name.clone()))
-                } else {
-                    None
+                    return Some((tool_call_id.clone(), tool_name.clone()));
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolCallConfirmationRequired",
+        "ToolConfirmRequired",
     )
     .await;
     assert_eq!(tool_name, "echo");
@@ -542,40 +537,35 @@ async fn e2e_confirm_tool_call_approve_executes_tool() {
     // Approve it.
     tx.send(ClientMessage::ConfirmToolCall {
         session_id,
-        tool_id,
+        tool_id: tool_call_id,
         decision: ConfirmDecision::Approve,
     })
     .await
     .expect("send ConfirmToolCall(Approve)");
 
-    // The engine should now execute the tool and emit a ToolResult, then
-    // loop and finish with EndTurn (after the second provider call).
-    let (result_content, is_error) = expect_server_message(
+    // The engine should now execute the tool and emit a ToolEnd, then
+    // loop and finish with EndTurn.
+    let (result_content, is_error) = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolResult {
+        |ev| {
+            if let AgentEvent::ToolEnd {
                 session_id: sid,
                 result,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some((result.content.clone(), result.is_error))
-                } else {
-                    None
+                    return Some((result.content.clone(), result.is_error));
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolResult",
+        "ToolEnd",
     )
     .await;
     assert!(!is_error, "approved tool should not error");
     assert_eq!(result_content, "echo: hello");
 
-    // Drain the remaining turn until EndTurn (the Finish{ToolUse} was
-    // already consumed while waiting for the confirmation request above).
     drain_until_end_turn(&mut rx, session_id).await;
 
     daemon.abort();
@@ -594,57 +584,51 @@ async fn e2e_confirm_tool_call_reject_skips_tool() {
     .await
     .expect("send Chat");
 
-    let (tool_id, _) = expect_server_message(
+    let (tool_call_id, _) = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolCallConfirmationRequired {
+        |ev| {
+            if let AgentEvent::ToolConfirmRequired {
                 session_id: sid,
-                tool_id,
+                tool_call_id,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some((tool_id.clone(), ()))
-                } else {
-                    None
+                    return Some((tool_call_id.clone(), ()));
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolCallConfirmationRequired",
+        "ToolConfirmRequired",
     )
     .await;
 
     tx.send(ClientMessage::ConfirmToolCall {
         session_id,
-        tool_id,
+        tool_id: tool_call_id,
         decision: ConfirmDecision::Reject,
     })
     .await
     .expect("send ConfirmToolCall(Reject)");
 
-    // The engine should emit a ToolResult marked as an error with
-    // "user rejected" content, NOT "echo: hello".
-    let (result_content, is_error) = expect_server_message(
+    // The engine should emit a ToolEnd marked as an error with
+    // "user rejected" content.
+    let (result_content, is_error) = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolResult {
+        |ev| {
+            if let AgentEvent::ToolEnd {
                 session_id: sid,
                 result,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some((result.content.clone(), result.is_error))
-                } else {
-                    None
+                    return Some((result.content.clone(), result.is_error));
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolResult(rejected)",
+        "ToolEnd(rejected)",
     )
     .await;
     assert!(is_error, "rejected tool should be an error");
@@ -653,7 +637,6 @@ async fn e2e_confirm_tool_call_reject_skips_tool() {
         "expected 'rejected' in content, got: {result_content}"
     );
 
-    // Drain remaining turn until EndTurn.
     drain_until_end_turn(&mut rx, session_id).await;
 
     daemon.abort();
@@ -661,9 +644,6 @@ async fn e2e_confirm_tool_call_reject_skips_tool() {
 
 #[tokio::test]
 async fn e2e_confirm_tool_call_timeout_skips_tool() {
-    // Use a short timeout so the test doesn't wait 60s. The test does NOT
-    // send a ConfirmToolCall response — the engine should time out and
-    // treat it as Reject.
     let (mut rx, tx, daemon) =
         spawn_daemon(vec!["echo".to_string()], Duration::from_millis(300)).await;
     let session_id = create_session(&tx, &mut rx).await;
@@ -676,47 +656,40 @@ async fn e2e_confirm_tool_call_timeout_skips_tool() {
     .expect("send Chat");
 
     // Expect the confirmation request, then do nothing and wait for the
-    // engine's timeout to fire — it should emit a ToolResult with
-    // "confirmation timeout" content.
-    let _ = expect_server_message(
+    // engine's timeout to fire.
+    let _ = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolCallConfirmationRequired {
+        |ev| {
+            if let AgentEvent::ToolConfirmRequired {
                 session_id: sid, ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some(())
-                } else {
-                    None
+                    return Some(());
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolCallConfirmationRequired",
+        "ToolConfirmRequired",
     )
     .await;
 
-    let (result_content, is_error) = expect_server_message(
+    let (result_content, is_error) = expect_agent_event(
         &mut rx,
-        |m| {
-            if let ServerMessage::ToolResult {
+        |ev| {
+            if let AgentEvent::ToolEnd {
                 session_id: sid,
                 result,
                 ..
-            } = m
+            } = ev
             {
                 if *sid == session_id {
-                    Some((result.content.clone(), result.is_error))
-                } else {
-                    None
+                    return Some((result.content.clone(), result.is_error));
                 }
-            } else {
-                None
             }
+            None
         },
-        "ToolResult(timeout)",
+        "ToolEnd(timeout)",
     )
     .await;
     assert!(is_error, "timed-out tool should be an error");
@@ -725,7 +698,6 @@ async fn e2e_confirm_tool_call_timeout_skips_tool() {
         "expected 'timeout' in content, got: {result_content}"
     );
 
-    // Drain remaining turn until EndTurn.
     drain_until_end_turn(&mut rx, session_id).await;
 
     daemon.abort();

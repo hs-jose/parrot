@@ -2,6 +2,8 @@ use crate::error::ProviderError;
 use crate::tool::ToolDefinition;
 use crate::types::{ChatMessage, GenerateConfig, ModelInfo};
 use async_trait::async_trait;
+use parrot_protocol::types::Usage;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -27,7 +29,66 @@ pub trait LlmProvider: Send + Sync {
 }
 
 pub struct ChatStream {
-    pub inner: tokio::sync::mpsc::Receiver<crate::event_log::StreamEvent>,
+    pub inner: tokio::sync::mpsc::Receiver<ProviderStreamEvent>,
+}
+
+/// Sub-events emitted by a provider adapter while parsing the provider's
+/// streaming response (e.g. Anthropic SSE). Consumed only by the engine,
+/// which wraps them in `AgentEvent` lifecycle envelopes before forwarding.
+///
+/// Note: `ToolResult` and `ToolCallConfirmationRequired` are NOT here —
+/// the former is produced by the engine after executing a tool, the latter
+/// is a strategy decision made by the engine when a tool matches
+/// `require_confirmation`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProviderStreamEvent {
+    TextDelta {
+        delta: String,
+    },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        id: String,
+        args_delta: String,
+    },
+    ToolCallEnd {
+        id: String,
+        arguments: serde_json::Value,
+    },
+    Finish {
+        stop_reason: ProviderStopReason,
+        usage: Usage,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProviderStopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+}
+
+impl ProviderStopReason {
+    pub fn from_anthropic(s: &str) -> Self {
+        match s {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolUse,
+            "max_tokens" => Self::MaxTokens,
+            _ => Self::EndTurn,
+        }
+    }
+}
+
+impl From<ProviderStopReason> for parrot_protocol::agent_event::MessageStopReason {
+    fn from(value: ProviderStopReason) -> Self {
+        match value {
+            ProviderStopReason::EndTurn => Self::EndTurn,
+            ProviderStopReason::ToolUse => Self::ToolUse,
+            ProviderStopReason::MaxTokens => Self::MaxTokens,
+        }
+    }
 }
 
 pub struct ProviderRegistry {

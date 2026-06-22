@@ -10,7 +10,10 @@ pub mod types;
 
 pub use confirm::ConfirmRouter;
 pub use error::{AgentError, ProviderError};
-pub use provider::{ChatStream, LlmProvider, ProviderRegistry};
+pub use event_log::{rebuild_context, EventLog};
+pub use provider::{
+    ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
+};
 pub use session::{SessionCmd, SessionHandle, SessionManager};
 pub use tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry, ToolResult};
 pub use types::*;

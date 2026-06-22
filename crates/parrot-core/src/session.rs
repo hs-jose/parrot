@@ -1,9 +1,9 @@
 use crate::confirm::ConfirmRouter;
 use crate::engine::ReActEngine;
-use crate::event_log::StreamEvent;
 use crate::provider::ProviderRegistry;
 use crate::tool::ToolRegistry;
 use crate::types::{ChatMessage, GenerateConfig};
+use parrot_protocol::agent_event::AgentEvent;
 use parrot_protocol::types::SessionConfig as ProtocolSessionConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ pub enum SessionCmd {
 pub struct SessionHandle {
     pub id: Uuid,
     pub cmd_tx: mpsc::Sender<SessionCmd>,
-    event_rx: Option<mpsc::Receiver<StreamEvent>>,
+    event_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub abort_handle: AbortHandle,
 }
 
@@ -151,6 +151,60 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Resume variant: spawn an engine with the replayed context plus
+    /// resume-specific metadata (`resumed_from_seq`, optional integrity
+    /// warning). The daemon's `resume_session` calls this after running
+    /// `EventLog::replay_for_resume` and `rebuild_context`.
+    pub async fn create_resumed_session(
+        &mut self,
+        id: Uuid,
+        config: GenerateConfig,
+        system_prompt: Option<String>,
+        replayed_context: Vec<ChatMessage>,
+        resumed_from_seq: u64,
+        integrity_warning: Option<parrot_protocol::agent_event::IntegrityIssue>,
+    ) -> Result<Uuid, crate::error::AgentError> {
+        let session_dir = self.data_dir.join(id.to_string());
+        std::fs::create_dir_all(&session_dir)?;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCmd>(32);
+        let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(64);
+
+        let mut engine = ReActEngine::new(
+            id,
+            Arc::clone(&self.tool_registry),
+            Arc::clone(&self.provider_registry),
+            config,
+            system_prompt,
+            session_dir,
+            self.working_dir.clone(),
+        )
+        .with_confirm_config(self.confirm_config.clone())
+        .with_initial_context(replayed_context)
+        .with_resumed_from(resumed_from_seq);
+
+        if let Some(issue) = integrity_warning {
+            engine = engine.with_pending_integrity_warning(issue);
+        }
+
+        let abort_handle = tokio::spawn(async move {
+            engine.run(cmd_rx, event_tx).await;
+        })
+        .abort_handle();
+
+        self.sessions.insert(
+            id,
+            SessionHandle {
+                id,
+                cmd_tx,
+                event_rx: Some(event_rx),
+                abort_handle,
+            },
+        );
+
+        Ok(id)
+    }
+
     /// Shared inner: build the engine, spawn its task, register the handle.
     /// `initial_context` is fed to the engine's run loop so it can resume
     /// mid-conversation (empty for fresh sessions).
@@ -165,7 +219,7 @@ impl SessionManager {
         std::fs::create_dir_all(&session_dir)?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCmd>(32);
-        let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
+        let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(64);
 
         let engine = ReActEngine::new(
             id,
@@ -206,7 +260,7 @@ impl SessionManager {
     }
 
     /// Takes the event receiver for a session. Returns None if already taken or session not found.
-    pub fn take_event_receiver(&mut self, id: &Uuid) -> Option<mpsc::Receiver<StreamEvent>> {
+    pub fn take_event_receiver(&mut self, id: &Uuid) -> Option<mpsc::Receiver<AgentEvent>> {
         self.sessions.get_mut(id)?.event_rx.take()
     }
 

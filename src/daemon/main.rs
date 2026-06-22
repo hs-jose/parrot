@@ -4,7 +4,6 @@ use tracing_subscriber::EnvFilter;
 mod auth;
 mod providers;
 mod server;
-mod session_adapter;
 mod session_store;
 mod tools;
 

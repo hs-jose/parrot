@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use parrot_config::AppConfig;
+use parrot_protocol::agent_event::{AgentEvent, PersistedAgentEvent};
 use parrot_protocol::types::{ConfirmDecision, SessionMeta, ToolDefinitionWire};
 use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
 use parrot_transport::{TransportClient, WsTransportClient};
@@ -8,21 +9,15 @@ use std::io::Write;
 #[derive(Parser)]
 #[command(name = "parrot", version, about = "Parrot LLM Agent CLI")]
 struct Cli {
-    /// Connect to daemon at this URL
     #[arg(long, default_value = "ws://127.0.0.1:9876")]
     connect: String,
 
-    /// Read auth token from this file
     #[arg(long)]
     token_file: Option<String>,
 
-    /// Send one message and exit (non-interactive mode). Mutually exclusive
-    /// with subcommands. Kept as a top-level flag for backward compatibility
-    /// with `parrot -m "..."`.
     #[arg(short, long)]
     message: Option<String>,
 
-    /// Use simple stdin input instead of rustyline (for non-TTY environments)
     #[arg(long)]
     simple: bool,
 
@@ -32,11 +27,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List and inspect persisted sessions
     Sessions(SessionsCmd),
-    /// List available models
     Models,
-    /// List available tools
     Tools,
 }
 
@@ -48,11 +40,8 @@ struct SessionsCmd {
 
 #[derive(Subcommand)]
 enum SessionsAction {
-    /// List all sessions known to the daemon
     List,
-    /// Show the event-log history of a session
     Show { session_id: String },
-    /// Resume a session and enter interactive mode
     Resume { session_id: String },
 }
 
@@ -144,8 +133,9 @@ async fn send_chat_and_stream(
     print_stream(sender, receiver, session_id, interactive).await
 }
 
-/// Print the streaming response for one chat turn. `interactive` controls
-/// how `ToolCallConfirmationRequired` is handled:
+/// Print the streaming response for one chat turn by unwrapping
+/// `ServerMessage::AgentEvent` envelopes and rendering the lifecycle events.
+/// `interactive` controls how `ToolConfirmRequired` is handled:
 ///   - `true`  → prompt the user on stdin for y/n, send `ConfirmToolCall`
 ///   - `false` → auto-reject (no operator present to approve dangerous tools)
 async fn print_stream(
@@ -159,71 +149,110 @@ async fn print_stream(
 
     loop {
         match receiver.recv().await {
-            Some(ServerMessage::TextDelta { delta, .. }) => {
-                write!(stdout, "{}", delta)?;
-                stdout.flush()?;
-            }
-            Some(ServerMessage::ToolCallStart { tool_name, .. }) => {
-                writeln!(stdout, "\n[Calling tool: {}]", tool_name)?;
-                stdout.flush()?;
-            }
-            Some(ServerMessage::ToolCallDelta { .. }) | Some(ServerMessage::ToolCallEnd { .. }) => {
-            }
-            Some(ServerMessage::ToolResult { result, .. }) => {
-                if result.is_error {
-                    writeln!(stdout, "[Tool error: {}]", result.content)?;
-                    stdout.flush()?;
+            Some(ServerMessage::AgentEvent { event }) => {
+                match event {
+                    AgentEvent::AgentStart { .. } => {
+                        // Silent — session already acknowledged above.
+                    }
+                    AgentEvent::AgentEnd { reason, .. } => {
+                        writeln!(stdout, "\n--- Agent ended: {:?} ---", reason)?;
+                        stdout.flush()?;
+                        return Ok(());
+                    }
+                    AgentEvent::TurnStart { .. } => {
+                        // Silent — the user's prompt was just echoed.
+                    }
+                    AgentEvent::TurnEnd {
+                        stop_reason, usage, ..
+                    } => {
+                        writeln!(stdout)?;
+                        writeln!(
+                            stdout,
+                            "\n--- Turn end (reason: {:?}, tokens: {}+{}) ---",
+                            stop_reason, usage.input_tokens, usage.output_tokens
+                        )?;
+                        stdout.flush()?;
+                        return Ok(());
+                    }
+                    AgentEvent::MessageStart { .. } => {
+                        // Silent.
+                    }
+                    AgentEvent::MessageDelta { payload, .. } => match payload {
+                        parrot_protocol::agent_event::MessageDeltaPayload::TextDelta { delta } => {
+                            write!(stdout, "{}", delta)?;
+                            stdout.flush()?;
+                        }
+                        parrot_protocol::agent_event::MessageDeltaPayload::ToolCallStart {
+                            tool_name,
+                            ..
+                        } => {
+                            writeln!(stdout, "\n[Calling tool: {}]", tool_name)?;
+                            stdout.flush()?;
+                        }
+                        parrot_protocol::agent_event::MessageDeltaPayload::ToolCallArgsDelta {
+                            ..
+                        } => {}
+                    },
+                    AgentEvent::MessageEnd { .. } => {
+                        // Silent — text already streamed via deltas.
+                    }
+                    AgentEvent::ToolStart { .. } => {
+                        // Silent — the ToolCallStart delta already announced it.
+                    }
+                    AgentEvent::ToolUpdate { .. } => {
+                        // MVP doesn't render tool progress.
+                    }
+                    AgentEvent::ToolEnd { result, .. } => {
+                        if result.is_error {
+                            writeln!(stdout, "[Tool error: {}]", result.content)?;
+                            stdout.flush()?;
+                        }
+                    }
+                    AgentEvent::ToolConfirmRequired {
+                        tool_call_id,
+                        tool_name,
+                        arguments,
+                        ..
+                    } => {
+                        writeln!(
+                            stdout,
+                            "\n[Confirmation required] tool: {} args: {}",
+                            tool_name, arguments
+                        )?;
+                        stdout.flush()?;
+                        let decision = if interactive {
+                            prompt_confirm(&mut stdout)?
+                        } else {
+                            writeln!(
+                                stdout,
+                                "[Non-interactive mode — auto-rejecting confirmation request]"
+                            )?;
+                            stdout.flush()?;
+                            ConfirmDecision::Reject
+                        };
+                        sender
+                            .send(ClientMessage::ConfirmToolCall {
+                                session_id,
+                                tool_id: tool_call_id,
+                                decision,
+                            })
+                            .await?;
+                    }
+                    AgentEvent::ReplayIntegrityWarning { issue, .. } => {
+                        writeln!(
+                            stdout,
+                            "\n[WARNING] Replay integrity issue: {:?} ({} events dropped)",
+                            issue.kind, issue.dropped_event_count
+                        )?;
+                        stdout.flush()?;
+                    }
                 }
-            }
-            Some(ServerMessage::ToolCallConfirmationRequired {
-                tool_id,
-                tool_name,
-                arguments,
-                ..
-            }) => {
-                writeln!(
-                    stdout,
-                    "\n[Confirmation required] tool: {} args: {}",
-                    tool_name, arguments
-                )?;
-                stdout.flush()?;
-                let decision = if interactive {
-                    prompt_confirm(&mut stdout)?
-                } else {
-                    writeln!(
-                        stdout,
-                        "[Non-interactive mode — auto-rejecting confirmation request]"
-                    )?;
-                    stdout.flush()?;
-                    ConfirmDecision::Reject
-                };
-                sender
-                    .send(ClientMessage::ConfirmToolCall {
-                        session_id,
-                        tool_id,
-                        decision,
-                    })
-                    .await?;
-            }
-            Some(ServerMessage::Finished {
-                stop_reason, usage, ..
-            }) => {
-                writeln!(stdout)?;
-                writeln!(
-                    stdout,
-                    "\n--- Finished (reason: {:?}, tokens: {}+{}) ---",
-                    stop_reason, usage.input_tokens, usage.output_tokens
-                )?;
-                stdout.flush()?;
-                return Ok(());
             }
             Some(ServerMessage::Error { message, .. }) => {
                 writeln!(stdout, "\nError: {}", message)?;
                 stdout.flush()?;
                 return Err(message.into());
             }
-            // Non-streaming response messages aren't expected during a chat
-            // turn; log and keep waiting for the turn's Finished.
             Some(msg) => {
                 eprintln!("Unexpected stream message: {:?}", msg);
             }
@@ -235,10 +264,6 @@ async fn print_stream(
     }
 }
 
-/// Prompt the user for a y/n confirmation. Reads one line from stdin
-/// synchronously — this blocks the stream task, which is acceptable in
-/// interactive CLI mode (the user is at a terminal). TUI will use a
-/// non-blocking modal instead.
 fn prompt_confirm(
     stdout: &mut std::io::StdoutLock,
 ) -> Result<ConfirmDecision, Box<dyn std::error::Error>> {
@@ -252,7 +277,6 @@ fn prompt_confirm(
     })
 }
 
-/// Read a line from stdin asynchronously using tokio::io::BufReader
 async fn read_line_stdin() -> Option<String> {
     use tokio::io::AsyncBufReadExt;
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -260,8 +284,6 @@ async fn read_line_stdin() -> Option<String> {
     lines.next_line().await.ok().flatten()
 }
 
-/// Run the interactive REPL. Shared by the default path (no subcommand) and
-/// `sessions resume`. `use_rustyline` picks the input backend.
 async fn run_interactive(
     conn: &mut Connection,
     session_id: SessionId,
@@ -329,10 +351,6 @@ async fn run_interactive(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Subcommand handlers
-// ---------------------------------------------------------------------------
-
 fn print_session_table(sessions: &[SessionMeta]) {
     if sessions.is_empty() {
         println!("No sessions found.");
@@ -355,40 +373,80 @@ fn print_session_table(sessions: &[SessionMeta]) {
     }
 }
 
-fn print_history(entries: &[parrot_protocol::types::EventLogEntryWithMeta]) {
-    use parrot_protocol::types::EventLogEntry;
-    if entries.is_empty() {
+fn print_history(events: &[PersistedAgentEvent]) {
+    if events.is_empty() {
         println!("Session history is empty.");
         return;
     }
-    for e in entries {
-        let kind = match &e.entry {
-            EventLogEntry::SessionCreated { model, provider } => {
-                format!("SessionCreated(model={}, provider={})", model, provider)
-            }
-            EventLogEntry::UserMessage { content } => {
-                format!("UserMessage({})", truncate(content, 60))
-            }
-            EventLogEntry::AssistantText { content } => {
-                format!("AssistantText({})", truncate(content, 60))
-            }
-            EventLogEntry::ToolCall {
-                tool_name,
-                arguments,
+    for e in events {
+        let kind = match &e.event {
+            AgentEvent::AgentStart {
+                model,
+                provider,
+                resumed_from_seq,
                 ..
-            } => format!("ToolCall({} args={})", tool_name, arguments),
-            EventLogEntry::ToolResult { output, .. } => {
+            } => {
+                let resume = resumed_from_seq
+                    .map(|n| format!(" (resumed from {n})"))
+                    .unwrap_or_default();
                 format!(
-                    "ToolResult(err={} {})",
-                    output.is_error,
-                    truncate(&output.content, 60)
+                    "AgentStart(model={}, provider={}{})",
+                    model, provider, resume
                 )
             }
-            EventLogEntry::Finish { stop_reason, usage } => {
+            AgentEvent::AgentEnd {
+                reason,
+                total_usage,
+                ..
+            } => {
                 format!(
-                    "Finish({:?} in={} out={})",
+                    "AgentEnd({:?} in={} out={})",
+                    reason, total_usage.input_tokens, total_usage.output_tokens
+                )
+            }
+            AgentEvent::TurnStart { user_message, .. } => {
+                format!("TurnStart({})", truncate(user_message, 60))
+            }
+            AgentEvent::TurnEnd {
+                stop_reason, usage, ..
+            } => {
+                format!(
+                    "TurnEnd({:?} in={} out={})",
                     stop_reason, usage.input_tokens, usage.output_tokens
                 )
+            }
+            AgentEvent::MessageStart { .. } => "MessageStart".to_string(),
+            AgentEvent::MessageDelta { .. } => "MessageDelta (non-persistent)".to_string(),
+            AgentEvent::MessageEnd {
+                final_content,
+                tool_calls,
+                stop_reason,
+                ..
+            } => {
+                format!(
+                    "MessageEnd({:?} tools={} {})",
+                    stop_reason,
+                    tool_calls.len(),
+                    truncate(final_content, 60)
+                )
+            }
+            AgentEvent::ToolStart { tool_name, .. } => format!("ToolStart({})", tool_name),
+            AgentEvent::ToolUpdate { .. } => "ToolUpdate (non-persistent)".to_string(),
+            AgentEvent::ToolEnd {
+                tool_call_id,
+                result,
+                ..
+            } => format!(
+                "ToolEnd(id={} err={} {})",
+                tool_call_id,
+                result.is_error,
+                truncate(&result.content, 60)
+            ),
+            AgentEvent::ToolConfirmRequired { tool_name, .. } => {
+                format!("ToolConfirmRequired({})", tool_name)
+            }
+            AgentEvent::ReplayIntegrityWarning { issue, .. } => {
+                format!("ReplayIntegrityWarning({:?})", issue.kind)
             }
         };
         println!("#{:-4} {} {}", e.seq, e.ts.format("%H:%M:%S"), kind);
@@ -432,10 +490,6 @@ fn print_model_list(models: &[parrot_protocol::types::ModelInfo]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
@@ -450,8 +504,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Default path: `parrot` (no subcommand) or `parrot -m "..."`. Backward
-/// compatible with the pre-subcommand CLI.
 async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = connect(&cli, config).await?;
 
@@ -459,8 +511,6 @@ async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::er
     eprintln!("Session created: {}", session_id);
 
     if let Some(message) = cli.message {
-        // Non-interactive single message. Confirmations auto-rejected
-        // (no operator present).
         send_chat_and_stream(
             &conn.sender,
             &mut conn.receiver,
@@ -509,8 +559,8 @@ async fn run_sessions(
                 .await?;
             loop {
                 match conn.receiver.recv().await {
-                    Some(ServerMessage::History { entries, .. }) => {
-                        print_history(&entries);
+                    Some(ServerMessage::History { events, .. }) => {
+                        print_history(&events);
                         return Ok(());
                     }
                     Some(ServerMessage::Error { message, .. }) => {
@@ -568,10 +618,6 @@ async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::err
 
 async fn run_tools(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = connect(&cli, config).await?;
-    // ListTools requires a session_id per the protocol. We create a throwaway
-    // session to get one, then immediately ask for tools. A future protocol
-    // revision could lift the session_id requirement (tools are global to the
-    // daemon, not per-session).
     let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
     conn.sender
         .send(ClientMessage::ListTools { session_id })

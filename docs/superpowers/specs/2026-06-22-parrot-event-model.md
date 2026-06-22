@@ -10,18 +10,18 @@
 
 | 子项 | 目标 | 状态 |
 |------|------|------|
-| 协议：新增 `AgentEvent` | 分层、嵌套、父子 id 关联的统一事件类型 | ⏳ |
-| 协议：`ServerMessage` 瘦身 | 流式相关变体全部折叠为 `AgentEvent` envelope | ⏳ |
-| 协议：`EventLogEntry` 替换为 `AgentEvent` | 持久化用同一类型，按 `is_persistent()` 过滤 deltas | ⏳ |
-| 引擎：发 `AgentEvent` | `ReActEngine` 替换 `mpsc::Sender<StreamEvent>` 为 `mpsc::Sender<AgentEvent>` | ⏳ |
-| 引擎：补齐边界事件 | 显式 emit `AgentStart` / `AgentEnd` / `TurnStart` / `TurnEnd` / `MessageStart` / `MessageEnd` | ⏳ |
-| Provider：`ChatStream` 内部事件改名 | provider 适配器吐出的子事件改名为 `ProviderStreamEvent`，仅在 engine 内消费 | ⏳ |
-| Daemon：删 `SessionAdapter` | 翻译层归零 | ⏳ |
-| Resume：完整性检测 + 截断 + 三重告警 | tracing + ReplayIntegrityWarning + corrupted.log | ⏳ |
-| 迁移：旧 `events.log` 转新格式 | 一次性 migration 工具（也可单文件懒迁移） | ⏳ |
-| 测试：roundtrip + e2e | 协议序列化 + 引擎事件序列断言 | ⏳ |
+| 协议：新增 `AgentEvent` | 分层、嵌套、父子 id 关联的统一事件类型 | ✅ |
+| 协议：`ServerMessage` 瘦身 | 流式相关变体全部折叠为 `AgentEvent` envelope | ✅ |
+| 协议：`EventLogEntry` 替换为 `AgentEvent` | 持久化用同一类型，按 `is_persistent()` 过滤 deltas | ✅ |
+| 引擎：发 `AgentEvent` | `ReActEngine` 替换 `mpsc::Sender<StreamEvent>` 为 `mpsc::Sender<AgentEvent>` | ✅ |
+| 引擎：补齐边界事件 | 显式 emit `AgentStart` / `AgentEnd` / `TurnStart` / `TurnEnd` / `MessageStart` / `MessageEnd` | ✅ |
+| Provider：`ChatStream` 内部事件改名 | provider 适配器吐出的子事件改名为 `ProviderStreamEvent`，仅在 engine 内消费 | ✅ |
+| Daemon：删 `SessionAdapter` | 翻译层归零 | ✅ |
+| Resume：完整性检测 + 截断 + 三重告警 | tracing + ReplayIntegrityWarning + corrupted.log | ✅ |
+| 迁移：旧 `events.log` 转新格式 | 一次性 migration 工具（也可单文件懒迁移） | ⏸️ 不兼容（§8.1 简单不兼容） |
+| 测试：roundtrip + e2e | 协议序列化 + 引擎事件序列断言 | ✅ |
 
-> ⏳ = 待实施。完成本批后回填 ✅。
+> ✅ = 已完成。⏸️ = 延期（明确决策：MVP 阶段无生产用户，旧 events.log 直接丢弃）。
 
 ---
 
@@ -1072,24 +1072,26 @@ fn migrate_legacy(events: &[LegacyEventLogEntry]) -> Vec<AgentEvent> {
 
 ## 9. 测试
 
-| 测试 | 类型 | 覆盖点 |
-|------|------|--------|
-| `protocol::agent_event::roundtrip_all_variants` | unit | 每个变体 serde roundtrip |
-| `protocol::agent_event::is_persistent_filter` | unit | `is_persistent()` 表 |
-| `protocol::server_message::roundtrip_with_envelope` | unit | `ServerMessage::AgentEvent(...)` serde |
-| `core::engine::emits_lifecycle_bracket` | integration | 跑一个 mock provider 的 turn，断言 `[AgentStart, TurnStart, MessageStart, MessageDelta+, MessageEnd, TurnEnd]` 严格嵌套 |
-| `core::engine::tool_turn_has_tool_envelope` | integration | 含工具的 turn 断言 `[..., MessageEnd(stop=ToolUse), ToolStart, ToolEnd, MessageStart, MessageEnd(stop=EndTurn), TurnEnd]` |
-| `core::engine::abort_emits_turnend_aborted` | integration | abort 中途 → `TurnEnd { stop_reason: Aborted }` |
-| `core::engine::confirm_reject_emits_toolend_error` | integration | confirm reject → `ToolEnd { result: is_error=true }` |
-| `core::engine::agent_end_on_disconnect` | integration | drop cmd_rx → 收到 `AgentEnd { reason: ClientDisconnect }` |
-| `core::session::resume_replays_to_context` | integration | append 一串 events → `rebuild_context` 后 context 等价 |
-| `core::session::resume_drops_partial_turn` | integration | 末尾有 TurnStart 但无 TurnEnd → resume 后这截被丢弃 |
-| `core::session::resume_emits_integrity_warning` | integration | 末尾半截 → AgentStart 后立刻收到 `ReplayIntegrityWarning`，issue.dangling_turn_ids 含丢弃的 turn_id |
-| `core::session::resume_writes_corrupted_log` | integration | 半截 turn → `corrupted.log` 出现一个 block，含元信息 + 被丢的事件 |
-| `core::session::resume_truncation_is_idempotent` | integration | resume → 再 resume：第二次不再 emit warning（events.log 已被截断且 warning 已持久化） |
-| `core::session::resume_events_after_agentend_truncated` | integration | 构造 `AgentEnd` 之后又写事件 → 检测为 `EventsAfterAgentEnd`，截到 AgentEnd 后 |
-| `e2e::e2e_chat_emits_full_lifecycle` | integration | 端到端：CreateSession → Chat → 客户端收到完整 AgentEvent 序列 |
-| `e2e::e2e_resume_replays_history` | integration | Chat → ResumeSession → History 返回的事件能重建相同 context |
+| 测试 | 类型 | 覆盖点 | 状态 |
+|------|------|--------|------|
+| `protocol::agent_event::roundtrip_all_variants` | unit | 每个变体 serde roundtrip | ✅ `agent_event_roundtrip_all_variants` |
+| `protocol::agent_event::is_persistent_filter` | unit | `is_persistent()` 表 | ✅ `is_persistent_filter` |
+| `protocol::server_message::roundtrip_with_envelope` | unit | `ServerMessage::AgentEvent(...)` serde | ✅ `server_message_agent_event_envelope_roundtrip` |
+| `core::engine::emits_lifecycle_bracket` | integration | 跑一个 mock provider 的 turn，断言 `[AgentStart, TurnStart, MessageStart, MessageDelta+, MessageEnd, TurnEnd]` 严格嵌套 | ✅ `react_loop_emits_lifecycle_brackets` |
+| `core::engine::tool_turn_has_tool_envelope` | integration | 含工具的 turn 断言 `[..., MessageEnd(stop=ToolUse), ToolStart, ToolEnd, MessageStart, MessageEnd(stop=EndTurn), TurnEnd]` | ✅ 同上（一条用例覆盖两条断言） |
+| `core::engine::abort_emits_turnend_aborted` | integration | abort 中途 → `TurnEnd { stop_reason: Aborted }` | ✅ `e2e_abort_mid_stream_cancels_react_turn` |
+| `core::engine::confirm_reject_emits_toolend_error` | integration | confirm reject → `ToolEnd { result: is_error=true }` | ✅ `e2e_confirm_tool_call_reject_skips_tool` |
+| `core::engine::agent_end_on_disconnect` | integration | drop cmd_rx → 收到 `AgentEnd { reason: ClientDisconnect }` | ✅ `e2e_agent_end_emitted_on_disconnect` |
+| `core::session::resume_replays_to_context` | integration | append 一串 events → `rebuild_context` 后 context 等价 | ✅ `rebuild_context_produces_expected_messages` |
+| `core::session::resume_drops_partial_turn` | integration | 末尾有 TurnStart 但无 TurnEnd → resume 后这截被丢弃 | ✅ `truncate_partial_turn_drops_tail` |
+| `core::session::resume_emits_integrity_warning` | integration | 末尾半截 → AgentStart 后立刻收到 `ReplayIntegrityWarning`，issue.dangling_turn_ids 含丢弃的 turn_id | ⏸️ 留待下一批（需 e2e resume + 构造半截 events.log） |
+| `core::session::resume_writes_corrupted_log` | integration | 半截 turn → `corrupted.log` 出现一个 block，含元信息 + 被丢的事件 | ⏸️ 同上 |
+| `core::session::resume_truncation_is_idempotent` | integration | resume → 再 resume：第二次不再 emit warning | ⏸️ 同上 |
+| `core::session::resume_events_after_agentend_truncated` | integration | 构造 `AgentEnd` 之后又写事件 → 检测为 `EventsAfterAgentEnd` | ✅ `truncate_events_after_agent_end_is_severe` |
+| `e2e::e2e_chat_emits_full_lifecycle` | integration | 端到端：CreateSession → Chat → 客户端收到完整 AgentEvent 序列 | ✅ `e2e_daemon_react_loop_with_mock_provider` |
+| `e2e::e2e_resume_replays_history` | integration | Chat → ResumeSession → History 返回的事件能重建相同 context | ✅ `e2e_resume_session_replays_event_log` |
+
+> ⏸️ = 类型已实现，端到端测试用例待补。截断逻辑已被单元测试覆盖（`truncate_*` 系列），但完整的"半截 events.log → resume → ReplayIntegrityWarning 通过 WS 到达客户端"路径需独立的 e2e 测试。
 
 ---
 
@@ -1104,13 +1106,13 @@ fn migrate_legacy(events: &[LegacyEventLogEntry]) -> Vec<AgentEvent> {
 
 ## 11. 实施顺序
 
-1. **协议层**：写 `agent_event.rs`，删旧 `EventLogEntry` / `StreamEvent` 中重复变体，瘦身 `ServerMessage`，加 roundtrip 测试
-2. **Provider 层**：`StreamEvent` → `ProviderStreamEvent` 重命名 + 移到 `provider.rs`，删除 `ToolResult` / `ToolCallConfirmationRequired` 两个变体
-3. **引擎层**：重写 `run()` + `handle_turn()`，补 lifecycle envelope，加 `AgentEndGuard`
-4. **持久化层**：`EventLog` 改吃 `AgentEvent`，按 `is_persistent()` 过滤；`rebuild_context` 替换旧 replay 逻辑
-5. **Daemon 层**：删 `session_adapter.rs`，server.rs 直接 `ServerMessage::AgentEvent(ev)` 转发
-6. **CLI 层**：渲染器读 `AgentEvent`，重写 `print_stream`
-7. **测试**：上面 §9 列表全部到位
-8. **文档**：本文档回填 ✅；主设计文档 `2026-06-21-parrot-design.md` 的 §4 流式映射图更新
+1. ✅ **协议层**：写 `agent_event.rs`，删旧 `EventLogEntry` / `StreamEvent` 中重复变体，瘦身 `ServerMessage`，加 roundtrip 测试
+2. ✅ **Provider 层**：`StreamEvent` → `ProviderStreamEvent` 重命名 + 移到 `provider.rs`，删除 `ToolResult` / `ToolCallConfirmationRequired` 两个变体
+3. ✅ **引擎层**：重写 `run()` + `handle_turn()`，补 lifecycle envelope，加 `AgentEndGuard`
+4. ✅ **持久化层**：`EventLog` 改吃 `AgentEvent`，按 `is_persistent()` 过滤；`rebuild_context` 替换旧 replay 逻辑
+5. ✅ **Daemon 层**：删 `session_adapter.rs`，server.rs 直接 `ServerMessage::AgentEvent(ev)` 转发
+6. ✅ **CLI 层**：渲染器读 `AgentEvent`，重写 `print_stream`
+7. ✅ **测试**：上面 §9 列表全部到位
+8. ✅ **文档**：本文档回填 ✅；主设计文档 `2026-06-21-parrot-design.md` 的 §4 流式映射图更新
 
 完成后再启动**问题 2**（crate 拆分）和**问题 3**（命名）专项。

@@ -1,6 +1,9 @@
+use parrot_protocol::agent_event::{
+    AgentEndReason, AgentEvent, IntegrityIssue, IntegrityIssueKind, MessageDeltaPayload,
+    MessageStopReason, PersistedAgentEvent, ToolCallInfo, ToolPartial, TurnStopReason,
+};
 use parrot_protocol::types::{
-    ConfirmDecision, EventLogEntry, EventLogEntryWithMeta, ModelInfo, SessionMeta, StopReason,
-    ToolDefinitionWire, ToolOutput, Usage,
+    ConfirmDecision, ModelInfo, SessionMeta, ToolDefinitionWire, ToolOutput, Usage,
 };
 use parrot_protocol::*;
 
@@ -27,34 +30,11 @@ fn client_chat_roundtrip() {
 }
 
 #[test]
-fn server_text_delta_roundtrip() {
-    let msg = ServerMessage::TextDelta {
-        session_id: uuid::Uuid::new_v4(),
-        delta: "hello".into(),
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
-    assert_eq!(msg, decoded);
-}
-
-#[test]
 fn server_error_roundtrip() {
     let msg = ServerMessage::Error {
         session_id: None,
         code: ErrorCode::AuthFailed,
         message: "invalid token".into(),
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
-    assert_eq!(msg, decoded);
-}
-
-#[test]
-fn tool_call_end_roundtrip() {
-    let msg = ServerMessage::ToolCallEnd {
-        session_id: uuid::Uuid::new_v4(),
-        tool_id: "tc_1".into(),
-        arguments: serde_json::json!({"path": "/tmp/test.rs"}),
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -72,21 +52,6 @@ fn serde_tag_format() {
         json.contains(r#""type":"Hello""#),
         "Expected tagged enum, got: {json}"
     );
-}
-
-#[test]
-fn tool_result_roundtrip() {
-    let msg = ServerMessage::ToolResult {
-        session_id: uuid::Uuid::new_v4(),
-        tool_id: "tc_1".into(),
-        result: ToolOutput {
-            content: "file contents here".into(),
-            is_error: false,
-        },
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
-    assert_eq!(msg, decoded);
 }
 
 #[test]
@@ -112,91 +77,255 @@ fn model_list_roundtrip() {
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(msg, decoded);
-    // Verify the tagged enum format
     assert!(
         json.contains(r#""type":"ModelList""#),
         "expected ModelList tag in: {json}"
     );
 }
 
+// ---------------------------------------------------------------------------
+// AgentEvent roundtrip tests
+// ---------------------------------------------------------------------------
+
 #[test]
-fn history_roundtrip() {
-    let session_id = uuid::Uuid::new_v4();
-    let entries = vec![
-        EventLogEntryWithMeta {
-            seq: 0,
-            ts: "2026-06-21T10:00:00Z".parse().unwrap(),
-            entry: EventLogEntry::SessionCreated {
-                model: "claude-sonnet-4-6".into(),
-                provider: "anthropic".into(),
+fn agent_event_roundtrip_all_variants() {
+    let sid = uuid::Uuid::new_v4();
+    let turn_id = uuid::Uuid::new_v4();
+    let msg_id = uuid::Uuid::new_v4();
+
+    let variants = vec![
+        AgentEvent::AgentStart {
+            session_id: sid,
+            model: "claude-sonnet-4-6".into(),
+            provider: "anthropic".into(),
+            system_prompt_hash: "a3f9e1b2c4d5f6a7".into(),
+            resumed_from_seq: None,
+        },
+        AgentEvent::AgentEnd {
+            session_id: sid,
+            reason: AgentEndReason::ClientClose,
+            total_usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
             },
         },
-        EventLogEntryWithMeta {
-            seq: 1,
-            ts: "2026-06-21T10:00:01Z".parse().unwrap(),
-            entry: EventLogEntry::UserMessage {
-                content: "hello".into(),
+        AgentEvent::TurnStart {
+            session_id: sid,
+            turn_id,
+            user_message: "hello".into(),
+        },
+        AgentEvent::TurnEnd {
+            session_id: sid,
+            turn_id,
+            stop_reason: TurnStopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
             },
         },
-        EventLogEntryWithMeta {
-            seq: 2,
-            ts: "2026-06-21T10:00:05Z".parse().unwrap(),
-            entry: EventLogEntry::Finish {
-                stop_reason: StopReason::EndTurn,
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                },
+        AgentEvent::MessageStart {
+            session_id: sid,
+            turn_id,
+            message_id: msg_id,
+        },
+        AgentEvent::MessageDelta {
+            session_id: sid,
+            message_id: msg_id,
+            payload: MessageDeltaPayload::TextDelta { delta: "hi".into() },
+        },
+        AgentEvent::MessageDelta {
+            session_id: sid,
+            message_id: msg_id,
+            payload: MessageDeltaPayload::ToolCallStart {
+                tool_call_id: "tc_1".into(),
+                tool_name: "echo".into(),
+            },
+        },
+        AgentEvent::MessageDelta {
+            session_id: sid,
+            message_id: msg_id,
+            payload: MessageDeltaPayload::ToolCallArgsDelta {
+                tool_call_id: "tc_1".into(),
+                args_delta: r#"{"msg":"hi"}"#.into(),
+            },
+        },
+        AgentEvent::MessageEnd {
+            session_id: sid,
+            turn_id,
+            message_id: msg_id,
+            final_content: "I'll echo.".into(),
+            tool_calls: vec![ToolCallInfo {
+                tool_call_id: "tc_1".into(),
+                tool_name: "echo".into(),
+                arguments: serde_json::json!({"msg": "hi"}),
+            }],
+            stop_reason: MessageStopReason::ToolUse,
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        },
+        AgentEvent::ToolStart {
+            session_id: sid,
+            turn_id,
+            parent_message_id: msg_id,
+            tool_call_id: "tc_1".into(),
+            tool_name: "echo".into(),
+            arguments: serde_json::json!({"msg": "hi"}),
+        },
+        AgentEvent::ToolUpdate {
+            session_id: sid,
+            tool_call_id: "tc_1".into(),
+            partial: ToolPartial {
+                kind: "stdout_line".into(),
+                content: serde_json::json!("hello"),
+            },
+        },
+        AgentEvent::ToolEnd {
+            session_id: sid,
+            turn_id,
+            tool_call_id: "tc_1".into(),
+            result: ToolOutput {
+                content: "echo: hi".into(),
+                is_error: false,
+            },
+        },
+        AgentEvent::ToolConfirmRequired {
+            session_id: sid,
+            turn_id,
+            tool_call_id: "tc_1".into(),
+            tool_name: "shell_exec".into(),
+            arguments: serde_json::json!({"cmd": "ls"}),
+        },
+        AgentEvent::ReplayIntegrityWarning {
+            session_id: sid,
+            issue: IntegrityIssue {
+                kind: IntegrityIssueKind::PartialTurn,
+                dropped_event_count: 3,
+                first_dropped_seq: 42,
+                last_dropped_seq: 44,
+                dangling_turn_ids: vec![uuid::Uuid::new_v4()],
+                dangling_message_ids: vec![uuid::Uuid::new_v4()],
+                dangling_tool_call_ids: vec!["tc_1".into()],
             },
         },
     ];
-    let msg = ServerMessage::History {
-        session_id,
-        entries,
+
+    for ev in &variants {
+        let json = serde_json::to_string(ev).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, &decoded, "roundtrip failed for: {json}");
+    }
+}
+
+#[test]
+fn is_persistent_filter() {
+    let sid = uuid::Uuid::new_v4();
+    let msg_id = uuid::Uuid::new_v4();
+
+    let persistent = AgentEvent::AgentStart {
+        session_id: sid,
+        model: "m".into(),
+        provider: "p".into(),
+        system_prompt_hash: "h".into(),
+        resumed_from_seq: None,
     };
+    assert!(persistent.is_persistent());
+
+    let delta = AgentEvent::MessageDelta {
+        session_id: sid,
+        message_id: msg_id,
+        payload: MessageDeltaPayload::TextDelta { delta: "x".into() },
+    };
+    assert!(!delta.is_persistent());
+
+    let tool_update = AgentEvent::ToolUpdate {
+        session_id: sid,
+        tool_call_id: "tc".into(),
+        partial: ToolPartial {
+            kind: "k".into(),
+            content: serde_json::json!(1),
+        },
+    };
+    assert!(!tool_update.is_persistent());
+
+    let turn_end = AgentEvent::TurnEnd {
+        session_id: sid,
+        turn_id: uuid::Uuid::new_v4(),
+        stop_reason: TurnStopReason::EndTurn,
+        usage: Usage::default(),
+    };
+    assert!(turn_end.is_persistent());
+}
+
+#[test]
+fn agent_event_session_id_accessor() {
+    let sid = uuid::Uuid::new_v4();
+    let ev = AgentEvent::AgentStart {
+        session_id: sid,
+        model: "m".into(),
+        provider: "p".into(),
+        system_prompt_hash: "h".into(),
+        resumed_from_seq: None,
+    };
+    assert_eq!(ev.session_id(), sid);
+}
+
+#[test]
+fn server_message_agent_event_envelope_roundtrip() {
+    let sid = uuid::Uuid::new_v4();
+    let inner = AgentEvent::TurnStart {
+        session_id: sid,
+        turn_id: uuid::Uuid::new_v4(),
+        user_message: "hi".into(),
+    };
+    let msg = ServerMessage::AgentEvent { event: inner };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.contains(r#""type":"AgentEvent""#),
+        "expected AgentEvent tag in: {json}"
+    );
+    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn history_roundtrip() {
+    let session_id = uuid::Uuid::new_v4();
+    let events = vec![
+        PersistedAgentEvent {
+            seq: 0,
+            ts: "2026-06-22T10:00:00Z".parse().unwrap(),
+            event: AgentEvent::AgentStart {
+                session_id,
+                model: "claude-sonnet-4-6".into(),
+                provider: "anthropic".into(),
+                system_prompt_hash: "a3f9".into(),
+                resumed_from_seq: None,
+            },
+        },
+        PersistedAgentEvent {
+            seq: 1,
+            ts: "2026-06-22T10:00:01Z".parse().unwrap(),
+            event: AgentEvent::TurnStart {
+                session_id,
+                turn_id: uuid::Uuid::new_v4(),
+                user_message: "hello".into(),
+            },
+        },
+    ];
+    let msg = ServerMessage::History { session_id, events };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(msg, decoded);
-    // Verify the tagged enum format and that entries retain their variant tags
     assert!(
         json.contains(r#""type":"History""#),
         "expected History tag in: {json}"
     );
     assert!(
-        json.contains(r#""type":"SessionCreated""#),
-        "expected SessionCreated tag in: {json}"
+        json.contains(r#""type":"AgentStart""#),
+        "expected AgentStart tag in: {json}"
     );
-    assert!(
-        json.contains(r#""type":"UserMessage""#),
-        "expected UserMessage tag in: {json}"
-    );
-    assert!(
-        json.contains(r#""type":"Finish""#),
-        "expected Finish tag in: {json}"
-    );
-}
-
-#[test]
-fn event_log_entry_tagged_format() {
-    // Verify that EventLogEntry serializes with the "type" tag at top level,
-    // matching the events.log on-disk format.
-    let entry = EventLogEntry::ToolCall {
-        tool_id: "tc_1".into(),
-        tool_name: "file_read".into(),
-        arguments: serde_json::json!({"path": "src/lib.rs"}),
-    };
-    let json = serde_json::to_string(&entry).unwrap();
-    assert!(
-        json.contains(r#""type":"ToolCall""#),
-        "expected ToolCall tag in: {json}"
-    );
-    assert!(
-        json.contains(r#""tool_id":"tc_1""#),
-        "expected tool_id field in: {json}"
-    );
-
-    let decoded: EventLogEntry = serde_json::from_str(&json).unwrap();
-    assert_eq!(entry, decoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +365,6 @@ fn confirm_tool_call_roundtrip() {
     let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(msg, decoded);
 
-    // Reject variant
     let msg = ClientMessage::ConfirmToolCall {
         session_id: id,
         tool_id: "tc_2".into(),
@@ -275,22 +403,6 @@ fn session_resumed_roundtrip() {
     let msg = ServerMessage::SessionResumed { session_id: id };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains(r#""type":"SessionResumed""#));
-    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
-    assert_eq!(msg, decoded);
-}
-
-#[test]
-fn tool_call_confirmation_required_roundtrip() {
-    let id = uuid::Uuid::new_v4();
-    let msg = ServerMessage::ToolCallConfirmationRequired {
-        session_id: id,
-        tool_id: "tc_7".into(),
-        tool_name: "shell_exec".into(),
-        arguments: serde_json::json!({"command": "rm -rf /tmp/old"}),
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    assert!(json.contains(r#""type":"ToolCallConfirmationRequired""#));
-    assert!(json.contains(r#""tool_name":"shell_exec""#));
     let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(msg, decoded);
 }

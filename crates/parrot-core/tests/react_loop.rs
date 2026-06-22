@@ -1,36 +1,31 @@
 //! ReAct loop integration test using a MockProvider.
 //!
 //! Drives the full ReAct engine through one tool-call cycle without touching
-//! the network. Validates:
-//! - Bug 1: `ToolContext.working_dir` is the engine's working dir, not the
-//!   session data dir.
-//! - Bug 2: context pruning preserves tool_use/tool_result pair boundaries
-//!   (verified indirectly — the MockProvider inspects the messages it receives
-//!   and the test asserts the tool_result message is preceded by the
-//!   assistant tool_use message).
-//! - Bug 4: `StreamEvent::ToolCallEnd` carries the parsed JSON arguments
-//!   emitted by the provider, not an empty object.
+//! the network. With the unified `AgentEvent` model, this asserts the
+//! lifecycle bracket structure from spec §9:
+//!   AgentStart → TurnStart → MessageStart → MessageDelta* → MessageEnd
+//!   → ToolStart → ToolEnd → MessageStart → MessageDelta* → MessageEnd
+//!   → TurnEnd → AgentEnd
 
 use async_trait::async_trait;
 use parrot_core::engine::ReActEngine;
 use parrot_core::error::AgentError;
-use parrot_core::event_log::StreamEvent;
-use parrot_core::provider::{ChatStream, LlmProvider, ProviderRegistry};
+use parrot_core::provider::{ChatStream, LlmProvider, ProviderRegistry, ProviderStreamEvent};
+use parrot_core::session::SessionCmd;
 use parrot_core::tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry};
 use parrot_core::types::GenerateConfig;
-use parrot_protocol::types::{StopReason, Usage};
+use parrot_protocol::agent_event::{AgentEndReason, AgentEvent, MessageStopReason, TurnStopReason};
+use parrot_protocol::types::Usage;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-/// A provider that emits a canned stream on each call.
-/// Call 1: tool_use (echo tool with {"message": "hello"}).
-/// Call 2: end_turn with text "done".
+use parrot_core::provider::ProviderStopReason;
+
 struct MockProvider {
     call_count: AtomicU32,
-    /// Captured messages from the most recent call (for assertions via the test).
     captured_messages: tokio::sync::Mutex<Vec<parrot_core::types::ChatMessage>>,
 }
 
@@ -75,32 +70,31 @@ impl LlmProvider for MockProvider {
         *self.captured_messages.lock().await = messages.to_vec();
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
 
-        let (tx, rx) = mpsc::channel::<StreamEvent>(16);
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
 
         tokio::spawn(async move {
             match n {
                 0 => {
-                    // First call: emit a tool_use block
-                    tx.send(StreamEvent::ToolCallStart {
+                    tx.send(ProviderStreamEvent::ToolCallStart {
                         id: "tc_mock_1".to_string(),
                         name: "echo".to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::ToolCallDelta {
+                    tx.send(ProviderStreamEvent::ToolCallDelta {
                         id: "tc_mock_1".to_string(),
                         args_delta: r#"{"message":"hello"}"#.to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::ToolCallEnd {
+                    tx.send(ProviderStreamEvent::ToolCallEnd {
                         id: "tc_mock_1".to_string(),
                         arguments: json!({"message": "hello"}),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::Finish {
-                        stop_reason: StopReason::ToolUse,
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::ToolUse,
                         usage: Usage {
                             input_tokens: 10,
                             output_tokens: 5,
@@ -110,14 +104,13 @@ impl LlmProvider for MockProvider {
                     .ok();
                 }
                 _ => {
-                    // Subsequent calls: end_turn with final text
-                    tx.send(StreamEvent::TextDelta {
+                    tx.send(ProviderStreamEvent::TextDelta {
                         delta: "done".to_string(),
                     })
                     .await
                     .ok();
-                    tx.send(StreamEvent::Finish {
-                        stop_reason: StopReason::EndTurn,
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::EndTurn,
                         usage: Usage {
                             input_tokens: 20,
                             output_tokens: 10,
@@ -143,10 +136,6 @@ impl LlmProvider for MockProvider {
     }
 }
 
-/// Echo tool: returns the `message` argument as its output content.
-/// Also stashes the ToolContext.working_dir it was called with into a shared
-/// cell so the test can assert it matches the engine's working dir (not the
-/// session data dir).
 struct EchoTool {
     captured_working_dir: Arc<tokio::sync::Mutex<Option<std::path::PathBuf>>>,
 }
@@ -182,18 +171,59 @@ impl Tool for EchoTool {
     }
 }
 
+/// Collect `AgentEvent`s until `TurnEnd` is observed. Does NOT wait for
+/// `AgentEnd` — the caller drops `cmd_tx` afterwards to let the engine
+/// exit, then drains the trailing events separately.
+async fn collect_until_turn_end(event_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Some(ev) = event_rx.recv().await {
+        let is_turn_end = matches!(ev, AgentEvent::TurnEnd { .. });
+        events.push(ev);
+        if is_turn_end {
+            break;
+        }
+    }
+    events
+}
+
+/// Drain remaining events (post-TurnEnd) until `AgentEnd` is observed.
+async fn drain_until_agent_end(event_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Some(ev) = event_rx.recv().await {
+        let is_agent_end = matches!(ev, AgentEvent::AgentEnd { .. });
+        events.push(ev);
+        if is_agent_end {
+            break;
+        }
+    }
+    events
+}
+
+fn variant_name(ev: &AgentEvent) -> &'static str {
+    match ev {
+        AgentEvent::AgentStart { .. } => "AgentStart",
+        AgentEvent::AgentEnd { .. } => "AgentEnd",
+        AgentEvent::TurnStart { .. } => "TurnStart",
+        AgentEvent::TurnEnd { .. } => "TurnEnd",
+        AgentEvent::MessageStart { .. } => "MessageStart",
+        AgentEvent::MessageDelta { .. } => "MessageDelta",
+        AgentEvent::MessageEnd { .. } => "MessageEnd",
+        AgentEvent::ToolStart { .. } => "ToolStart",
+        AgentEvent::ToolUpdate { .. } => "ToolUpdate",
+        AgentEvent::ToolEnd { .. } => "ToolEnd",
+        AgentEvent::ToolConfirmRequired { .. } => "ToolConfirmRequired",
+        AgentEvent::ReplayIntegrityWarning { .. } => "ReplayIntegrityWarning",
+    }
+}
+
 #[tokio::test]
-async fn react_loop_executes_tool_call_and_finishes() {
-    // Layout:
-    //   tmpdir/working  — engine working_dir (where tools resolve paths)
-    //   tmpdir/data     — session data dir (event log storage)
+async fn react_loop_emits_lifecycle_brackets() {
     let tmp = TempDir::new().expect("create temp dir");
     let working_dir = tmp.path().join("working");
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&working_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Registries
     let tool_registry = Arc::new(ToolRegistry::new());
     let captured_wd = Arc::new(tokio::sync::Mutex::new(None));
     tool_registry
@@ -209,7 +239,6 @@ async fn react_loop_executes_tool_call_and_finishes() {
         .register(provider, vec!["mock-model".to_string()])
         .await;
 
-    // Engine
     let config = GenerateConfig {
         model: "mock-model".to_string(),
         temperature: None,
@@ -227,76 +256,129 @@ async fn react_loop_executes_tool_call_and_finishes() {
     );
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(64);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
 
     let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
 
-    // Send a chat message
     cmd_tx
-        .send(parrot_core::session::SessionCmd::Chat {
+        .send(SessionCmd::Chat {
             message: "please echo hello".to_string(),
         })
         .await
         .unwrap();
 
-    // Collect events until we see two Finish events (tool_use round, then end_turn round)
-    let mut text_deltas = Vec::new();
-    let mut tool_call_starts = Vec::new();
-    let mut tool_call_ends = Vec::new();
-    let mut tool_results = Vec::new();
-    let mut finishes = Vec::new();
+    let mut events = collect_until_turn_end(&mut event_rx).await;
 
-    while finishes.len() < 2 {
-        match event_rx.recv().await {
-            Some(StreamEvent::TextDelta { delta }) => text_deltas.push(delta),
-            Some(StreamEvent::ToolCallStart { id, name }) => tool_call_starts.push((id, name)),
-            Some(StreamEvent::ToolCallDelta { .. }) => {}
-            Some(StreamEvent::ToolCallEnd { id, arguments }) => {
-                tool_call_ends.push((id, arguments))
-            }
-            Some(StreamEvent::ToolResult { id, result }) => tool_results.push((id, result)),
-            Some(StreamEvent::Finish { stop_reason, usage }) => finishes.push((stop_reason, usage)),
-            Some(StreamEvent::ToolCallConfirmationRequired { .. }) => {
-                // This test's mock provider doesn't trigger confirmations
-                // (the engine's ConfirmConfig is default — no patterns, no
-                // router). If we ever see one, ignore it.
-            }
-            None => break,
-        }
-    }
-
-    // Drop cmd_tx to let the engine's run loop exit.
+    // Drop cmd_tx to let the engine's run loop exit and emit AgentEnd.
     drop(cmd_tx);
+    let trailing = drain_until_agent_end(&mut event_rx).await;
+    events.extend(trailing);
+
     let _ = engine_task.await;
 
-    // Assertions — Bug 4: ToolCallEnd carries parsed args from the provider
-    assert_eq!(tool_call_starts.len(), 1, "expected exactly one tool call");
-    assert_eq!(tool_call_starts[0].1, "echo");
-    assert_eq!(tool_call_ends.len(), 1, "expected exactly one ToolCallEnd");
+    // Assert the lifecycle bracket sequence.
+    let bracket: Vec<&str> = events.iter().map(variant_name).collect();
+    assert!(
+        bracket.starts_with(&["AgentStart", "TurnStart", "MessageStart"]),
+        "expected AgentStart → TurnStart → MessageStart prefix, got: {:?}",
+        bracket
+    );
+    assert!(
+        bracket.contains(&"MessageEnd"),
+        "expected MessageEnd in: {:?}",
+        bracket
+    );
+    assert!(
+        bracket.contains(&"ToolStart"),
+        "expected ToolStart in: {:?}",
+        bracket
+    );
+    assert!(
+        bracket.contains(&"ToolEnd"),
+        "expected ToolEnd in: {:?}",
+        bracket
+    );
+    // After ToolEnd, a second MessageStart..MessageEnd for the final assistant message.
+    let tool_end_idx = bracket
+        .iter()
+        .position(|n| *n == "ToolEnd")
+        .expect("ToolEnd present");
+    let after_tool = &bracket[tool_end_idx + 1..];
+    assert!(
+        after_tool.contains(&"MessageStart"),
+        "expected second MessageStart after ToolEnd: {:?}",
+        bracket
+    );
+    assert!(
+        after_tool.contains(&"MessageEnd"),
+        "expected second MessageEnd after ToolEnd: {:?}",
+        bracket
+    );
+    // TurnEnd then AgentEnd at the tail.
+    assert!(
+        bracket.contains(&"TurnEnd"),
+        "expected TurnEnd in: {:?}",
+        bracket
+    );
     assert_eq!(
-        tool_call_ends[0].1,
-        json!({"message": "hello"}),
-        "ToolCallEnd arguments must be the parsed JSON, not an empty object"
+        bracket.last().copied(),
+        Some("AgentEnd"),
+        "expected AgentEnd last: {:?}",
+        bracket
     );
 
-    // Tool was actually executed
-    assert_eq!(tool_results.len(), 1, "expected one ToolResult event");
-    assert_eq!(tool_results[0].1.content, "echo: hello");
-    assert!(!tool_results[0].1.is_error);
+    // Inspect the MessageEnd of the first LLM call: stop_reason = ToolUse,
+    // tool_calls has one entry with parsed args.
+    let first_msg_end = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::MessageEnd {
+                stop_reason,
+                tool_calls,
+                final_content,
+                ..
+            } if *stop_reason == MessageStopReason::ToolUse => {
+                Some((tool_calls.clone(), final_content.clone()))
+            }
+            _ => None,
+        })
+        .expect("first MessageEnd with ToolUse");
+    assert_eq!(first_msg_end.0.len(), 1, "expected one tool call");
+    assert_eq!(first_msg_end.0[0].tool_name, "echo");
+    assert_eq!(first_msg_end.0[0].arguments, json!({"message": "hello"}));
 
-    // Two finish events: ToolUse round, then EndTurn round
-    assert_eq!(
-        finishes.len(),
-        2,
-        "expected two Finish events (tool_use + end_turn)"
-    );
-    assert_eq!(finishes[0].0, StopReason::ToolUse);
-    assert_eq!(finishes[1].0, StopReason::EndTurn);
+    // Inspect the ToolEnd: result.content = "echo: hello", is_error = false.
+    let tool_end = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::ToolEnd { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("ToolEnd present");
+    assert_eq!(tool_end.content, "echo: hello");
+    assert!(!tool_end.is_error);
 
-    // Final text delivered
-    assert_eq!(text_deltas.concat(), "done");
+    // Inspect the TurnEnd: stop_reason = EndTurn.
+    let turn_end = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::TurnEnd { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("TurnEnd present");
+    assert_eq!(turn_end, TurnStopReason::EndTurn);
 
-    // Bug 1: ToolContext.working_dir is the engine's working dir, not the session data dir
+    // Inspect the AgentEnd: reason = ClientDisconnect (cmd_tx dropped).
+    let agent_end = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::AgentEnd { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("AgentEnd present");
+    assert_eq!(agent_end, AgentEndReason::ClientDisconnect);
+
+    // Bug 1: ToolContext.working_dir is the engine's working dir.
     let captured = captured_wd
         .lock()
         .await
@@ -304,15 +386,13 @@ async fn react_loop_executes_tool_call_and_finishes() {
         .expect("tool was not called");
     assert_eq!(
         captured, working_dir,
-        "ToolContext.working_dir must equal the engine's working_dir, not the session data dir"
+        "ToolContext.working_dir must equal the engine's working_dir"
     );
-    assert_ne!(
-        captured, data_dir,
-        "working_dir must not accidentally be the session data dir"
-    );
+    assert_ne!(captured, data_dir);
 
-    // Bug 2 (indirect): on the second call, the provider received a context
-    // containing the assistant tool_use message followed by the tool_result
+    // Bug 2 (indirect): on the second call, the provider received a
+    // context containing the assistant tool_use message followed by the
+    // tool_result.
     let captured_second = mock.captured_messages().await;
     let mut found_pair = false;
     for i in 0..captured_second.len().saturating_sub(1) {

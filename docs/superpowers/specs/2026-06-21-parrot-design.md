@@ -235,20 +235,23 @@ pub struct SessionMeta {
 
 > `ModelInfo` 既出现在 protocol 也出现在 `parrot-core::types`，二者字段相同。`parrot-core` 的 `ModelInfo` 是引擎内部用，`parrot-protocol` 的是 wire 格式——保留两份避免 core 反向依赖 protocol 的 chrono 类型。daemon 在边界做转换。
 
-### StreamEvent → ServerMessage 映射
+### AgentEvent → ServerMessage 映射（2026-06-22 统一事件模型后）
 
-编排引擎产出 `StreamEvent`（core 内部类型），daemon 的 session adapter 负责加上 `session_id` 转换为 `ServerMessage` 推给客户端：
+> **重大变更（2026-06-22）**：原 `StreamEvent` / `EventLogEntry` / `ServerMessage` 三套语义重复的类型已合并为统一的 `AgentEvent`（详见 `docs/superpowers/specs/2026-06-22-parrot-event-model.md`）。`session_adapter.rs` 翻译层已删除；daemon 直接把 `AgentEvent` 装进 `ServerMessage::AgentEvent { event }` envelope 转发。`EventLogEntry` 已替换为 `AgentEvent`（持久化用同一类型，按 `is_persistent()` 过滤 `MessageDelta` / `ToolUpdate`）。
 
-| `StreamEvent` (core) | `ServerMessage` (protocol) |
+编排引擎产出 `AgentEvent`（protocol 公开类型），daemon 直接 envelope 后推给客户端。Provider 适配器产出 `ProviderStreamEvent`（core 内部类型，仅在 engine 内消费），engine 负责补齐 lifecycle envelope：
+
+| `AgentEvent` (protocol) | `ServerMessage` (protocol) |
 |---|---|
-| `TextDelta { delta }` | `TextDelta { session_id, delta }` |
-| `ToolCallStart { id, name }` | `ToolCallStart { session_id, tool_id: id, tool_name: name }` |
-| `ToolCallDelta { id, args_delta }` | `ToolCallDelta { session_id, tool_id: id, args_delta }` |
-| `ToolCallEnd { id, arguments }` | `ToolCallEnd { session_id, tool_id: id, arguments }` |
-| `ToolResult { id, result }` *(core 新增)* | `ToolResult { session_id, tool_id: id, result }` |
-| `Finish { stop_reason, usage }` | `Finished { session_id, stop_reason, usage }` |
+| `AgentStart { .. }` | `ServerMessage::AgentEvent { event }` |
+| `TurnStart { .. }` / `TurnEnd { .. }` | 同上 |
+| `MessageStart { .. }` / `MessageDelta { .. }` / `MessageEnd { .. }` | 同上 |
+| `ToolStart { .. }` / `ToolUpdate { .. }` / `ToolEnd { .. }` | 同上 |
+| `ToolConfirmRequired { .. }` | 同上 |
+| `ReplayIntegrityWarning { .. }` | 同上 |
+| `AgentEnd { .. }` | 同上 |
 
-> `StreamEvent` 需要在原设计基础上补一个 `ToolResult` 变体，对应 ReAct 的 Observe 阶段——工具执行结果同样要流式推给客户端，不能只存在 core 内部。
+> `ProviderStreamEvent` 不出现在 wire 协议上。Provider 适配器（如 `AnthropicProvider`）吐出 `TextDelta` / `ToolCallStart` / `ToolCallDelta` / `ToolCallEnd` / `Finish`，engine 聚合后补 `MessageStart..MessageEnd` / `ToolStart..ToolEnd` / `TurnStart..TurnEnd` / `AgentStart..AgentEnd` 的嵌套边界。
 
 ### 非流式请求 → 响应映射
 
@@ -260,7 +263,7 @@ pub struct SessionMeta {
 | `CreateSession { config }` | `SessionCreated { session_id }` | 同时 spawn session task |
 | `ListModels` | `ModelList { models }` | 聚合所有 provider 的 `list_models()` |
 | `ListTools { session_id }` | 多条 `TextDelta` + `Finished` | 当前实现：JSON dump 到 TextDelta |
-| `GetHistory { session_id }` | `History { session_id, entries }` | 重放 events.log |
+| `GetHistory { session_id }` | `History { session_id, events: Vec<PersistedAgentEvent> }` | 重放 events.log（2026-06-22 起 `EventLogEntry` → `AgentEvent`） |
 | `ListSessions` *(1.5)* | `SessionList { sessions }` | 读 index.json |
 | `ResumeSession { session_id }` *(1.5)* | `SessionResumed { session_id }` 或 `Error{SessionNotFound}` | 重放 + 重建 session task |
 | `ConfirmToolCall { .. }` *(1.5)* | （无直接响应；驱动后续 `ToolResult` 或 `ToolCallEnd`） | 见 §4.5 二次确认 |
