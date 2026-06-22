@@ -68,13 +68,17 @@ mod tests {
     #[test]
     fn test_validate_correct_token() {
         let token = Auth::generate_token();
-        let auth = Auth { token: token.clone() };
+        let auth = Auth {
+            token: token.clone(),
+        };
         assert!(auth.validate(&token));
     }
 
     #[test]
     fn test_validate_wrong_token() {
-        let auth = Auth { token: "abc123".to_string() };
+        let auth = Auth {
+            token: "abc123".to_string(),
+        };
         assert!(!auth.validate("wrong_token"));
     }
 

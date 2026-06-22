@@ -1,16 +1,16 @@
+use crate::error::AgentError;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::error::AgentError;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolOutput {
-    pub content: String,
-    pub is_error: bool,
-}
+// `ToolOutput` is canonical in `parrot-protocol::types` (it appears on the wire
+// in `ServerMessage::ToolResult` and inside `EventLogEntry::ToolResult`). Core
+// re-exports it so the `Tool::call` trait returns the same type the daemon
+// persists and ships — no boundary conversion needed.
+pub use parrot_protocol::types::ToolOutput;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResult {
@@ -51,7 +51,9 @@ impl Default for ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: RwLock::new(HashMap::new()) }
+        Self {
+            tools: RwLock::new(HashMap::new()),
+        }
     }
     pub async fn register(&self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
@@ -83,8 +85,12 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &str { "echo" }
-        fn description(&self) -> &str { "Echoes back the input" }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes back the input"
+        }
         fn input_schema(&self) -> Value {
             json!({
                 "type": "object",
@@ -92,11 +98,19 @@ mod tests {
                 "required": ["message"]
             })
         }
-        async fn call(&self, arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-            let msg = arguments.get("message")
+        async fn call(
+            &self,
+            arguments: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolOutput, AgentError> {
+            let msg = arguments
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            Ok(ToolOutput { content: msg.to_string(), is_error: false })
+            Ok(ToolOutput {
+                content: msg.to_string(),
+                is_error: false,
+            })
         }
     }
 

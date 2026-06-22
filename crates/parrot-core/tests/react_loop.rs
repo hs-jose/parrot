@@ -53,7 +53,9 @@ impl LlmProvider for MockProvider {
         "mock"
     }
 
-    async fn list_models(&self) -> Result<Vec<parrot_core::types::ModelInfo>, parrot_core::error::ProviderError> {
+    async fn list_models(
+        &self,
+    ) -> Result<Vec<parrot_core::types::ModelInfo>, parrot_core::error::ProviderError> {
         Ok(vec![parrot_core::types::ModelInfo {
             id: "mock-model".to_string(),
             name: "Mock Model".to_string(),
@@ -82,29 +84,47 @@ impl LlmProvider for MockProvider {
                     tx.send(StreamEvent::ToolCallStart {
                         id: "tc_mock_1".to_string(),
                         name: "echo".to_string(),
-                    }).await.ok();
+                    })
+                    .await
+                    .ok();
                     tx.send(StreamEvent::ToolCallDelta {
                         id: "tc_mock_1".to_string(),
                         args_delta: r#"{"message":"hello"}"#.to_string(),
-                    }).await.ok();
+                    })
+                    .await
+                    .ok();
                     tx.send(StreamEvent::ToolCallEnd {
                         id: "tc_mock_1".to_string(),
                         arguments: json!({"message": "hello"}),
-                    }).await.ok();
+                    })
+                    .await
+                    .ok();
                     tx.send(StreamEvent::Finish {
                         stop_reason: StopReason::ToolUse,
-                        usage: Usage { input_tokens: 10, output_tokens: 5 },
-                    }).await.ok();
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                        },
+                    })
+                    .await
+                    .ok();
                 }
                 _ => {
                     // Subsequent calls: end_turn with final text
                     tx.send(StreamEvent::TextDelta {
                         delta: "done".to_string(),
-                    }).await.ok();
+                    })
+                    .await
+                    .ok();
                     tx.send(StreamEvent::Finish {
                         stop_reason: StopReason::EndTurn,
-                        usage: Usage { input_tokens: 20, output_tokens: 10 },
-                    }).await.ok();
+                        usage: Usage {
+                            input_tokens: 20,
+                            output_tokens: 10,
+                        },
+                    })
+                    .await
+                    .ok();
                 }
             }
         });
@@ -133,9 +153,13 @@ struct EchoTool {
 
 #[async_trait]
 impl Tool for EchoTool {
-    fn name(&self) -> &str { "echo" }
+    fn name(&self) -> &str {
+        "echo"
+    }
 
-    fn description(&self) -> &str { "Echoes the message argument back." }
+    fn description(&self) -> &str {
+        "Echoes the message argument back."
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -173,7 +197,9 @@ async fn react_loop_executes_tool_call_and_finishes() {
     let tool_registry = Arc::new(ToolRegistry::new());
     let captured_wd = Arc::new(tokio::sync::Mutex::new(None));
     tool_registry
-        .register(Arc::new(EchoTool { captured_working_dir: Arc::clone(&captured_wd) }))
+        .register(Arc::new(EchoTool {
+            captured_working_dir: Arc::clone(&captured_wd),
+        }))
         .await;
 
     let mock = Arc::new(MockProvider::new());
@@ -191,9 +217,11 @@ async fn react_loop_executes_tool_call_and_finishes() {
         stop_sequences: None,
     };
     let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
         Arc::clone(&tool_registry),
         Arc::clone(&provider_registry),
         config,
+        Some("You are a test assistant.".to_string()),
         data_dir.clone(),
         working_dir.clone(),
     );
@@ -223,9 +251,16 @@ async fn react_loop_executes_tool_call_and_finishes() {
             Some(StreamEvent::TextDelta { delta }) => text_deltas.push(delta),
             Some(StreamEvent::ToolCallStart { id, name }) => tool_call_starts.push((id, name)),
             Some(StreamEvent::ToolCallDelta { .. }) => {}
-            Some(StreamEvent::ToolCallEnd { id, arguments }) => tool_call_ends.push((id, arguments)),
+            Some(StreamEvent::ToolCallEnd { id, arguments }) => {
+                tool_call_ends.push((id, arguments))
+            }
             Some(StreamEvent::ToolResult { id, result }) => tool_results.push((id, result)),
             Some(StreamEvent::Finish { stop_reason, usage }) => finishes.push((stop_reason, usage)),
+            Some(StreamEvent::ToolCallConfirmationRequired { .. }) => {
+                // This test's mock provider doesn't trigger confirmations
+                // (the engine's ConfirmConfig is default — no patterns, no
+                // router). If we ever see one, ignore it.
+            }
             None => break,
         }
     }
@@ -250,7 +285,11 @@ async fn react_loop_executes_tool_call_and_finishes() {
     assert!(!tool_results[0].1.is_error);
 
     // Two finish events: ToolUse round, then EndTurn round
-    assert_eq!(finishes.len(), 2, "expected two Finish events (tool_use + end_turn)");
+    assert_eq!(
+        finishes.len(),
+        2,
+        "expected two Finish events (tool_use + end_turn)"
+    );
     assert_eq!(finishes[0].0, StopReason::ToolUse);
     assert_eq!(finishes[1].0, StopReason::EndTurn);
 
@@ -258,7 +297,11 @@ async fn react_loop_executes_tool_call_and_finishes() {
     assert_eq!(text_deltas.concat(), "done");
 
     // Bug 1: ToolContext.working_dir is the engine's working dir, not the session data dir
-    let captured = captured_wd.lock().await.clone().expect("tool was not called");
+    let captured = captured_wd
+        .lock()
+        .await
+        .clone()
+        .expect("tool was not called");
     assert_eq!(
         captured, working_dir,
         "ToolContext.working_dir must equal the engine's working_dir, not the session data dir"

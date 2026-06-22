@@ -1,14 +1,16 @@
+pub mod confirm;
+pub mod context;
+pub mod engine;
 pub mod error;
-pub mod types;
-pub mod tool;
+pub mod event_log;
 pub mod provider;
 pub mod session;
-pub mod event_log;
-pub mod engine;
-pub mod context;
+pub mod tool;
+pub mod types;
 
+pub use confirm::ConfirmRouter;
 pub use error::{AgentError, ProviderError};
+pub use provider::{ChatStream, LlmProvider, ProviderRegistry};
+pub use session::{SessionCmd, SessionHandle, SessionManager};
+pub use tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry, ToolResult};
 pub use types::*;
-pub use tool::{Tool, ToolRegistry, ToolContext, ToolResult, ToolOutput, ToolDefinition};
-pub use provider::{LlmProvider, ProviderRegistry, ChatStream};
-pub use session::{SessionHandle, SessionCmd, SessionManager};

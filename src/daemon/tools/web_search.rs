@@ -5,6 +5,12 @@ use serde_json::Value;
 
 pub struct WebSearchTool;
 
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl WebSearchTool {
     pub fn new() -> Self {
         Self
@@ -13,7 +19,9 @@ impl WebSearchTool {
 
 #[async_trait]
 impl Tool for WebSearchTool {
-    fn name(&self) -> &str { "web_search" }
+    fn name(&self) -> &str {
+        "web_search"
+    }
 
     fn description(&self) -> &str {
         "Search the web for information. Not yet implemented (planned for Phase 2)."
@@ -34,7 +42,8 @@ impl Tool for WebSearchTool {
 
     async fn call(&self, _arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
         Ok(ToolOutput {
-            content: "web_search is not yet implemented. This tool will be available in Phase 2.".to_string(),
+            content: "web_search is not yet implemented. This tool will be available in Phase 2."
+                .to_string(),
             is_error: true,
         })
     }

@@ -1,14 +1,16 @@
+use crate::confirm::ConfirmRouter;
+use crate::engine::ReActEngine;
+use crate::event_log::StreamEvent;
+use crate::provider::ProviderRegistry;
+use crate::tool::ToolRegistry;
+use crate::types::{ChatMessage, GenerateConfig};
+use parrot_protocol::types::SessionConfig as ProtocolSessionConfig;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use uuid::Uuid;
-use crate::types::GenerateConfig;
-use crate::tool::ToolRegistry;
-use crate::provider::ProviderRegistry;
-use crate::engine::ReActEngine;
-use crate::event_log::StreamEvent;
-use std::collections::HashMap;
-use std::sync::Arc;
-use parrot_protocol::types::SessionConfig as ProtocolSessionConfig;
 
 pub enum SessionCmd {
     Chat { message: String },
@@ -22,6 +24,45 @@ pub struct SessionHandle {
     pub abort_handle: AbortHandle,
 }
 
+/// What the engine should inject as the system prompt when the client didn't
+/// supply one in `SessionConfig`. Daemon supplies this so `parrot-core` stays
+/// policy-free (the engine only emits whatever prompt it's handed).
+pub fn default_system_prompt() -> String {
+    "You are Parrot, a helpful coding assistant. Use the available tools when \
+     they help you answer the user's request. Reason step by step about which \
+     tool to call and with what arguments, then act. When you have enough \
+     information, give a concise final answer."
+        .to_string()
+}
+
+/// Phase 1.5: tool-call confirmation configuration. Lives in core so the
+/// engine can read it without a boundary crossing each tool call. Populated
+/// by the daemon from `config.tools.sandbox.require_confirmation` plus the
+/// shared `ConfirmRouter` handle. Cloned cheaply into each engine instance.
+#[derive(Clone)]
+pub struct ConfirmConfig {
+    /// Tool-name prefixes that require client confirmation before execution.
+    /// Simple `starts_with` match (see `2026-06-21-parrot-phase-1.5.md` §4.3).
+    pub require_confirmation: Vec<String>,
+    /// How long to wait for `ClientMessage::ConfirmToolCall` before treating
+    /// it as `ConfirmDecision::Timeout`. Default 60s; tests use a small value.
+    pub timeout: Duration,
+    /// The daemon-side router that bridges client responses to waiting
+    /// session tasks. `None` disables confirmation entirely (engine never
+    /// blocks on a confirm). Set by the daemon when constructing the engine.
+    pub router: Option<Arc<ConfirmRouter>>,
+}
+
+impl Default for ConfirmConfig {
+    fn default() -> Self {
+        Self {
+            require_confirmation: Vec::new(),
+            timeout: Duration::from_secs(60),
+            router: None,
+        }
+    }
+}
+
 pub struct SessionManager {
     sessions: HashMap<Uuid, SessionHandle>,
     tool_registry: Arc<ToolRegistry>,
@@ -29,6 +70,7 @@ pub struct SessionManager {
     default_config: GenerateConfig,
     data_dir: std::path::PathBuf,
     working_dir: std::path::PathBuf,
+    confirm_config: ConfirmConfig,
 }
 
 impl SessionManager {
@@ -46,7 +88,16 @@ impl SessionManager {
             default_config,
             data_dir,
             working_dir,
+            confirm_config: ConfirmConfig::default(),
         }
+    }
+
+    /// Set the confirmation config. Daemon calls this once at startup, after
+    /// `new()`, before any session is created. Each engine instance gets a
+    /// clone of this config.
+    pub fn with_confirm_config(mut self, config: ConfirmConfig) -> Self {
+        self.confirm_config = config;
+        self
     }
 
     pub async fn create_session(
@@ -55,16 +106,61 @@ impl SessionManager {
     ) -> Result<Uuid, crate::error::AgentError> {
         let id = Uuid::new_v4();
 
-        let gen_config = match config {
-            Some(c) => GenerateConfig {
-                model: c.model.unwrap_or_else(|| self.default_config.model.clone()),
-                temperature: self.default_config.temperature,
-                max_tokens: self.default_config.max_tokens,
-                stop_sequences: self.default_config.stop_sequences.clone(),
-            },
-            None => self.default_config.clone(),
+        let (gen_config, system_prompt) = match config {
+            Some(c) => {
+                let gen = GenerateConfig {
+                    model: c.model.unwrap_or_else(|| self.default_config.model.clone()),
+                    temperature: self.default_config.temperature,
+                    max_tokens: self.default_config.max_tokens,
+                    stop_sequences: self.default_config.stop_sequences.clone(),
+                };
+                // If the client supplied a system_prompt use it; otherwise fall
+                // back to the daemon default (kept here in core's `session`
+                // module purely so the engine doesn't need to know the
+                // default — the daemon is free to override before constructing
+                // the engine if it wants a different default).
+                let prompt = Some(c.system_prompt.unwrap_or_else(default_system_prompt));
+                (gen, prompt)
+            }
+            None => {
+                let prompt = Some(default_system_prompt());
+                (self.default_config.clone(), prompt)
+            }
         };
 
+        self.spawn_session(id, gen_config, system_prompt, Vec::new())
+            .await?;
+        Ok(id)
+    }
+
+    /// Phase 1.5: create a session with a pre-built context. Used by
+    /// `ResumeSession` to reconstruct the in-memory state from a replayed
+    /// event log. The `replayed_context` should NOT include the system
+    /// prompt — the engine injects `system_prompt` at the head itself
+    /// (matching `create_session`'s behavior), so callers should pass only
+    /// user/assistant/tool messages.
+    pub async fn create_session_with_context(
+        &mut self,
+        id: Uuid,
+        config: GenerateConfig,
+        system_prompt: Option<String>,
+        replayed_context: Vec<ChatMessage>,
+    ) -> Result<Uuid, crate::error::AgentError> {
+        self.spawn_session(id, config, system_prompt, replayed_context)
+            .await?;
+        Ok(id)
+    }
+
+    /// Shared inner: build the engine, spawn its task, register the handle.
+    /// `initial_context` is fed to the engine's run loop so it can resume
+    /// mid-conversation (empty for fresh sessions).
+    async fn spawn_session(
+        &mut self,
+        id: Uuid,
+        gen_config: GenerateConfig,
+        system_prompt: Option<String>,
+        initial_context: Vec<ChatMessage>,
+    ) -> Result<(), crate::error::AgentError> {
         let session_dir = self.data_dir.join(id.to_string());
         std::fs::create_dir_all(&session_dir)?;
 
@@ -72,25 +168,33 @@ impl SessionManager {
         let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(64);
 
         let engine = ReActEngine::new(
+            id,
             Arc::clone(&self.tool_registry),
             Arc::clone(&self.provider_registry),
             gen_config,
+            system_prompt,
             session_dir,
             self.working_dir.clone(),
-        );
+        )
+        .with_confirm_config(self.confirm_config.clone())
+        .with_initial_context(initial_context);
 
         let abort_handle = tokio::spawn(async move {
             engine.run(cmd_rx, event_tx).await;
-        }).abort_handle();
+        })
+        .abort_handle();
 
-        self.sessions.insert(id, SessionHandle {
+        self.sessions.insert(
             id,
-            cmd_tx,
-            event_rx: Some(event_rx),
-            abort_handle,
-        });
+            SessionHandle {
+                id,
+                cmd_tx,
+                event_rx: Some(event_rx),
+                abort_handle,
+            },
+        );
 
-        Ok(id)
+        Ok(())
     }
 
     pub fn get_handle(&self, id: &Uuid) -> Option<&SessionHandle> {
@@ -109,5 +213,19 @@ impl SessionManager {
     /// Get tool definitions from the tool registry
     pub async fn list_tool_definitions(&self) -> Vec<crate::tool::ToolDefinition> {
         self.tool_registry.list_definitions().await
+    }
+
+    /// Enumerate all known session ids (used by the daemon to implement
+    /// `ListSessions` in Phase 1.5 — kept here so the session manager is the
+    /// single source of truth for the in-memory session set).
+    pub fn session_ids(&self) -> Vec<Uuid> {
+        self.sessions.keys().copied().collect()
+    }
+
+    /// Whether a session with the given id is currently live in this manager.
+    /// `ResumeSession` uses this to short-circuit: if the session is already
+    /// in memory (e.g. resumed by another connection), just acknowledge.
+    pub fn contains(&self, id: &Uuid) -> bool {
+        self.sessions.contains_key(id)
     }
 }

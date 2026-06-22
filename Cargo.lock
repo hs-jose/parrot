@@ -1113,6 +1113,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atty",
+ "chrono",
  "clap",
  "futures-util",
  "glob",
@@ -1166,6 +1167,7 @@ dependencies = [
 name = "parrot-protocol"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
  "thiserror",

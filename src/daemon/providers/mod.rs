@@ -3,6 +3,7 @@ use parrot_core::provider::ProviderRegistry;
 use std::sync::Arc;
 
 pub mod anthropic;
+pub mod retry;
 
 pub async fn register_all(registry: &ProviderRegistry, config: &AppConfig) {
     for provider_config in &config.providers {

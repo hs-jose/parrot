@@ -7,7 +7,10 @@ pub struct ContextManager {
 
 impl ContextManager {
     pub fn new(max_tokens: u32, keep_recent_turns: u32) -> Self {
-        Self { max_tokens, keep_recent_turns }
+        Self {
+            max_tokens,
+            keep_recent_turns,
+        }
     }
 
     fn estimate_tokens(msg: &ChatMessage) -> u32 {
@@ -71,8 +74,20 @@ mod tests {
             tool_calls: None,
         }];
         for _i in 0..count {
-            msgs.push(ChatMessage { role: ChatRole::User, content: "a".repeat(chars_each), tool_call_id: None, tool_name: None, tool_calls: None });
-            msgs.push(ChatMessage { role: ChatRole::Assistant, content: "b".repeat(chars_each), tool_call_id: None, tool_name: None, tool_calls: None });
+            msgs.push(ChatMessage {
+                role: ChatRole::User,
+                content: "a".repeat(chars_each),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            });
+            msgs.push(ChatMessage {
+                role: ChatRole::Assistant,
+                content: "b".repeat(chars_each),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            });
         }
         msgs
     }
@@ -111,21 +126,67 @@ mod tests {
         let mgr = ContextManager::new(10, 1);
 
         let mut msgs = vec![
-            ChatMessage { role: ChatRole::System,    content: "sys".to_string(),         tool_call_id: None, tool_name: None, tool_calls: None },
+            ChatMessage {
+                role: ChatRole::System,
+                content: "sys".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
             // Turn 1
-            ChatMessage { role: ChatRole::User,      content: "question1".to_string(),   tool_call_id: None, tool_name: None, tool_calls: None },
-            ChatMessage { role: ChatRole::Assistant, content: "".to_string(),             tool_call_id: None, tool_name: None, tool_calls: Some(vec![]) },
-            ChatMessage { role: ChatRole::Tool,      content: "result".to_string(),       tool_call_id: Some("id1".to_string()), tool_name: Some("file_read".to_string()), tool_calls: None },
-            ChatMessage { role: ChatRole::Assistant, content: "answer1".to_string(),      tool_call_id: None, tool_name: None, tool_calls: None },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "question1".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Some(vec![]),
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: "result".to_string(),
+                tool_call_id: Some("id1".to_string()),
+                tool_name: Some("file_read".to_string()),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "answer1".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
             // Turn 2
-            ChatMessage { role: ChatRole::User,      content: "question2".to_string(),   tool_call_id: None, tool_name: None, tool_calls: None },
-            ChatMessage { role: ChatRole::Assistant, content: "answer2".to_string(),      tool_call_id: None, tool_name: None, tool_calls: None },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "question2".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "answer2".to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
         ];
 
         mgr.prune(&mut msgs);
 
         // Turn 1 (messages 1-4) should be removed; system + turn 2 remain
-        assert_eq!(msgs.len(), 3, "expected system + turn2 user + turn2 assistant");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "expected system + turn2 user + turn2 assistant"
+        );
         assert_eq!(msgs[0].role, ChatRole::System);
         assert_eq!(msgs[1].role, ChatRole::User);
         assert_eq!(msgs[1].content, "question2");

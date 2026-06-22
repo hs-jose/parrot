@@ -17,6 +17,9 @@ pub mod server;
 #[path = "daemon/session_adapter.rs"]
 pub mod session_adapter;
 
+#[path = "daemon/session_store.rs"]
+pub mod session_store;
+
 #[path = "daemon/providers/mod.rs"]
 pub mod providers;
 

@@ -20,6 +20,30 @@ Parrot 是一个 Rust 实现的 LLM agent，兼具**通用编程助手**（类�
 
 > TUI 从 MVP 移出，先确保 CLI → daemon → Anthropic → 工具调用的核心链路完全跑通后再加 TUI。
 
+### Phase 1 实施状态（2026-06-21）
+
+| 子项 | 状态 | 备注 |
+|------|------|------|
+| workspace + 4 个 lib crate skeleton | ✅ | `parrot-core/protocol/transport/config` |
+| `parrot-protocol`：消息类型 + serde 往返测试 | ✅ | 10 个 roundtrip 测试通过（含 ModelList/History/EventLogEntry） |
+| `parrot-config`：TOML 解析 + `dirs` 路径解析 + env 变量展开 | ✅ | |
+| `parrot-transport`：Transport trait + WS server/client + Origin 校验 | ✅ | 3 个 transport 测试（含跨域拒绝）通过 |
+| `parrot-core`：Tool/Provider trait + ReAct 引擎 + Session 状态机 + thiserror | ✅ | |
+| `parrot-core`：上下文裁剪（滑窗 + 完整轮次保留） | ✅ | 4 个 context 测试通过 |
+| `parrot-daemon`：WS server + Anthropic adapter + Token 握手 + Origin 校验 | ✅ | Anthropic adapter 含 SSE 流式解析 + 重试退避（§4.8） |
+| `parrot-daemon`：内置工具（file_read/glob/grep/write/shell/web_fetch/web_search） | ✅ | 按配置开关注册 |
+| `parrot-cli`：瘦客户端（Hello 握手、Chat、流式输出、rustyline 交互模式） | ✅ | |
+| E2E 集成测试（mock provider 注入） | ✅ | `tests/integration/e2e_test.rs` 跑通完整 ReAct 链路 + ListModels + GetHistory + Abort |
+| `ListModels` 服务端响应 | ✅ | `ServerMessage::ModelList` + 聚合各 provider 的 `list_models()` |
+| `GetHistory` 服务端响应（event log 重放） | ✅ | `ServerMessage::History` + `EventLog::replay()` |
+| Session 持久化补全（meta.json + index.json + snapshot 触发） | ✅ | `src/daemon/session_store.rs`；每 100 events 写 snapshot |
+| Provider 重试退避（指数退避 + jitter） | ✅ | `src/daemon/providers/retry.rs`；`with_retry` 包装 `send_request` |
+| 真正的 Abort 取消（中断在飞 LLM 流 + 工具执行） | ✅ | 引擎内 `tokio::select!` 监听 `cmd_rx`，drop stream / cancel tool future |
+| System prompt 注入（SessionConfig.system_prompt → context） | ✅ | `ReActEngine::new` 接 `Option<String>`；默认模板在 `session::default_system_prompt` |
+| Cassette 录制/回放 provider 测试 | ✅ | `tests/cassette_test.rs` + `tests/cassettes/anthropic/*.json`；`CassetteProvider` 实现 `LlmProvider` |
+
+> 全绿基线：`cargo build --workspace` + `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo fmt --all -- --check`。
+
 ---
 
 ## 2. 顶层架构
@@ -111,6 +135,26 @@ pub enum ClientMessage {
     ListTools { session_id: SessionId },
     /// 获取 session 历史
     GetHistory { session_id: SessionId },
+    /// 列出本地所有 session（Phase 1.5）
+    ListSessions,
+    /// 恢复已存在的 session（Phase 1.5）
+    ResumeSession { session_id: SessionId },
+    /// 工具二次确认响应（Phase 1.5）
+    ConfirmToolCall {
+        session_id: SessionId,
+        tool_id: String,
+        decision: ConfirmDecision,
+    },
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+pub enum ConfirmDecision {
+    /// 客户端用户确认执行
+    Approve,
+    /// 客户端用户拒绝执行
+    Reject,
+    /// 客户端超时未响应（daemon 侧也会本地超时）
+    Timeout,
 }
 ```
 
@@ -137,8 +181,59 @@ pub enum ServerMessage {
     Finished { session_id: SessionId, stop_reason: StopReason, usage: Usage },
     /// 错误
     Error { session_id: Option<SessionId>, code: ErrorCode, message: String },
+    /// 模型列表（响应 ListModels）
+    ModelList { models: Vec<ModelInfo> },
+    /// Session 历史响应（event log 重放）
+    History { session_id: SessionId, entries: Vec<HistoryEntry> },
+    /// Session 列表响应（Phase 1.5）
+    SessionList { sessions: Vec<SessionMeta> },
+    /// Session 恢复确认（Phase 1.5）
+    SessionResumed { session_id: SessionId },
+    /// 工具调用需二次确认（Phase 1.5）
+    ToolCallConfirmationRequired {
+        session_id: SessionId,
+        tool_id: String,
+        tool_name: String,
+        arguments: Value,
+    },
 }
 ```
+
+**新增纯数据类型（`parrot-protocol::types`）：**
+```rust
+/// 模型元信息（响应 ListModels）
+#[derive(Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub context_window: u32,
+    pub max_output_tokens: u32,
+}
+
+/// 历史条目（响应 GetHistory，对齐 EventLogEntry 但带元数据）
+#[derive(Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub seq: u64,
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub entry: EventLogEntry,   // 复用 core 的 EventLogEntry（带 tag）
+}
+
+/// Session 元信息（响应 ListSessions / SessionList）
+#[derive(Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: SessionId,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub model: String,
+    pub provider: String,
+    pub title: Option<String>,
+    pub total_tokens: u64,
+    pub last_snapshot_seq: u64,
+}
+```
+
+> `ModelInfo` 既出现在 protocol 也出现在 `parrot-core::types`，二者字段相同。`parrot-core` 的 `ModelInfo` 是引擎内部用，`parrot-protocol` 的是 wire 格式——保留两份避免 core 反向依赖 protocol 的 chrono 类型。daemon 在边界做转换。
 
 ### StreamEvent → ServerMessage 映射
 
@@ -154,6 +249,23 @@ pub enum ServerMessage {
 | `Finish { stop_reason, usage }` | `Finished { session_id, stop_reason, usage }` |
 
 > `StreamEvent` 需要在原设计基础上补一个 `ToolResult` 变体，对应 ReAct 的 Observe 阶段——工具执行结果同样要流式推给客户端，不能只存在 core 内部。
+
+### 非流式请求 → 响应映射
+
+非 ReAct 流的请求是"一问一答"，daemon 直接合成 `ServerMessage`，不经 session adapter：
+
+| `ClientMessage` | `ServerMessage` 响应 | 备注 |
+|---|---|---|
+| `Hello { token, .. }` | `HelloAck { server_version }` 或 `Error{AuthFailed}` | 握手阶段 |
+| `CreateSession { config }` | `SessionCreated { session_id }` | 同时 spawn session task |
+| `ListModels` | `ModelList { models }` | 聚合所有 provider 的 `list_models()` |
+| `ListTools { session_id }` | 多条 `TextDelta` + `Finished` | 当前实现：JSON dump 到 TextDelta |
+| `GetHistory { session_id }` | `History { session_id, entries }` | 重放 events.log |
+| `ListSessions` *(1.5)* | `SessionList { sessions }` | 读 index.json |
+| `ResumeSession { session_id }` *(1.5)* | `SessionResumed { session_id }` 或 `Error{SessionNotFound}` | 重放 + 重建 session task |
+| `ConfirmToolCall { .. }` *(1.5)* | （无直接响应；驱动后续 `ToolResult` 或 `ToolCallEnd`） | 见 §4.5 二次确认 |
+
+> `ListTools` 当前实现把工具 schema 用 `TextDelta` 流回，是非正规方式。Phase 1.5 改为新增 `ServerMessage::ToolList { tools: Vec<ToolDefinition> }`，与 `ModelList` 对称。
 
 ---
 
@@ -171,6 +283,22 @@ Think → Act → Observe → Think → Act → Observe → ... → Final Answer
 1. **Think**：LLM 分析当前上下文，决定下一步（调用工具 or 回复用户）
 2. **Act**：如果选择工具调用，执行工具并获取结果
 3. **Observe**：将工具结果追加到上下文，回到 Think 阶段
+
+**System prompt 注入**：session 创建时若 `SessionConfig.system_prompt` 非空，引擎在 context 初始位置插入一条 `ChatRole::System` 消息。后续每轮 ReAct 都保留这条消息（context 裁剪 §4.6 也永远保留 System）。MVP 不支持会话中途修改 system prompt；如需修改需新建 session。
+
+```rust
+// 引擎初始化 context 时：
+let mut context: Vec<ChatMessage> = Vec::new();
+if let Some(prompt) = &self.system_prompt {
+    context.push(ChatMessage {
+        role: ChatRole::System,
+        content: prompt.clone(),
+        tool_call_id: None, tool_name: None, tool_calls: None,
+    });
+}
+```
+
+**默认 system prompt**：若 `SessionConfig.system_prompt` 为空，daemon 注入一份"通用编程助手"模板（声明可用工具、ReAct 工作方式、安全约束）。模板放在 daemon 而非 core，遵守 core 的零 IO/零策略假设。
 
 **后续升级**：ReAct + 规划子模式。复杂任务先让 LLM 生成高层计划，再逐步进入 ReAct 执行。MVP 阶段仅实现纯 ReAct，架构预留规划层的扩展点。
 
@@ -265,6 +393,39 @@ pub enum StreamEvent {
 - Session 恢复：daemon 重启后按需重放 event log 重建内存状态
 - 并发模型详见 §4.5
 
+**Session 生命周期与持久化触发点**：
+
+| 事件 | daemon 动作 |
+|------|-------------|
+| `CreateSession` | 生成 `session_id`，创建 `{data_dir}/sessions/{id}/`，写 `meta.json`（initial）、追加 `SessionCreated` 到 events.log、更新 `index.json` |
+| 每条 `EventLogEntry::append` | 写 events.log 一行；同步更新 `meta.json` 的 `updated_at`/`total_tokens`；每 100 条触发 snapshot |
+| `Finished`（一轮 ReAct 结束） | 更新 `meta.json`；若 `title` 仍为空且这是第一轮，调用 LLM 生成 title（异步、失败不阻塞） |
+| daemon 优雅退出 | 对所有 active session flush + 写最终 snapshot |
+| daemon 崩溃 | 重启后通过 `index.json` 找到所有 session；按需重放（客户端 `ResumeSession` 时） |
+
+**index.json（全局索引）**：
+
+```json
+{
+  "version": 1,
+  "sessions": [
+    { "id": "uuid", "title": "重构 utils.rs", "model": "...", "updated_at": "...", "total_tokens": 15000 }
+  ]
+}
+```
+
+读写由 daemon 串行化（`RwLock<SessionIndex>`），不并发写——session 创建/更新事件先入队，单个 task 顺序应用，避免文件竞争。
+
+**ResumeSession 流程（Phase 1.5）**：
+1. 客户端发 `ResumeSession { session_id }`
+2. daemon 查 `index.json` 确认存在
+3. 读 `meta.json` → 读最近 snapshot → 重放 snapshot 之后的 events.log → 重建 `Vec<ChatMessage>`
+4. spawn 新的 ReAct engine task，注入重建后的 context
+5. 回 `SessionResumed { session_id }`
+6. 后续 `Chat` 命令接续到该 task
+
+> 重放产物（`Vec<ChatMessage>`）只含 user/assistant/tool 三类，System 由当前 daemon 的 system prompt 模板重新注入——这保证升级 system prompt 模板后旧 session 也能享受到新版行为。
+
 ### 4.5 并发模型
 
 **每 session 一个独立 tokio task**，session 内部状态不跨 task 共享，避免锁竞争。
@@ -308,6 +469,55 @@ pub enum SessionCmd {
 - `Abort` 通过 `tokio::select!` 在 ReAct 循环中监听，收到后立即结束当前 LLM 流（drop stream）和工具执行（cancel-safe）
 - 已写入 session log 的事件不回滚（append-only），但当前 ReAct 轮次标记为 `aborted`
 - 客户端收到 `Finished { stop_reason: Aborted }`
+
+**真正的 Abort 实现**（修正初版仅 break 主循环的缺陷）：
+
+每轮 ReAct 的"调 LLM + 工具执行"是两个独立可取消点。当前实现把 `cmd_rx.recv()` 放在 while 循环顶部，导致 `Abort` 必须等当前轮完整跑完才被处理。正确做法是把 `Abort` 监听下沉到每轮内部：
+
+```rust
+// 每轮 ReAct 内部：
+loop {
+    tokio::select! {
+        // 1. 正常接收 provider stream 事件
+        Some(event) = stream.inner.recv() => { /* 累积 text / tool_calls */ }
+
+        // 2. 监听 abort 命令
+        Some(SessionCmd::Abort) = cmd_rx.recv() => {
+            drop(stream);                    // drop mpsc receiver → spawn 的 SSE 解析 task 退出
+            emit Finish { stop_reason: Aborted, .. };
+            return;                          // 整个 session task 结束
+        }
+
+        // 3. 监听工具取消（工具执行阶段，下方 else 分支）
+        else => break;                       // stream 自然结束
+    }
+}
+```
+
+工具执行阶段类似：`tokio::select! { _ = tool.call(...) => ..., _ = cmd_rx.recv() => abort }`。但工具若已发出 IO（如 `file_write` 已落盘），不能"撤回"——只能让后续的 `ToolResult` 标记为 `is_error: true, content: "aborted"`，并把已落盘的事实写进 event log，让用户/LLM 知道副作用已发生。
+
+`SessionHandle::abort_handle` 仅用于"强杀整个 session task"（如 daemon 关闭时），不参与正常 Abort 流程。
+
+**工具二次确认流程（Phase 1.5）**：
+
+`tools.sandbox.require_confirmation` 列表匹配的命令，daemon 在 `Act` 阶段不直接执行，而是走以下流程：
+
+```
+1. 引擎拿到 tool_calls 后，对每个需要确认的 tool_call：
+   - 不立即调用 tool.call()
+   - 通过 event_tx 发送 ToolCallConfirmationRequired { session_id, tool_id, tool_name, arguments }
+   - 在 session task 内挂起一个 oneshot::Receiver<ConfirmDecision>
+2. daemon 的 connection handler 收到 ToolCallConfirmationRequired 转发给客户端
+3. 客户端 UI 弹确认（CLI 输入 y/n；TUI 模态框）
+4. 客户端发 ConfirmToolCall { session_id, tool_id, decision }
+5. daemon 路由到对应 session task，通过 oneshot sender 唤醒
+6. 引擎根据 decision：
+   - Approve → 正常 tool.call()，发 ToolResult
+   - Reject  → 发 ToolResult { is_error: true, content: "user rejected" }，LLM 后续可决策
+   - Timeout（默认 60s） → 同 Reject，但记录 "confirmation timeout"
+```
+
+需要"路由 client→session 的 confirm 回调"——daemon 端维护 `HashMap<(SessionId, ToolId), oneshot::Sender<ConfirmDecision>>`，挂在 `RwLock` 后面。这个 map 仅在 confirm 流程激活期间存在条目，正常路径零开销。
 
 **ToolRegistry 并发**：`RwLock<HashMap>` 支持运行时热注册工具（Phase 2 场景），读多写少。
 
@@ -365,6 +575,56 @@ pub enum ProviderError {
 
 `anyhow` 仅用于 daemon 和客户端 binary 内部（应用层），不跨 crate 边界。
 
+### 4.8 Provider 重试与退避
+
+`ProviderError` 区分可重试与不可重试：
+
+| `ProviderError` 变体 | 可重试 | 备注 |
+|---|---|---|
+| `RateLimited { retry_after_ms }` | ✅ | 优先按服务端 `retry-after` 头等待 |
+| `Timeout(ms)` | ✅ | 网络/上游慢 |
+| `Api { status: 5xx, .. }` | ✅ | 服务端错误 |
+| `Api { status: 4xx (非 429), .. }` | ❌ | 请求本身错（鉴权、参数），重试无意义 |
+| `Network(_)` | ✅ | 连接重置等 |
+| `StreamError(_)` | ❌ | 流已部分发送，重试会破坏一致性 |
+
+**退避策略（在 daemon 的 provider 调用包装层实现，不动 core trait）**：
+
+```rust
+// 伪代码：daemon/providers/retry.rs
+const MAX_RETRIES: u32 = 3;
+const BASE_DELAY_MS: u64 = 500;
+const MAX_DELAY_MS:   u64 = 30_000;
+
+async fn with_retry<F, Fut, T>(op: F) -> Result<T, ProviderError>
+where F: Fn() -> Fut, Fut: Future<Output = Result<T, ProviderError>>
+{
+    let mut attempt = 0;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if !is_retryable(&e) => return Err(e),
+            Err(e) if attempt >= MAX_RETRIES => return Err(e),
+            Err(e) => {
+                let delay = match &e {
+                    ProviderError::RateLimited { retry_after_ms } => *retry_after_ms,
+                    _ => BASE_DELAY_MS * 2u64.pow(attempt),
+                };
+                let delay = delay.min(MAX_DELAY_MS);
+                let jitter = rand::rng().random_range(0..delay / 4 + 1);  // ±25% jitter
+                tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
+                attempt += 1;
+                tracing::warn!(attempt, delay_ms = delay + jitter, error = %e, "retrying provider");
+            }
+        }
+    }
+}
+```
+
+包装点：`AnthropicProvider::chat_stream` / `chat` 内部的 `send_request` 调用前包一层 `with_retry`。流式阶段（SSE 已开始）不再重试——一旦开始吐 delta，错误只能上报为 `StreamError`。
+
+**降级（Phase 3 预留）**：当某 provider 连续 N 次失败，`ProviderRegistry` 可标记其为"暂时不可用"，`resolve(model)` 路由到 fallback provider。MVP 不实现，仅留 hook（registry 内 `health: HashMap<provider_id, HealthState>`）。
+
 ---
 
 ## 5. Crate 工作区
@@ -373,6 +633,7 @@ pub enum ProviderError {
 parrot/
 ├── Cargo.toml              # workspace manifest
 ├── parrot.toml              # 默认配置文件
+├── AGENTS.md                # build/test/lint 指引（给 agent / 新贡献者）
 ├── crates/
 │   ├── parrot-core/         # lib — 编排引擎、Tool/Provider trait、Session 状态机
 │   ├── parrot-protocol/     # lib — WS 消息类型（纯 serde 数据）
@@ -384,7 +645,11 @@ parrot/
 │   └── tui/                 # binary: parrot-tui — TUI 客户端（Phase 1.5）
 ├── docs/
 │   └── superpowers/specs/   # 设计文档
-└── tests/                   # 集成测试
+└── tests/
+    ├── integration/
+    │   └── e2e_test.rs      # mock provider 注入式 E2E
+    └── cassettes/           # provider API 录制（Phase 1 收尾）
+        └── anthropic/       # anthropic SSE 帧序列
 ```
 
 ### Binary 与 Crate 命名
@@ -529,6 +794,46 @@ keep_recent_turns = 6
 }
 ```
 
+**写入时机**：
+- `CreateSession`：写 initial 版本（`title: null`, `total_tokens: 0`, `last_snapshot_seq: 0`）
+- 每次 `EventLogEntry::Finish`：更新 `updated_at` + 累加 `total_tokens`
+- snapshot 完成后：更新 `last_snapshot_seq`
+- 第一轮 `Finished` 后异步生成 `title`（调 LLM 用 user message 概括 ≤ 30 字），失败保持 null
+
+**原子写**：写 `meta.json` 用 `write to .tmp then rename` 模式，避免崩溃时半截文件。
+
+### index.json
+
+```json
+{
+  "version": 1,
+  "sessions": [
+    {
+      "id": "uuid-v4",
+      "title": "重构 utils.rs",
+      "model": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "updated_at": "2026-06-21T10:30:00Z",
+      "total_tokens": 15000
+    }
+  ]
+}
+```
+
+**角色**：客户端 `ListSessions` 不需要扫盘，单文件读即得全部 session 摘要。**只有 daemon 写**：每次 `CreateSession` / `meta.json` 更新时同步刷 index.json（同样原子写）。
+
+### Snapshot 触发
+
+| 触发条件 | 动作 |
+|----------|------|
+| `events.log` 自上次 snapshot 后新增 ≥ 100 条 | 写 `snapshot-{NNN}.json`，更新 `meta.json::last_snapshot_seq` |
+| daemon 收到 `SIGTERM` / `Ctrl+C` | 对所有 active session flush 当前 events.log + 写最终 snapshot |
+| 客户端显式 `FlushSession`（Phase 1.5 可选） | 立即 snapshot |
+
+**Snapshot 内容**：完整的 `Vec<ChatMessage>` 序列化（含 tool_calls / tool_call_id），外加 `last_seq` 字段。重放时优先加载 snapshot，再 replay `seq > last_seq` 的 events。
+
+**Snapshot 轮转**：保留最近 3 个 snapshot，更老的删除（避免无限增长）。
+
 ---
 
 ## 8. 安全模型
@@ -610,6 +915,16 @@ daemon 监听 `127.0.0.1:9876`，本机任何进程都可尝试连接。主要�
 | `parrot-daemon` | 集成测试 | 启动 daemon → WS 连接 → 发送消息 → 验证响应 |
 | 客户端 | 集成测试 | CLI 端到端测试（daemon 在后台） |
 
+**当前已落地测试**（`cargo test --workspace` 全绿）：
+
+- `parrot-protocol/tests/roundtrip.rs` — 7 个 serde 往返测试
+- `parrot-transport/tests/transport_test.rs` — 3 个 WS 测试（含跨域 Origin 拒绝）
+- `parrot-core/tests/react_loop.rs` — 1 个 mock provider + ReAct loop 测试
+- `parrot-core::context::tests` — 4 个上下文裁剪测试
+- `parrot-core::tool::tests` — 3 个 ToolRegistry 测试
+- `src/daemon/auth.rs::tests` — 3 个 token 生成/校验测试
+- `tests/integration/e2e_test.rs` — 1 个完整 E2E（Hello → CreateSession → Chat → tool_use → ToolResult → Finished）
+
 **Provider 适配器测试：cassette 录制/回放**
 
 - 首次运行录制真实 Anthropic API 响应到 `tests/cassettes/`
@@ -617,28 +932,100 @@ daemon 监听 `127.0.0.1:9876`，本机任何进程都可尝试连接。主要�
 - CI 环境完全确定性
 - 录制新 cassette 需显式触发（`RECORD=1 cargo test`）
 
+**Cassette 框架设计**：
+
+```
+tests/
+└── cassettes/
+    └── anthropic/
+        ├── chat_stream_simple_text.json       # 单文本响应
+        ├── chat_stream_tool_use.json          # 单工具调用 + 后续 end_turn
+        ├── chat_stream_multi_tool_use.json    # 并行多工具
+        └── chat_stream_error_rate_limited.json
+```
+
+每个 cassette 是一份 JSON，结构对齐 Anthropic SSE 帧序列：
+
+```json
+{
+  "name": "chat_stream_tool_use",
+  "request": {
+    "url": "/v1/messages",
+    "method": "POST",
+    "body_matches": { "model": "claude-sonnet-4-6", "stream": true }
+  },
+  "response": {
+    "status": 200,
+    "events": [
+      { "event": "message_start", "data": { "message": { "usage": { "input_tokens": 10 } } } },
+      { "event": "content_block_start", "data": { "index": 0, "content_block": { "type": "tool_use", "id": "tc_1", "name": "file_read" } } },
+      { "event": "content_block_delta",  "data": { "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{\"path\":" } } },
+      { "event": "content_block_delta",  "data": { "index": 0, "delta": { "type": "input_json_delta", "partial_json": "\"src/lib.rs\"}" } } },
+      { "event": "content_block_stop",   "data": { "index": 0 } },
+      { "event": "message_delta",        "data": { "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 25 } } },
+      { "event": "message_stop",         "data": {} }
+    ]
+  }
+}
+```
+
+**实现路径**：在 `src/daemon/providers/anthropic.rs` 抽出 `fn send_request` 的可插拔 HTTP client。测试用一个 `MockHttpClient` 实现 `reqwest` 的子集接口，根据 request URL/body 匹配 cassette，按 `events` 数组顺序 yield SSE 帧。生产代码用真实 `reqwest::Client`。
+
+或者更轻量：测试不调 `AnthropicProvider::chat_stream`，而是直接构造一个 `CassetteProvider` 实现 `LlmProvider` trait，把 cassette 里的 events 转成 `StreamEvent` 推入 mpsc——绕过 SSE 解析，专注测引擎 + 工具链路。前者覆盖 SSE 解析、后者覆盖 ReAct 行为，互补。
+
+MVP 采用 **后者**（`CassetteProvider`）：成本低、覆盖关键路径。SSE 解析的单测另写：把 `parse_sse_stream` 抽 pub(crate) 或加 `#[cfg(test)]` 入口，喂入字节流验证 StreamEvent 序列。
+
+**录制模式（`RECORD=1`）**：
+
+```rust
+// tests/cassette/record.rs (only compiled when RECORD=1)
+if env::var("RECORD").is_ok() {
+    let real = AnthropicProvider::new(api_key, ..);
+    let stream = real.chat_stream(..).await?;
+    let mut events = Vec::new();
+    while let Some(ev) = stream.inner.recv().await { events.push(ev); }
+    serde_json::to_writer(File::create(path)?, &events)?;
+}
+```
+
+CI 默认跑回放，开发者本地偶尔 `RECORD=1 cargo test --test cassette` 刷新。
+
 ---
 
 ## 11. 实施路线
 
 ### Phase 1 — MVP（当前）
 
-1. 搭建 workspace，创建所有 crate skeleton（含 `parrot-transport`）
-2. `parrot-protocol`：WS 消息类型定义 + serde 往返测试
-3. `parrot-config`：配置文件解析 + `dirs` 路径解析
-4. `parrot-transport`：Transport trait + WS server/client 实现
-5. `parrot-core`：Tool trait + Provider trait + ReAct 引擎 + Session 状态机 + thiserror 错误类型
-6. `parrot-daemon`：WS server + Anthropic adapter + 内置工具实现 + Token 握手 + Origin 校验
-7. `parrot-cli`：CLI 瘦客户端（Hello 握手、Chat、流式输出展示）
-8. 集成测试（cassette 录制）+ 文档
+1. ✅ 搭建 workspace，创建所有 crate skeleton（含 `parrot-transport`）
+2. ✅ `parrot-protocol`：WS 消息类型定义 + serde 往返测试
+3. ✅ `parrot-config`：配置文件解析 + `dirs` 路径解析
+4. ✅ `parrot-transport`：Transport trait + WS server/client 实现
+5. ✅ `parrot-core`：Tool trait + Provider trait + ReAct 引擎 + Session 状态机 + thiserror 错误类型
+6. ✅ `parrot-daemon`：WS server + Anthropic adapter + 内置工具实现 + Token 握手 + Origin 校验
+7. ✅ `parrot-cli`：CLI 瘦客户端（Hello 握手、Chat、流式输出展示）
+8. ✅ 集成测试（mock provider 注入）+ 文档
+
+**Phase 1 收尾（本批推进）**：
+
+9. ✅ `ListModels` 协议消息 + daemon 实现（聚合各 provider 的 `list_models()`）
+10. ✅ `GetHistory` 协议消息 + event log 重放
+11. ✅ Session 持久化补全：`meta.json` 写入时机、`index.json`、snapshot 触发与轮转
+12. ✅ Provider 重试退避（`with_retry` 包装层，§4.8）
+13. ✅ 真正的 Abort 取消（`tokio::select!` 下沉到 ReAct 每轮内部，§4.5）
+14. ✅ System prompt 注入（`SessionConfig.system_prompt` → context 头部，§4.1）
+15. ✅ Cassette 测试框架（`CassetteProvider` + `tests/cassettes/anthropic/`）
 
 **MVP 验收标准**：CLI 启动 daemon → 创建 session → 发送"读取 X 文件并总结"→ agent 调用 `file_read` → 流式返回总结，全程 token 校验生效。
 
 ### Phase 1.5
 
-- TUI 客户端（ratatui + mpsc 喂 WS 事件到事件循环）
-- 工具二次确认流程（`ConfirmToolCall` 协议消息）
-- Session 历史搜索与管理（CLI 子命令）
+- ✅ TUI 客户端（ratatui + mpsc 喂 WS 事件到事件循环）— 设计就绪，待 Phase 1.5b 实施
+- ✅ 工具二次确认流程（`ConfirmToolCall` 协议消息）
+- ✅ Session 历史搜索与管理（CLI 子命令）
+- ✅ `ListSessions` / `ResumeSession` 协议消息 + daemon 处理器
+- ✅ `ToolList` 消息（替换当前 `ListTools` 用 `TextDelta` 回传 JSON 的临时实现）
+
+> 详细规范与实施状态见 [`2026-06-21-parrot-phase-1.5.md`](2026-06-21-parrot-phase-1.5.md)。该文档拆分自本文档以控制单文件规模——主文档保留架构与 Phase 1 基线，phase-1.5 文档专注该阶段的协议扩展、daemon 处理器、CLI 子命令、二次确认流程、TUI（Phase 1.5b 待实施）。
 
 ### Phase 2
 

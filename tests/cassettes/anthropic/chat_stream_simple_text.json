@@ -1,0 +1,8 @@
+{
+  "name": "chat_stream_simple_text",
+  "description": "A no-tool-call response: Anthropic emits a text delta and immediately stops with EndTurn. Used to test the simplest ReAct path.",
+  "events": [
+    { "TextDelta": { "delta": "Hello from the cassette." } },
+    { "Finish": { "stop_reason": "EndTurn", "usage": { "input_tokens": 5, "output_tokens": 8 } } }
+  ]
+}

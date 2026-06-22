@@ -13,7 +13,9 @@ impl FileGlobTool {
 
 #[async_trait]
 impl Tool for FileGlobTool {
-    fn name(&self) -> &str { "file_glob" }
+    fn name(&self) -> &str {
+        "file_glob"
+    }
 
     fn description(&self) -> &str {
         "Find files matching a glob pattern. Returns matching file paths relative to the working directory."
@@ -37,14 +39,16 @@ impl Tool for FileGlobTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let pattern = arguments.get("pattern")
+        let pattern = arguments
+            .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::ToolExecution {
                 tool: "file_glob".to_string(),
                 message: "Missing 'pattern' argument".to_string(),
             })?;
 
-        let base_path = arguments.get("path")
+        let base_path = arguments
+            .get("path")
             .and_then(|v| v.as_str())
             .map(|p| {
                 if std::path::Path::new(p).is_absolute() {
@@ -64,8 +68,7 @@ impl Tool for FileGlobTool {
                 for entry in paths {
                     match entry {
                         Ok(path) => {
-                            let relative = path.strip_prefix(&base_path)
-                                .unwrap_or(&path);
+                            let relative = path.strip_prefix(&base_path).unwrap_or(&path);
                             matches.push(relative.to_string_lossy().to_string());
                         }
                         Err(e) => {

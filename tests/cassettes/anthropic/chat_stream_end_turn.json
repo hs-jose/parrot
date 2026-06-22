@@ -1,0 +1,8 @@
+{
+  "name": "chat_stream_end_turn",
+  "description": "Followup turn after the tool result: Anthropic emits a final text delta and stops with EndTurn. Used as the second cassette in a ReAct loop test.",
+  "events": [
+    { "TextDelta": { "delta": "done" } },
+    { "Finish": { "stop_reason": "EndTurn", "usage": { "input_tokens": 20, "output_tokens": 10 } } }
+  ]
+}

@@ -27,11 +27,7 @@ impl WsTransportClient {
 
 #[async_trait]
 impl TransportClient for WsTransportClient {
-    async fn connect(
-        &self,
-        url: &str,
-        token: &str,
-    ) -> Result<ServerConnection, TransportError> {
+    async fn connect(&self, url: &str, token: &str) -> Result<ServerConnection, TransportError> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
         let (ws_sink, ws_stream) = ws_stream.split();
 

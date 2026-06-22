@@ -5,6 +5,7 @@ mod auth;
 mod providers;
 mod server;
 mod session_adapter;
+mod session_store;
 mod tools;
 
 #[tokio::main]

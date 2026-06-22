@@ -114,7 +114,11 @@ impl AppConfig {
     fn resolve_token_path(&mut self) -> Result<(), ConfigError> {
         if self.daemon.auth_token_file.is_empty() {
             if let Some(config_dir) = dirs::config_dir() {
-                self.daemon.auth_token_file = config_dir.join("parrot").join("token").to_string_lossy().to_string();
+                self.daemon.auth_token_file = config_dir
+                    .join("parrot")
+                    .join("token")
+                    .to_string_lossy()
+                    .to_string();
             }
         }
         Ok(())

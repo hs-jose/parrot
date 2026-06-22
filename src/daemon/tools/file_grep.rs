@@ -14,7 +14,9 @@ impl FileGrepTool {
 
 #[async_trait]
 impl Tool for FileGrepTool {
-    fn name(&self) -> &str { "file_grep" }
+    fn name(&self) -> &str {
+        "file_grep"
+    }
 
     fn description(&self) -> &str {
         "Search for a regex pattern in files. Returns matching lines in file:line:content format."
@@ -42,7 +44,8 @@ impl Tool for FileGrepTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let pattern_str = arguments.get("pattern")
+        let pattern_str = arguments
+            .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::ToolExecution {
                 tool: "file_grep".to_string(),
@@ -54,7 +57,8 @@ impl Tool for FileGrepTool {
             message: format!("Invalid regex pattern '{}': {}", pattern_str, e),
         })?;
 
-        let base_path = arguments.get("path")
+        let base_path = arguments
+            .get("path")
             .and_then(|v| v.as_str())
             .map(|p| {
                 if std::path::Path::new(p).is_absolute() {
@@ -65,7 +69,8 @@ impl Tool for FileGrepTool {
             })
             .unwrap_or_else(|| ctx.working_dir.clone());
 
-        let include_pattern = arguments.get("include")
+        let include_pattern = arguments
+            .get("include")
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
@@ -73,11 +78,22 @@ impl Tool for FileGrepTool {
         let mut files_searched = 0u32;
         let max_results = 100;
 
-        search_dir(&base_path, &ctx.working_dir, &re, include_pattern, &mut results, &mut files_searched, max_results)?;
+        search_dir(
+            &base_path,
+            &ctx.working_dir,
+            &re,
+            include_pattern,
+            &mut results,
+            &mut files_searched,
+            max_results,
+        )?;
 
         if results.is_empty() {
             Ok(ToolOutput {
-                content: format!("No matches found for pattern '{}' in {:?}", pattern_str, base_path),
+                content: format!(
+                    "No matches found for pattern '{}' in {:?}",
+                    pattern_str, base_path
+                ),
                 is_error: false,
             })
         } else {
@@ -123,7 +139,15 @@ fn search_dir(
                     continue;
                 }
             }
-            search_dir(&path, working_dir, re, include_pattern, results, files_searched, max_results)?;
+            search_dir(
+                &path,
+                working_dir,
+                re,
+                include_pattern,
+                results,
+                files_searched,
+                max_results,
+            )?;
         } else if path.is_file() {
             // Apply include filter
             if !include_pattern.is_empty() {
@@ -149,8 +173,7 @@ fn search_dir(
 
             if let Ok(content) = std::fs::read_to_string(&path) {
                 *files_searched += 1;
-                let relative = path.strip_prefix(working_dir)
-                    .unwrap_or(&path);
+                let relative = path.strip_prefix(working_dir).unwrap_or(&path);
                 for (i, line) in content.lines().enumerate() {
                     if re.is_match(line) {
                         results.push(format!("{}:{}:{}", relative.to_string_lossy(), i + 1, line));

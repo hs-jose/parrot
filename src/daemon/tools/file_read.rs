@@ -13,7 +13,9 @@ impl FileReadTool {
 
 #[async_trait]
 impl Tool for FileReadTool {
-    fn name(&self) -> &str { "file_read" }
+    fn name(&self) -> &str {
+        "file_read"
+    }
 
     fn description(&self) -> &str {
         "Read the contents of a file. Use offset and limit to read specific line ranges."
@@ -41,7 +43,8 @@ impl Tool for FileReadTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let path_str = arguments.get("path")
+        let path_str = arguments
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::ToolExecution {
                 tool: "file_read".to_string(),
@@ -75,7 +78,10 @@ impl Tool for FileReadTool {
             message: format!("Cannot read file {:?}: {}", path, e),
         })?;
 
-        let offset = arguments.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let offset = arguments
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
         let limit = arguments.get("limit").and_then(|v| v.as_u64());
 
         let lines: Vec<&str> = content.lines().collect();
@@ -87,7 +93,11 @@ impl Tool for FileReadTool {
 
         if start >= lines.len() {
             return Ok(ToolOutput {
-                content: format!("File has {} lines, offset {} is out of range", lines.len(), offset),
+                content: format!(
+                    "File has {} lines, offset {} is out of range",
+                    lines.len(),
+                    offset
+                ),
                 is_error: true,
             });
         }

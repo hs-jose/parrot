@@ -7,6 +7,12 @@ pub struct WebFetchTool {
     client: reqwest::Client,
 }
 
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebFetchTool {
     pub fn new() -> Self {
         Self {
@@ -20,7 +26,9 @@ impl WebFetchTool {
 
 #[async_trait]
 impl Tool for WebFetchTool {
-    fn name(&self) -> &str { "web_fetch" }
+    fn name(&self) -> &str {
+        "web_fetch"
+    }
 
     fn description(&self) -> &str {
         "Fetch content from a URL. Returns the response body as text."
@@ -40,27 +48,40 @@ impl Tool for WebFetchTool {
     }
 
     async fn call(&self, arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let url = arguments.get("url")
+        let url = arguments
+            .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::ToolExecution {
                 tool: "web_fetch".to_string(),
                 message: "Missing 'url' argument".to_string(),
             })?;
 
-        let response = self.client.get(url).send().await.map_err(|e| AgentError::ToolExecution {
-            tool: "web_fetch".to_string(),
-            message: format!("Failed to fetch URL '{}': {}", url, e),
-        })?;
+        let response =
+            self.client
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| AgentError::ToolExecution {
+                    tool: "web_fetch".to_string(),
+                    message: format!("Failed to fetch URL '{}': {}", url, e),
+                })?;
 
         let status = response.status();
-        let content = response.text().await.map_err(|e| AgentError::ToolExecution {
-            tool: "web_fetch".to_string(),
-            message: format!("Failed to read response body: {}", e),
-        })?;
+        let content = response
+            .text()
+            .await
+            .map_err(|e| AgentError::ToolExecution {
+                tool: "web_fetch".to_string(),
+                message: format!("Failed to read response body: {}", e),
+            })?;
 
         // Truncate very large responses
         let content = if content.len() > 100_000 {
-            format!("{}... (truncated, total {} bytes)", &content[..100_000], content.len())
+            format!(
+                "{}... (truncated, total {} bytes)",
+                &content[..100_000],
+                content.len()
+            )
         } else {
             content
         };

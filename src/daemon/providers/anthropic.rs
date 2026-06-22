@@ -174,6 +174,18 @@ impl AnthropicProvider {
         &self,
         request: &AnthropicRequest,
     ) -> Result<reqwest::Response, ProviderError> {
+        // Wrap the single HTTP attempt in the retry/backoff policy (§4.8).
+        // The closure captures `self` and `request` by reference; each retry
+        // builds a fresh future and re-issues the same POST. Stream-phase
+        // errors don't go through this path (we only retry up to the point
+        // where the response body starts streaming).
+        crate::providers::retry::with_retry(|| self.send_request_once(request)).await
+    }
+
+    async fn send_request_once(
+        &self,
+        request: &AnthropicRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
         let response = self
             .client
@@ -194,7 +206,9 @@ impl AnthropicProvider {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(5000);
-            return Err(ProviderError::RateLimited { retry_after_ms: retry_after });
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: retry_after,
+            });
         }
         if status.is_client_error() || status.is_server_error() {
             let body = response.text().await.unwrap_or_default();
@@ -332,7 +346,11 @@ impl LlmProvider for AnthropicProvider {
             content: text_content,
             tool_call_id: None,
             tool_name: None,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
         })
     }
 }
@@ -398,7 +416,8 @@ async fn parse_sse_stream(
                             current_usage.input_tokens = usage
                                 .get("input_tokens")
                                 .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
+                                .unwrap_or(0)
+                                as u32;
                         }
                     }
                 }
@@ -408,10 +427,8 @@ async fn parse_sse_stream(
                             .get("type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let index = json
-                            .get("index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
+                        let index =
+                            json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
                         if block_type == "tool_use" {
                             let id = content_block
@@ -431,34 +448,35 @@ async fn parse_sse_stream(
                 }
                 "content_block_delta" => {
                     if let Some(delta) = json.get("delta") {
-                        let delta_type = delta
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let index = json
-                            .get("index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
+                        let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let index =
+                            json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
                         match delta_type {
                             "text_delta" => {
                                 if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                    let _ = tx.send(StreamEvent::TextDelta {
-                                        delta: text.to_string(),
-                                    }).await;
+                                    let _ = tx
+                                        .send(StreamEvent::TextDelta {
+                                            delta: text.to_string(),
+                                        })
+                                        .await;
                                 }
                             }
                             "input_json_delta" => {
-                                if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                if let Some(partial) =
+                                    delta.get("partial_json").and_then(|v| v.as_str())
+                                {
                                     if let Some(tool_id) = tool_index_to_id.get(&index) {
                                         tool_accumulated_args
                                             .entry(index)
                                             .or_default()
                                             .push_str(partial);
-                                        let _ = tx.send(StreamEvent::ToolCallDelta {
-                                            id: tool_id.clone(),
-                                            args_delta: partial.to_string(),
-                                        }).await;
+                                        let _ = tx
+                                            .send(StreamEvent::ToolCallDelta {
+                                                id: tool_id.clone(),
+                                                args_delta: partial.to_string(),
+                                            })
+                                            .await;
                                     }
                                 }
                             }
@@ -467,10 +485,7 @@ async fn parse_sse_stream(
                     }
                 }
                 "content_block_stop" => {
-                    let index = json
-                        .get("index")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as usize;
+                    let index = json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     if let Some(tool_id) = tool_index_to_id.get(&index) {
                         let args_str = tool_accumulated_args
                             .get(&index)
@@ -478,10 +493,12 @@ async fn parse_sse_stream(
                             .unwrap_or("{}");
                         let arguments = serde_json::from_str(args_str)
                             .unwrap_or(Value::Object(serde_json::Map::new()));
-                        let _ = tx.send(StreamEvent::ToolCallEnd {
-                            id: tool_id.clone(),
-                            arguments,
-                        }).await;
+                        let _ = tx
+                            .send(StreamEvent::ToolCallEnd {
+                                id: tool_id.clone(),
+                                arguments,
+                            })
+                            .await;
                     }
                 }
                 "message_delta" => {
@@ -490,16 +507,19 @@ async fn parse_sse_stream(
                             current_usage.output_tokens += usage_delta
                                 .get("output_tokens")
                                 .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
+                                .unwrap_or(0)
+                                as u32;
                         }
                         let stop_reason = delta
                             .get("stop_reason")
                             .and_then(|v| v.as_str())
                             .unwrap_or("end_turn");
-                        let _ = tx.send(StreamEvent::Finish {
-                            stop_reason: parse_stop_reason(stop_reason),
-                            usage: current_usage.clone(),
-                        }).await;
+                        let _ = tx
+                            .send(StreamEvent::Finish {
+                                stop_reason: parse_stop_reason(stop_reason),
+                                usage: current_usage.clone(),
+                            })
+                            .await;
                     }
                 }
                 "message_stop" => {}

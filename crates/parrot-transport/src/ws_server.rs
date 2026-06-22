@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parrot_protocol::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc;
+use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tokio_tungstenite::accept_hdr_async;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -70,12 +70,20 @@ pub async fn accept_connection(
     let (stream, remote_addr) = listener.accept().await?;
     info!("New connection from {}", remote_addr);
 
+    // `accept_hdr_async`'s callback signature returns `Result<Response, Response>`
+    // (an HTTP response as both Ok and Err), so the Err variant is unavoidably
+    // large — it IS the response. Clippy's `result_large_err` lint fires here
+    // but the size is inherent to the tungstenite API contract.
+    #[allow(clippy::result_large_err)]
     let origin_check = |req: &Request, response: Response| {
         match req.headers().get("Origin").and_then(|v| v.to_str().ok()) {
             None => Ok(response), // no origin header — allow (local CLI doesn't send one)
             Some(origin) if origin_allowed(origin) => Ok(response),
             Some(origin) => {
-                warn!("Rejecting WS upgrade from {}: bad origin {:?}", remote_addr, origin);
+                warn!(
+                    "Rejecting WS upgrade from {}: bad origin {:?}",
+                    remote_addr, origin
+                );
                 // Build a 403 response body to signal rejection.
                 let body = format!("Origin not allowed: {origin}\n");
                 let reject = Response::builder()

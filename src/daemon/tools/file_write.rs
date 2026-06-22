@@ -13,7 +13,9 @@ impl FileWriteTool {
 
 #[async_trait]
 impl Tool for FileWriteTool {
-    fn name(&self) -> &str { "file_write" }
+    fn name(&self) -> &str {
+        "file_write"
+    }
 
     fn description(&self) -> &str {
         "Write content to a file. Creates the file if it does not exist."
@@ -37,14 +39,16 @@ impl Tool for FileWriteTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let path_str = arguments.get("path")
+        let path_str = arguments
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::ToolExecution {
                 tool: "file_write".to_string(),
                 message: "Missing 'path' argument".to_string(),
             })?;
 
-        let content = arguments.get("content")
+        let content = arguments
+            .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::ToolExecution {
                 tool: "file_write".to_string(),

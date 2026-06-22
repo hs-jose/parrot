@@ -1,5 +1,5 @@
+use crate::types::{ConfirmDecision, SessionConfig, SessionId};
 use serde::{Deserialize, Serialize};
-use crate::types::{SessionConfig, SessionId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -24,5 +24,21 @@ pub enum ClientMessage {
     },
     GetHistory {
         session_id: SessionId,
+    },
+    /// List all sessions known to the daemon (reads `index.json`).
+    /// Response: `ServerMessage::SessionList`.
+    ListSessions,
+    /// Resume a previously-persisted session: daemon replays the event log,
+    /// rebuilds the in-memory context, and spawns a new engine task. Response:
+    /// `ServerMessage::SessionResumed` or `Error{SessionNotFound}`.
+    ResumeSession {
+        session_id: SessionId,
+    },
+    /// Response to `ServerMessage::ToolCallConfirmationRequired`. The daemon
+    /// routes this to the waiting session task via `ConfirmRouter`.
+    ConfirmToolCall {
+        session_id: SessionId,
+        tool_id: String,
+        decision: ConfirmDecision,
     },
 }

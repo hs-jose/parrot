@@ -53,6 +53,14 @@ path = "src/cli/main.rs"
 name = "e2e"
 path = "tests/integration/e2e_test.rs"
 
+[[test]]
+name = "phase15"
+path = "tests/integration/phase15_test.rs"
+
+[[test]]
+name = "cassette"
+path = "tests/cassette_test.rs"
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -73,6 +81,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 futures-util = { workspace = true }
 glob = { workspace = true }
 rustyline = { workspace = true }

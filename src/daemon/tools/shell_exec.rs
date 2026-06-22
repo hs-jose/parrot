@@ -26,7 +26,9 @@ impl ShellExecTool {
 
 #[async_trait]
 impl Tool for ShellExecTool {
-    fn name(&self) -> &str { "shell_exec" }
+    fn name(&self) -> &str {
+        "shell_exec"
+    }
 
     fn description(&self) -> &str {
         "Execute a shell command and return its output. Commands are sandboxed to the working directory."
@@ -50,7 +52,8 @@ impl Tool for ShellExecTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let command = arguments.get("command")
+        let command = arguments
+            .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::ToolExecution {
                 tool: "shell_exec".to_string(),
@@ -65,7 +68,8 @@ impl Tool for ShellExecTool {
             });
         }
 
-        let working_dir = arguments.get("working_dir")
+        let working_dir = arguments
+            .get("working_dir")
             .and_then(|v| v.as_str())
             .map(|p| {
                 if std::path::Path::new(p).is_absolute() {
@@ -118,7 +122,10 @@ impl Tool for ShellExecTool {
         }
 
         if result.is_empty() {
-            result = format!("Command exited with code {}", output.status.code().unwrap_or(-1));
+            result = format!(
+                "Command exited with code {}",
+                output.status.code().unwrap_or(-1)
+            );
         }
 
         Ok(ToolOutput {

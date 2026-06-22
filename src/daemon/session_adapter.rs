@@ -36,6 +36,16 @@ impl SessionAdapter {
                 stop_reason,
                 usage,
             },
+            StreamEvent::ToolCallConfirmationRequired {
+                tool_id,
+                tool_name,
+                arguments,
+            } => ServerMessage::ToolCallConfirmationRequired {
+                session_id,
+                tool_id,
+                tool_name,
+                arguments,
+            },
         }
     }
 }

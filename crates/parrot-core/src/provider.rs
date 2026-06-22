@@ -1,7 +1,7 @@
-use async_trait::async_trait;
 use crate::error::ProviderError;
-use crate::types::{ChatMessage, GenerateConfig, ModelInfo};
 use crate::tool::ToolDefinition;
+use crate::types::{ChatMessage, GenerateConfig, ModelInfo};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -68,5 +68,10 @@ impl ProviderRegistry {
             return providers.get(provider_id).cloned();
         }
         None
+    }
+    /// Enumerate the ids of all registered providers. Used by the daemon to
+    /// aggregate `list_models()` across providers for `ClientMessage::ListModels`.
+    pub async fn provider_ids(&self) -> Vec<String> {
+        self.providers.read().await.keys().cloned().collect()
     }
 }

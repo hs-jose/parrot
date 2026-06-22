@@ -1,34 +1,48 @@
-use serde::{Deserialize, Serialize};
 use crate::tool::ToolOutput;
 use parrot_protocol::types::{StopReason, Usage};
+use serde::{Deserialize, Serialize};
+
+// `EventLogEntry` and `EventLogEntryWithMeta` are defined in `parrot-protocol`
+// because they are pure serde data used both on the wire (`ServerMessage::History`)
+// and on disk (`events.log`). Re-export here so existing callers
+// (`crate::engine`, `crate::session`) can keep using `crate::event_log::*`.
+pub use parrot_protocol::types::{EventLogEntry, EventLogEntryWithMeta};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StreamEvent {
-    TextDelta { delta: String },
-    ToolCallStart { id: String, name: String },
-    ToolCallDelta { id: String, args_delta: String },
-    ToolCallEnd { id: String, arguments: serde_json::Value },
-    ToolResult { id: String, result: ToolOutput },
-    Finish { stop_reason: StopReason, usage: Usage },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub enum EventLogEntry {
-    SessionCreated { model: String, provider: String },
-    UserMessage { content: String },
-    AssistantText { content: String },
-    ToolCall { tool_id: String, tool_name: String, arguments: serde_json::Value },
-    ToolResult { tool_id: String, output: ToolOutput },
-    Finish { stop_reason: StopReason, usage: Usage },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventLogEntryWithMeta {
-    pub seq: u64,
-    pub ts: chrono::DateTime<chrono::Utc>,
-    #[serde(flatten)]
-    pub entry: EventLogEntry,
+    TextDelta {
+        delta: String,
+    },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        id: String,
+        args_delta: String,
+    },
+    ToolCallEnd {
+        id: String,
+        arguments: serde_json::Value,
+    },
+    ToolResult {
+        id: String,
+        result: ToolOutput,
+    },
+    Finish {
+        stop_reason: StopReason,
+        usage: Usage,
+    },
+    /// Phase 1.5: a tool call matched `require_confirmation` and the engine
+    /// is now blocking on `ConfirmRouter` for the client's decision. The
+    /// daemon's session adapter converts this to
+    /// `ServerMessage::ToolCallConfirmationRequired`. The engine does NOT
+    /// emit a `ToolResult` until a decision arrives (or the timeout fires).
+    ToolCallConfirmationRequired {
+        tool_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
 }
 
 pub struct EventLog {
@@ -38,7 +52,15 @@ pub struct EventLog {
 
 impl EventLog {
     pub fn new(dir: std::path::PathBuf) -> Self {
-        Self { dir, current_seq: 0 }
+        Self {
+            dir,
+            current_seq: 0,
+        }
+    }
+
+    /// Current sequence number (number of entries appended so far).
+    pub fn current_seq(&self) -> u64 {
+        self.current_seq
     }
 
     pub fn append(&mut self, entry: EventLogEntry) -> std::io::Result<()> {
@@ -49,9 +71,7 @@ impl EventLog {
             ts: chrono::Utc::now(),
             entry,
         };
-        let mut line = serde_json::to_string(&meta).map_err(|e| {
-            std::io::Error::other(e)
-        })?;
+        let mut line = serde_json::to_string(&meta).map_err(std::io::Error::other)?;
         line.push('\n');
         use std::io::Write;
         let file = std::fs::OpenOptions::new()
@@ -89,5 +109,21 @@ impl EventLog {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join("snapshot.json");
         std::fs::write(path, snapshot)
+    }
+
+    /// Write a snapshot of the current context if `current_seq` has crossed a
+    /// multiple of `SNAPSHOT_INTERVAL`. Called by the engine after each
+    /// `Finish` event so a crash never loses more than ~`SNAPSHOT_INTERVAL`
+    /// events of replay work. Single-file overwrite for MVP (rotation to
+    /// keep the last 3 is a follow-up per design doc §7).
+    pub fn maybe_snapshot(&self, context: &[crate::types::ChatMessage]) -> std::io::Result<()> {
+        const SNAPSHOT_INTERVAL: u64 = 100;
+        if self.current_seq == 0 || !self.current_seq.is_multiple_of(SNAPSHOT_INTERVAL) {
+            return Ok(());
+        }
+        let json = serde_json::to_string_pretty(context).map_err(std::io::Error::other)?;
+        self.write_snapshot(&json)?;
+        tracing::info!(seq = self.current_seq, "wrote session snapshot");
+        Ok(())
     }
 }

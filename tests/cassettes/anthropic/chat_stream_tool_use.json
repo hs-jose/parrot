@@ -1,0 +1,10 @@
+{
+  "name": "chat_stream_tool_use",
+  "description": "Anthropic emits a single tool_use block (echo) then stops with ToolUse. The engine should execute the echo tool and re-enter the ReAct loop.",
+  "events": [
+    { "ToolCallStart": { "id": "tc_1", "name": "echo" } },
+    { "ToolCallDelta": { "id": "tc_1", "args_delta": "{\"message\":\"hello\"}" } },
+    { "ToolCallEnd": { "id": "tc_1", "arguments": { "message": "hello" } } },
+    { "Finish": { "stop_reason": "ToolUse", "usage": { "input_tokens": 10, "output_tokens": 5 } } }
+  ]
+}

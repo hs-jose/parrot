@@ -1,10 +1,14 @@
-use parrot_transport::{TransportClient, TransportServer, WsTransportClient, WsTransportServer, accept_connection};
 use parrot_protocol::{ClientMessage, ServerMessage};
+use parrot_transport::{
+    accept_connection, TransportClient, TransportServer, WsTransportClient, WsTransportServer,
+};
 use tokio::time::{timeout, Duration};
 
 /// Bind to an ephemeral port to avoid conflicts between tests.
 async fn bind_ephemeral() -> (tokio::net::TcpListener, u16) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failed");
     let port = listener.local_addr().expect("local addr").port();
     (listener, port)
 }
@@ -80,9 +84,7 @@ async fn ws_server_rejects_cross_origin() {
 
     let (listener, port) = bind_ephemeral().await;
 
-    let server_handle = tokio::spawn(async move {
-        accept_connection(&listener).await
-    });
+    let server_handle = tokio::spawn(async move { accept_connection(&listener).await });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -91,7 +93,9 @@ async fn ws_server_rejects_cross_origin() {
     let mut req = url.into_client_request().expect("build request");
     req.headers_mut().insert(
         "Origin",
-        "http://evil.example.com".parse::<HeaderValue>().expect("header value"),
+        "http://evil.example.com"
+            .parse::<HeaderValue>()
+            .expect("header value"),
     );
 
     // The client side should also fail to connect (handshake rejected with 403).
@@ -105,7 +109,10 @@ async fn ws_server_rejects_cross_origin() {
     // Server must report an OriginRejected error.
     match server_result {
         Err(parrot_transport::TransportError::OriginRejected(_)) => {}
-        other => panic!("expected OriginRejected, got Ok or other error: {:?}", other.err()),
+        other => panic!(
+            "expected OriginRejected, got Ok or other error: {:?}",
+            other.err()
+        ),
     }
 
     // Client must have failed too (either an HTTP error or a connection drop).
@@ -125,9 +132,7 @@ async fn ws_server_allows_localhost_origin() {
 
     let (listener, port) = bind_ephemeral().await;
 
-    let server_handle = tokio::spawn(async move {
-        accept_connection(&listener).await
-    });
+    let server_handle = tokio::spawn(async move { accept_connection(&listener).await });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
