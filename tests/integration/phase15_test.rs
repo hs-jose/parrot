@@ -269,7 +269,7 @@ async fn spawn_daemon(
     config.tools.sandbox.require_confirmation = confirm_patterns;
 
     let daemon_handle = tokio::spawn(async move {
-        parrot_daemon::server::run_with_confirm_timeout(
+        parrot_daemon::run_with_confirm_timeout(
             config,
             auth,
             provider_registry,

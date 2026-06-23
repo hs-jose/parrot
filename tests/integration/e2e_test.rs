@@ -325,7 +325,7 @@ async fn e2e_daemon_react_loop_with_mock_provider() {
 
     let config = test_config(port, &data_dir, &token_path);
     let daemon_handle = tokio::spawn(async move {
-        parrot_daemon::server::run_with(config, auth, provider_registry, tool_registry)
+        parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
             .await
             .expect("daemon run_with");
     });
@@ -582,7 +582,7 @@ async fn spawn_daemon_with_provider(
 
     let config = test_config(port, &data_dir, &token_path);
     let daemon_handle = tokio::spawn(async move {
-        parrot_daemon::server::run_with(config, auth, provider_registry, tool_registry)
+        parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
             .await
             .expect("daemon run_with");
     });
