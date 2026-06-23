@@ -1,0 +1,18 @@
+[package]
+name = "parrot-providers"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+parrot-core     = { path = "../parrot-core" }
+parrot-config   = { path = "../parrot-config" }
+parrot-protocol = { path = "../parrot-protocol" }
+tokio           = { workspace = true }
+reqwest         = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+async-trait     = { workspace = true }
+tracing         = { workspace = true }
+rand            = { workspace = true }
+futures-util    = { workspace = true }
+async-stream    = { workspace = true }

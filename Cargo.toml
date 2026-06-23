@@ -10,6 +10,9 @@ members = [
     "crates/parrot-config",
     "crates/parrot-transport",
     "crates/parrot-core",
+    "crates/parrot-providers",
+    "crates/parrot-tools",
+    "crates/parrot-daemon",
 ]
 
 [workspace.package]
@@ -62,28 +65,28 @@ name = "cassette"
 path = "tests/cassette_test.rs"
 
 [dev-dependencies]
+parrot-daemon    = { path = "crates/parrot-daemon" }
+parrot-core      = { path = "crates/parrot-core" }
+parrot-config    = { path = "crates/parrot-config" }
+parrot-protocol  = { path = "crates/parrot-protocol" }
+parrot-transport = { path = "crates/parrot-transport" }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+async-trait      = { workspace = true }
+tokio            = { workspace = true }
 tempfile = "3"
 
 [dependencies]
-parrot-core = { path = "crates/parrot-core" }
-parrot-protocol = { path = "crates/parrot-protocol" }
-parrot-transport = { path = "crates/parrot-transport" }
-parrot-config = { path = "crates/parrot-config" }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
-rand = { workspace = true }
-hex = { workspace = true }
-reqwest = { workspace = true }
-clap = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-async-trait = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
-futures-util = { workspace = true }
-glob = { workspace = true }
-rustyline = { workspace = true }
-atty = { workspace = true }
-regex = { workspace = true }
+# parrotd binary
+parrot-daemon       = { path = "crates/parrot-daemon" }
+parrot-config       = { path = "crates/parrot-config" }
+tracing-subscriber  = { workspace = true }
+
+# parrot CLI binary
+parrot-protocol     = { path = "crates/parrot-protocol" }
+parrot-transport    = { path = "crates/parrot-transport" }
+tokio               = { workspace = true }
+clap                = { workspace = true }
+rustyline           = { workspace = true }
+atty                = { workspace = true }
+uuid                = { workspace = true }

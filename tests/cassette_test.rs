@@ -392,7 +392,7 @@ async fn spawn_daemon_with_cassette_provider(
     let token_path = tmp.path().join("token");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let auth = parrot::auth::Auth::new(&token_path)
+    let auth = parrot_daemon::auth::Auth::new(&token_path)
         .await
         .expect("init auth");
     let token = std::fs::read_to_string(&token_path)
@@ -416,7 +416,7 @@ async fn spawn_daemon_with_cassette_provider(
 
     let config = test_config(port, &data_dir, &token_path);
     let daemon_handle = tokio::spawn(async move {
-        parrot::server::run_with(config, auth, provider_registry, tool_registry)
+        parrot_daemon::server::run_with(config, auth, provider_registry, tool_registry)
             .await
             .expect("daemon run_with");
     });

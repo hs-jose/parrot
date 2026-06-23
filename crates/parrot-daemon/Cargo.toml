@@ -1,0 +1,23 @@
+[package]
+name = "parrot-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+parrot-core      = { path = "../parrot-core" }
+parrot-protocol  = { path = "../parrot-protocol" }
+parrot-config    = { path = "../parrot-config" }
+parrot-transport = { path = "../parrot-transport" }
+parrot-providers = { path = "../parrot-providers" }
+parrot-tools     = { path = "../parrot-tools" }
+tokio            = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tracing          = { workspace = true }
+uuid             = { workspace = true }
+chrono           = { workspace = true }
+rand             = { workspace = true }
+hex              = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

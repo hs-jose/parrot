@@ -1,11 +1,6 @@
 use parrot_config::AppConfig;
+use parrot_daemon::run;
 use tracing_subscriber::EnvFilter;
-
-mod auth;
-mod providers;
-mod server;
-mod session_store;
-mod tools;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,6 +8,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("parrotd=info".parse()?))
         .init();
 
-    let config = AppConfig::load().map_err(|e| format!("Config error: {}", e))?;
-    server::run(config).await
+    let config = AppConfig::load().map_err(|e| format!("Config error: {e}"))?;
+    run(config).await
 }

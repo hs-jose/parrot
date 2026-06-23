@@ -178,7 +178,7 @@ impl AnthropicProvider {
         // builds a fresh future and re-issues the same POST. Stream-phase
         // errors don't go through this path (we only retry up to the point
         // where the response body starts streaming).
-        crate::providers::retry::with_retry(|| self.send_request_once(request)).await
+        crate::retry::with_retry(|| self.send_request_once(request)).await
     }
 
     async fn send_request_once(

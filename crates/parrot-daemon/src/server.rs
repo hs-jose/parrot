@@ -26,8 +26,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let tool_registry = Arc::new(ToolRegistry::new());
     let provider_registry = Arc::new(ProviderRegistry::new());
 
-    crate::tools::register_all(&tool_registry, &config).await;
-    crate::providers::register_all(&provider_registry, &config).await;
+    parrot_tools::register_all(&tool_registry, &config).await;
+    parrot_providers::register_all(&provider_registry, &config).await;
 
     run_with(config, auth, provider_registry, tool_registry).await
 }
