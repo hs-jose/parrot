@@ -14,6 +14,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+# sha2 + hex compute the system_prompt_hash field on ReActEngine (spec
+# 2026-06-22 §3 AgentStart). Kept in parrot-core rather than parrot-daemon
+# because the engine owns system_prompt_hash and emits AgentStart itself;
+# moving the hash computation to the daemon would force the daemon to pass
+# the hash through SessionManager -> ReActEngine, breaking the "engine is
+# the single owner of its AgentStart fields" invariant.
 sha2 = "0.10"
 hex = { workspace = true }
 

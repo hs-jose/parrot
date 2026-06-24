@@ -37,7 +37,7 @@ impl ConfirmRouter {
     }
 
     /// Register a pending confirmation. The engine calls this just before
-    /// emitting `StreamEvent::ToolCallConfirmationRequired` and then awaits
+    /// emitting `AgentEvent::ToolConfirmRequired` and then awaits
     /// `rx`. If the client responds before the timeout, `resolve` consumes
     /// the sender and `rx` yields the decision; otherwise the engine's
     /// `tokio::time::timeout` fires and the sender is dropped (a stale

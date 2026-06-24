@@ -162,6 +162,14 @@ impl ReActEngine {
         let context_manager = ContextManager::new(100_000, 10);
 
         // RAII guard: ensures AgentEnd fires even on panic / task abort.
+        //
+        // Invariant: the `Arc<Mutex<Usage>>` / `Arc<Mutex<AgentEndReason>>` are
+        // shared with the guard so `run()` can accumulate usage across turns
+        // and the guard can read it on drop. `std::sync::Mutex` is safe here
+        // ONLY because every critical section clones the value out and drops
+        // the guard before any `.await`. DO NOT hold the lock across an
+        // await — that would deadlock under tokio's current-thread runtime
+        // and is undefined behavior under `Send` futures holding the guard.
         let total_usage: Arc<Mutex<Usage>> = Arc::new(Mutex::new(Usage::default()));
         let end_reason: Arc<Mutex<AgentEndReason>> =
             Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
@@ -243,7 +251,7 @@ impl ReActEngine {
             }
         }
 
-        guard.fire_and_drop(&event_tx).await;
+        guard.fire_and_drop(&event_tx, &mut event_log).await;
     }
 
     async fn resolve_provider_id(&self) -> String {
@@ -682,27 +690,25 @@ struct AgentEndGuard {
 impl AgentEndGuard {
     /// Fire the `AgentEnd` event explicitly (used for normal shutdown paths
     /// where we want to consume the guard without dropping it silently).
-    async fn fire_and_drop(mut self, _tx: &mpsc::Sender<AgentEvent>) {
+    async fn fire_and_drop(mut self, _tx: &mpsc::Sender<AgentEvent>, event_log: &mut EventLog) {
         if self.fired {
             return;
         }
         let usage = self.total_usage.lock().unwrap().clone();
-        let reason = {
-            let r = self.reason.lock().unwrap();
-            // If reason is still the default ClientDisconnect but we got
-            // here via a normal break, that's fine — the caller set the
-            // reason before breaking. Take it as-is.
-            r.clone()
+        let reason = self.reason.lock().unwrap().clone();
+        let event = AgentEvent::AgentEnd {
+            session_id: self.session_id,
+            reason,
+            total_usage: usage,
         };
-        let _ = self
-            .event_tx
-            .send(AgentEvent::AgentEnd {
-                session_id: self.session_id,
-                reason,
-                total_usage: usage,
-            })
-            .await
-            .ok();
+        // Persist before sending: a session that ended cleanly must have
+        // AgentEnd in events.log so a later resume can tell "session was
+        // terminated" from "daemon crashed mid-run". Drop-path (panic /
+        // task-abort) can't safely do disk IO and won't reach here.
+        if let Err(e) = event_log.append(event.clone()) {
+            tracing::warn!(error = ?e, "failed to persist AgentEnd");
+        }
+        let _ = self.event_tx.send(event).await.ok();
         self.fired = true;
     }
 }

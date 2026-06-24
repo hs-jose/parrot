@@ -2,8 +2,8 @@
 //!
 //! This file implements the `CassetteProvider` test harness described in the
 //! design doc §10: a `LlmProvider` impl that replays a recorded sequence of
-//! `StreamEvent`s from a JSON file under `tests/cassettes/anthropic/`. No
-//! network, no API key — the test is fully deterministic.
+//! `ProviderStreamEvent`s from a JSON file under `tests/cassettes/anthropic/`.
+//! No network, no API key — the test is fully deterministic.
 //!
 //! Cassette format (one JSON file per recorded turn):
 //! ```json
@@ -15,13 +15,13 @@
 //!   ]
 //! }
 //! ```
-//! The `events` array is a `Vec<StreamEvent>` serialized in serde's default
-//! (internally-tagged) enum format. `CassetteProvider::chat_stream` pushes
-//! them into an mpsc channel in order, mimicking a real provider.
+//! The `events` array is a `Vec<ProviderStreamEvent>` serialized in serde's
+//! default (internally-tagged) enum format. `CassetteProvider::chat_stream`
+//! pushes them into an mpsc channel in order, mimicking a real provider.
 //!
 //! Recording new cassettes (RECORD mode) is a follow-up; for now cassettes
-//! are hand-authored to match the Anthropic SSE → StreamEvent mapping in
-//! `src/daemon/providers/anthropic.rs::parse_sse_stream`.
+//! are hand-authored to match the Anthropic SSE → ProviderStreamEvent mapping
+//! in `crates/parrot-providers/src/anthropic.rs::parse_sse_stream`.
 
 use async_trait::async_trait;
 use parrot_core::error::{AgentError, ProviderError};
