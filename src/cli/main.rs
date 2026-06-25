@@ -1,15 +1,16 @@
 mod conn;
+mod stream;
 
 use clap::{Parser, Subcommand};
 use parrot_config::AppConfig;
 use parrot_protocol::agent_event::{AgentEvent, PersistedAgentEvent};
-use parrot_protocol::types::{ConfirmDecision, SessionMeta, ToolDefinitionWire};
+use parrot_protocol::types::{SessionMeta, ToolDefinitionWire};
 use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
-use std::io::Write;
 
 use crate::conn::{
     connect as connect_with_token, create_session, wait_hello, wait_session_resumed, Connection,
 };
+use crate::stream::print_stream;
 
 #[derive(Parser)]
 #[command(name = "parrot", version, about = "Parrot LLM Agent CLI")]
@@ -50,167 +51,6 @@ enum SessionsAction {
     Resume { session_id: String },
 }
 
-async fn send_chat_and_stream(
-    sender: &tokio::sync::mpsc::Sender<ClientMessage>,
-    receiver: &mut tokio::sync::mpsc::Receiver<ServerMessage>,
-    session_id: SessionId,
-    message: &str,
-    interactive: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    sender
-        .send(ClientMessage::Chat {
-            session_id,
-            message: message.to_string(),
-        })
-        .await?;
-
-    print_stream(sender, receiver, session_id, interactive).await
-}
-
-/// Print the streaming response for one chat turn by unwrapping
-/// `ServerMessage::AgentEvent` envelopes and rendering the lifecycle events.
-/// `interactive` controls how `ToolConfirmRequired` is handled:
-///   - `true`  → prompt the user on stdin for y/n, send `ConfirmToolCall`
-///   - `false` → auto-reject (no operator present to approve dangerous tools)
-async fn print_stream(
-    sender: &tokio::sync::mpsc::Sender<ClientMessage>,
-    receiver: &mut tokio::sync::mpsc::Receiver<ServerMessage>,
-    session_id: SessionId,
-    interactive: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-
-    loop {
-        match receiver.recv().await {
-            Some(ServerMessage::AgentEvent { event }) => {
-                match event {
-                    AgentEvent::AgentStart { .. } => {
-                        // Silent — session already acknowledged above.
-                    }
-                    AgentEvent::AgentEnd { reason, .. } => {
-                        writeln!(stdout, "\n--- Agent ended: {:?} ---", reason)?;
-                        stdout.flush()?;
-                        return Ok(());
-                    }
-                    AgentEvent::TurnStart { .. } => {
-                        // Silent — the user's prompt was just echoed.
-                    }
-                    AgentEvent::TurnEnd {
-                        stop_reason, usage, ..
-                    } => {
-                        writeln!(stdout)?;
-                        writeln!(
-                            stdout,
-                            "\n--- Turn end (reason: {:?}, tokens: {}+{}) ---",
-                            stop_reason, usage.input_tokens, usage.output_tokens
-                        )?;
-                        stdout.flush()?;
-                        return Ok(());
-                    }
-                    AgentEvent::MessageStart { .. } => {
-                        // Silent.
-                    }
-                    AgentEvent::MessageDelta { payload, .. } => match payload {
-                        parrot_protocol::agent_event::MessageDeltaPayload::TextDelta { delta } => {
-                            write!(stdout, "{}", delta)?;
-                            stdout.flush()?;
-                        }
-                        parrot_protocol::agent_event::MessageDeltaPayload::ToolCallStart {
-                            tool_name,
-                            ..
-                        } => {
-                            writeln!(stdout, "\n[Calling tool: {}]", tool_name)?;
-                            stdout.flush()?;
-                        }
-                        parrot_protocol::agent_event::MessageDeltaPayload::ToolCallArgsDelta {
-                            ..
-                        } => {}
-                    },
-                    AgentEvent::MessageEnd { .. } => {
-                        // Silent — text already streamed via deltas.
-                    }
-                    AgentEvent::ToolStart { .. } => {
-                        // Silent — the ToolCallStart delta already announced it.
-                    }
-                    AgentEvent::ToolUpdate { .. } => {
-                        // MVP doesn't render tool progress.
-                    }
-                    AgentEvent::ToolEnd { result, .. } => {
-                        if result.is_error {
-                            writeln!(stdout, "[Tool error: {}]", result.content)?;
-                            stdout.flush()?;
-                        }
-                    }
-                    AgentEvent::ToolConfirmRequired {
-                        tool_call_id,
-                        tool_name,
-                        arguments,
-                        ..
-                    } => {
-                        writeln!(
-                            stdout,
-                            "\n[Confirmation required] tool: {} args: {}",
-                            tool_name, arguments
-                        )?;
-                        stdout.flush()?;
-                        let decision = if interactive {
-                            prompt_confirm(&mut stdout)?
-                        } else {
-                            writeln!(
-                                stdout,
-                                "[Non-interactive mode — auto-rejecting confirmation request]"
-                            )?;
-                            stdout.flush()?;
-                            ConfirmDecision::Reject
-                        };
-                        sender
-                            .send(ClientMessage::ConfirmToolCall {
-                                session_id,
-                                tool_id: tool_call_id,
-                                decision,
-                            })
-                            .await?;
-                    }
-                    AgentEvent::ReplayIntegrityWarning { issue, .. } => {
-                        writeln!(
-                            stdout,
-                            "\n[WARNING] Replay integrity issue: {:?} ({} events dropped)",
-                            issue.kind, issue.dropped_event_count
-                        )?;
-                        stdout.flush()?;
-                    }
-                }
-            }
-            Some(ServerMessage::Error { message, .. }) => {
-                writeln!(stdout, "\nError: {}", message)?;
-                stdout.flush()?;
-                return Err(message.into());
-            }
-            Some(msg) => {
-                eprintln!("Unexpected stream message: {:?}", msg);
-            }
-            None => {
-                writeln!(stdout, "\nConnection closed.")?;
-                return Err("Connection closed unexpectedly".into());
-            }
-        }
-    }
-}
-
-fn prompt_confirm(
-    stdout: &mut std::io::StdoutLock,
-) -> Result<ConfirmDecision, Box<dyn std::error::Error>> {
-    write!(stdout, "approve? (y/n) > ")?;
-    stdout.flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(match line.trim().to_lowercase().as_str() {
-        "y" | "yes" => ConfirmDecision::Approve,
-        _ => ConfirmDecision::Reject,
-    })
-}
-
 async fn read_line_stdin() -> Option<String> {
     use tokio::io::AsyncBufReadExt;
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -235,14 +75,13 @@ async fn run_interactive(
                         continue;
                     }
                     rl.add_history_entry(&line).ok();
-                    send_chat_and_stream(
-                        &conn.sender,
-                        &mut conn.receiver,
-                        session_id,
-                        trimmed,
-                        true,
-                    )
-                    .await?;
+                    conn.sender
+                        .send(ClientMessage::Chat {
+                            session_id,
+                            message: trimmed.to_string(),
+                        })
+                        .await?;
+                    print_stream(&mut *conn, session_id, true).await?;
                 }
                 Err(rustyline::error::ReadlineError::Interrupted) => {
                     println!("Ctrl+C");
@@ -269,14 +108,13 @@ async fn run_interactive(
                     if trimmed.is_empty() {
                         continue;
                     }
-                    send_chat_and_stream(
-                        &conn.sender,
-                        &mut conn.receiver,
-                        session_id,
-                        trimmed,
-                        true,
-                    )
-                    .await?;
+                    conn.sender
+                        .send(ClientMessage::Chat {
+                            session_id,
+                            message: trimmed.to_string(),
+                        })
+                        .await?;
+                    print_stream(&mut *conn, session_id, true).await?;
                 }
                 None => break,
             }
@@ -339,7 +177,7 @@ fn print_history(events: &[PersistedAgentEvent]) {
                 )
             }
             AgentEvent::TurnStart { user_message, .. } => {
-                format!("TurnStart({})", truncate(user_message, 60))
+                format!("TurnStart({})", crate::stream::truncate(user_message, 60))
             }
             AgentEvent::TurnEnd {
                 stop_reason, usage, ..
@@ -361,7 +199,7 @@ fn print_history(events: &[PersistedAgentEvent]) {
                     "MessageEnd({:?} tools={} {})",
                     stop_reason,
                     tool_calls.len(),
-                    truncate(final_content, 60)
+                    crate::stream::truncate(final_content, 60)
                 )
             }
             AgentEvent::ToolStart { tool_name, .. } => format!("ToolStart({})", tool_name),
@@ -374,7 +212,7 @@ fn print_history(events: &[PersistedAgentEvent]) {
                 "ToolEnd(id={} err={} {})",
                 tool_call_id,
                 result.is_error,
-                truncate(&result.content, 60)
+                crate::stream::truncate(&result.content, 60)
             ),
             AgentEvent::ToolConfirmRequired { tool_name, .. } => {
                 format!("ToolConfirmRequired({})", tool_name)
@@ -384,16 +222,6 @@ fn print_history(events: &[PersistedAgentEvent]) {
             }
         };
         println!("#{:-4} {} {}", e.seq, e.ts.format("%H:%M:%S"), kind);
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
     }
 }
 
@@ -451,14 +279,13 @@ async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::er
     eprintln!("Session created: {}", session_id);
 
     if let Some(message) = cli.message {
-        send_chat_and_stream(
-            &conn.sender,
-            &mut conn.receiver,
-            session_id,
-            &message,
-            false,
-        )
-        .await?;
+        conn.sender
+            .send(ClientMessage::Chat {
+                session_id,
+                message: message.clone(),
+            })
+            .await?;
+        print_stream(&mut conn, session_id, false).await?;
     } else {
         let use_rustyline = !cli.simple && atty::is(atty::Stream::Stdin);
         run_interactive(&mut conn, session_id, use_rustyline).await?;
