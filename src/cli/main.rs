@@ -1,10 +1,15 @@
+mod conn;
+
 use clap::{Parser, Subcommand};
 use parrot_config::AppConfig;
 use parrot_protocol::agent_event::{AgentEvent, PersistedAgentEvent};
 use parrot_protocol::types::{ConfirmDecision, SessionMeta, ToolDefinitionWire};
 use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
-use parrot_transport::{TransportClient, WsTransportClient};
 use std::io::Write;
+
+use crate::conn::{
+    connect as connect_with_token, create_session, wait_hello, wait_session_resumed, Connection,
+};
 
 #[derive(Parser)]
 #[command(name = "parrot", version, about = "Parrot LLM Agent CLI")]
@@ -43,77 +48,6 @@ enum SessionsAction {
     List,
     Show { session_id: String },
     Resume { session_id: String },
-}
-
-fn read_token(path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let token = std::fs::read_to_string(path)?.trim().to_string();
-    if token.is_empty() {
-        return Err(format!("Token file '{}' is empty", path).into());
-    }
-    Ok(token)
-}
-
-struct Connection {
-    sender: tokio::sync::mpsc::Sender<ClientMessage>,
-    receiver: tokio::sync::mpsc::Receiver<ServerMessage>,
-}
-
-async fn connect(cli: &Cli, config: &AppConfig) -> Result<Connection, Box<dyn std::error::Error>> {
-    let token_path = cli
-        .token_file
-        .clone()
-        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
-    let token = read_token(&token_path)?;
-
-    let client = WsTransportClient::new();
-    let mut conn = client.connect(&cli.connect, &token).await?;
-
-    let server_version = wait_hello(&mut conn.receiver).await?;
-    eprintln!("Connected to server v{}", server_version);
-
-    Ok(Connection {
-        sender: conn.sender,
-        receiver: conn.receiver,
-    })
-}
-
-async fn wait_hello(
-    receiver: &mut tokio::sync::mpsc::Receiver<ServerMessage>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    loop {
-        match receiver.recv().await {
-            Some(ServerMessage::HelloAck { server_version }) => return Ok(server_version),
-            Some(ServerMessage::Error { message, .. }) => {
-                return Err(format!("Server error during handshake: {}", message).into());
-            }
-            Some(msg) => {
-                eprintln!("Unexpected message during handshake: {:?}", msg);
-            }
-            None => return Err("Connection closed during handshake".into()),
-        }
-    }
-}
-
-async fn create_session(
-    sender: &tokio::sync::mpsc::Sender<ClientMessage>,
-    receiver: &mut tokio::sync::mpsc::Receiver<ServerMessage>,
-) -> Result<SessionId, Box<dyn std::error::Error>> {
-    sender
-        .send(ClientMessage::CreateSession { config: None })
-        .await?;
-
-    loop {
-        match receiver.recv().await {
-            Some(ServerMessage::SessionCreated { session_id }) => return Ok(session_id),
-            Some(ServerMessage::Error { message, .. }) => {
-                return Err(format!("Server error creating session: {}", message).into());
-            }
-            Some(msg) => {
-                eprintln!("Unexpected message waiting for session: {:?}", msg);
-            }
-            None => return Err("Connection closed waiting for session".into()),
-        }
-    }
 }
 
 async fn send_chat_and_stream(
@@ -505,7 +439,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = connect(&cli, config).await?;
+    let token_path = cli
+        .token_file
+        .clone()
+        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
+    let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+    let server_version = wait_hello(&mut conn.receiver).await?;
+    eprintln!("Connected to server v{}", server_version);
 
     let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
     eprintln!("Session created: {}", session_id);
@@ -531,9 +471,15 @@ async fn run_sessions(
     cli: Cli,
     config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let token_path = cli
+        .token_file
+        .clone()
+        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
     match action {
         SessionsAction::List => {
-            let mut conn = connect(&cli, config).await?;
+            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let server_version = wait_hello(&mut conn.receiver).await?;
+            eprintln!("Connected to server v{}", server_version);
             conn.sender.send(ClientMessage::ListSessions).await?;
             loop {
                 match conn.receiver.recv().await {
@@ -553,7 +499,9 @@ async fn run_sessions(
             let id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect(&cli, config).await?;
+            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let server_version = wait_hello(&mut conn.receiver).await?;
+            eprintln!("Connected to server v{}", server_version);
             conn.sender
                 .send(ClientMessage::GetHistory { session_id: id })
                 .await?;
@@ -572,34 +520,32 @@ async fn run_sessions(
             }
         }
         SessionsAction::Resume { session_id } => {
-            let id: SessionId = session_id
+            let session_id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect(&cli, config).await?;
+            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let server_version = wait_hello(&mut conn.receiver).await?;
+            eprintln!("Connected to server v{}", server_version);
             conn.sender
-                .send(ClientMessage::ResumeSession { session_id: id })
+                .send(ClientMessage::ResumeSession { session_id })
                 .await?;
-            loop {
-                match conn.receiver.recv().await {
-                    Some(ServerMessage::SessionResumed { .. }) => {
-                        eprintln!("Resumed session {}", id);
-                        let use_rustyline = !cli.simple && atty::is(atty::Stream::Stdin);
-                        run_interactive(&mut conn, id, use_rustyline).await?;
-                        return Ok(());
-                    }
-                    Some(ServerMessage::Error { message, .. }) => {
-                        return Err(format!("Server error: {}", message).into());
-                    }
-                    Some(msg) => eprintln!("Unexpected message: {:?}", msg),
-                    None => return Err("Connection closed".into()),
-                }
-            }
+            let id = wait_session_resumed(&mut conn.receiver).await?;
+            eprintln!("Resumed session {}", id);
+            let use_rustyline = !cli.simple && atty::is(atty::Stream::Stdin);
+            run_interactive(&mut conn, id, use_rustyline).await?;
+            Ok(())
         }
     }
 }
 
 async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = connect(&cli, config).await?;
+    let token_path = cli
+        .token_file
+        .clone()
+        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
+    let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+    let server_version = wait_hello(&mut conn.receiver).await?;
+    eprintln!("Connected to server v{}", server_version);
     conn.sender.send(ClientMessage::ListModels).await?;
     loop {
         match conn.receiver.recv().await {
@@ -617,7 +563,13 @@ async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::err
 }
 
 async fn run_tools(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = connect(&cli, config).await?;
+    let token_path = cli
+        .token_file
+        .clone()
+        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
+    let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+    let server_version = wait_hello(&mut conn.receiver).await?;
+    eprintln!("Connected to server v{}", server_version);
     let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
     conn.sender
         .send(ClientMessage::ListTools { session_id })
