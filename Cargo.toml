@@ -41,7 +41,6 @@ async-stream = "0.3"
 glob = "0.3"
 regex = "1"
 rustyline = "15"
-atty = "0.2"
 
 [[bin]]
 name = "parrotd"
@@ -87,5 +86,4 @@ parrot-transport    = { path = "crates/parrot-transport" }
 tokio               = { workspace = true }
 clap                = { workspace = true }
 rustyline           = { workspace = true }
-atty                = { workspace = true }
 uuid                = { workspace = true }

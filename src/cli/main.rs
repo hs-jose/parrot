@@ -1,11 +1,14 @@
 mod conn;
 mod stream;
+#[path = "../tui/mod.rs"]
+mod tui;
 
 use clap::{Parser, Subcommand};
 use parrot_config::AppConfig;
 use parrot_protocol::agent_event::{AgentEvent, PersistedAgentEvent};
 use parrot_protocol::types::{SessionMeta, ToolDefinitionWire};
 use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
+use std::io::IsTerminal;
 
 use crate::conn::{
     connect as connect_with_token, create_session, wait_hello, wait_session_resumed, Connection,
@@ -51,72 +54,40 @@ enum SessionsAction {
     Resume { session_id: String },
 }
 
-async fn read_line_stdin() -> Option<String> {
-    use tokio::io::AsyncBufReadExt;
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    lines.next_line().await.ok().flatten()
-}
-
-async fn run_interactive(
+async fn run_rustyline_loop(
     conn: &mut Connection,
     session_id: SessionId,
-    use_rustyline: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if use_rustyline {
-        let mut rl = rustyline::DefaultEditor::new()?;
-        println!("Parrot CLI - type messages and press Enter. Ctrl+D or Ctrl+C to exit.");
-        loop {
-            let readline = rl.readline("parrot> ");
-            match readline {
-                Ok(line) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    rl.add_history_entry(&line).ok();
-                    conn.sender
-                        .send(ClientMessage::Chat {
-                            session_id,
-                            message: trimmed.to_string(),
-                        })
-                        .await?;
-                    print_stream(&mut *conn, session_id, true).await?;
+    let mut rl = rustyline::DefaultEditor::new()?;
+    println!("Parrot CLI - type messages and press Enter. Ctrl+D or Ctrl+C to exit.");
+    loop {
+        let readline = rl.readline("parrot> ");
+        match readline {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
                 }
-                Err(rustyline::error::ReadlineError::Interrupted) => {
-                    println!("Ctrl+C");
-                    break;
-                }
-                Err(rustyline::error::ReadlineError::Eof) => {
-                    println!("Ctrl+D");
-                    break;
-                }
-                Err(err) => {
-                    eprintln!("Readline error: {}", err);
-                    break;
-                }
+                rl.add_history_entry(&line).ok();
+                conn.sender
+                    .send(ClientMessage::Chat {
+                        session_id,
+                        message: trimmed.to_string(),
+                    })
+                    .await?;
+                print_stream(&mut *conn, session_id, true).await?;
             }
-        }
-    } else {
-        println!("Parrot CLI (simple mode) - type messages and press Enter. Ctrl+C to exit.");
-        loop {
-            eprint!("parrot> ");
-            let input = read_line_stdin().await;
-            match input {
-                Some(line) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    conn.sender
-                        .send(ClientMessage::Chat {
-                            session_id,
-                            message: trimmed.to_string(),
-                        })
-                        .await?;
-                    print_stream(&mut *conn, session_id, true).await?;
-                }
-                None => break,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("Ctrl+C");
+                break;
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("Ctrl+D");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Readline error: {}", err);
+                break;
             }
         }
     }
@@ -275,10 +246,9 @@ async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::er
     let server_version = wait_hello(&mut conn.receiver).await?;
     eprintln!("Connected to server v{}", server_version);
 
-    let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
-    eprintln!("Session created: {}", session_id);
-
     if let Some(message) = cli.message {
+        // -m "..." : 一发即停，非交互，自动 Reject 工具确认
+        let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
         conn.sender
             .send(ClientMessage::Chat {
                 session_id,
@@ -286,11 +256,21 @@ async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::er
             })
             .await?;
         print_stream(&mut conn, session_id, false).await?;
-    } else {
-        let use_rustyline = !cli.simple && atty::is(atty::Stream::Stdin);
-        run_interactive(&mut conn, session_id, use_rustyline).await?;
+        return Ok(());
     }
-    Ok(())
+
+    if cli.simple || !std::io::stdin().is_terminal() {
+        // --simple 或非 tty：仍走 rustyline 行编辑 + 流式打印，但用户不可操作确认（自动 Reject）
+        let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
+        run_rustyline_loop(&mut conn, session_id).await?;
+        return Ok(());
+    }
+
+    // 默认：tty 且无消息 → TUI
+    let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
+    // 连接 + session 建好后，把 conn 交给 TUI 主循环
+    conn.session_id = Some(session_id); // 见 Step 4：Connection 加 session_id 字段
+    tui::run_tui(conn).await
 }
 
 async fn run_sessions(
@@ -358,8 +338,7 @@ async fn run_sessions(
                 .await?;
             let id = wait_session_resumed(&mut conn.receiver).await?;
             eprintln!("Resumed session {}", id);
-            let use_rustyline = !cli.simple && atty::is(atty::Stream::Stdin);
-            run_interactive(&mut conn, id, use_rustyline).await?;
+            run_rustyline_loop(&mut conn, id).await?;
             Ok(())
         }
     }

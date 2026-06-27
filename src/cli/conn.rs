@@ -5,6 +5,8 @@ use tokio::sync::mpsc;
 pub(crate) struct Connection {
     pub sender: mpsc::Sender<ClientMessage>,
     pub receiver: mpsc::Receiver<ServerMessage>,
+    /// 已 create_session 但又没把 id 立即放在调用栈里的可选槽，给 TUI 用。
+    pub session_id: Option<SessionId>,
 }
 
 pub(crate) fn read_token(path: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -25,6 +27,7 @@ pub(crate) async fn connect(
     Ok(Connection {
         sender: conn.sender,
         receiver: conn.receiver,
+        session_id: None,
     })
 }
 
