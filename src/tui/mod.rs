@@ -81,7 +81,10 @@ async fn choose_session(
             Some(ServerMessage::Error { message, .. }) => {
                 return Err(format!("ListSessions error: {}", message).into());
             }
-            _ => {}
+            Some(other) => {
+                eprintln!("Unexpected message waiting for session list: {:?}", other);
+            }
+            None => return Err("Connection closed waiting for session list".into()),
         }
     };
     if sessions.is_empty() {
