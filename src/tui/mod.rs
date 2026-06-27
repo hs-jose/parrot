@@ -4,6 +4,9 @@ pub(crate) mod app;
 #[allow(dead_code)]
 pub(crate) mod confirm;
 
+#[allow(dead_code)]
+pub(crate) mod input;
+
 use crate::conn::Connection;
 
 /// Phase 1.5b TUI 入口。Task 4+ 实装；Task 3 仅为占位以打通 dispatch。
