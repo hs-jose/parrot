@@ -41,6 +41,9 @@ async-stream = "0.3"
 glob = "0.3"
 regex = "1"
 rustyline = "15"
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
 
 [[bin]]
 name = "parrotd"
@@ -87,3 +90,6 @@ tokio               = { workspace = true }
 clap                = { workspace = true }
 rustyline           = { workspace = true }
 uuid                = { workspace = true }
+ratatui             = { workspace = true }
+crossterm           = { workspace = true }
+tui-textarea        = { workspace = true }
