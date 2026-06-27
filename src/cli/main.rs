@@ -266,10 +266,7 @@ async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::er
         return Ok(());
     }
 
-    // 默认：tty 且无消息 → TUI
-    let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
-    // 连接 + session 建好后，把 conn 交给 TUI 主循环
-    conn.session_id = Some(session_id); // 见 Step 4：Connection 加 session_id 字段
+    // 默认：tty 且无消息 → TUI（session 由 TUI 内部列表页建立）
     tui::run_tui(conn).await
 }
 

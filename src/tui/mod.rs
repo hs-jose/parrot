@@ -12,20 +12,27 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use parrot_protocol::types::ConfirmDecision;
-use parrot_protocol::ClientMessage;
+use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
-use crate::conn::Connection;
+use crate::conn::{create_session, wait_session_resumed, Connection};
 use crate::tui::app::Mode;
 use crate::tui::input::{spawn_input_thread, UiEvent};
 
 pub(crate) async fn run_tui(mut conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
-    let session_id = conn
-        .session_id
-        .ok_or("run_tui called without a session_id set on Connection")?;
+    // 1. 先发 ListSessions；若空或选 New 则发 CreateSession；若选已有项则发 ResumeSession。
+    let session_id = match choose_session(&mut conn).await? {
+        SessionChoice::New => create_session(&conn.sender, &mut conn.receiver).await?,
+        SessionChoice::Resume(id) => {
+            conn.sender
+                .send(ClientMessage::ResumeSession { session_id: id })
+                .await?;
+            wait_session_resumed(&mut conn.receiver).await?
+        }
+    };
 
     let mut app = app::App::new(session_id);
 
@@ -56,6 +63,62 @@ pub(crate) async fn run_tui(mut conn: Connection) -> Result<(), Box<dyn std::err
     let mut stdout = std::io::stdout();
     let _ = execute!(stdout, LeaveAlternateScreen);
     result
+}
+
+enum SessionChoice {
+    New,
+    Resume(SessionId),
+}
+
+/// 轻量文本列表（不开 ratatui）。
+async fn choose_session(
+    conn: &mut Connection,
+) -> Result<SessionChoice, Box<dyn std::error::Error>> {
+    conn.sender.send(ClientMessage::ListSessions).await?;
+    let sessions = loop {
+        match conn.receiver.recv().await {
+            Some(ServerMessage::SessionList { sessions }) => break sessions,
+            Some(ServerMessage::Error { message, .. }) => {
+                return Err(format!("ListSessions error: {}", message).into());
+            }
+            _ => {}
+        }
+    };
+    if sessions.is_empty() {
+        println!("No prior sessions; creating a new one.");
+        return Ok(SessionChoice::New);
+    }
+    loop {
+        println!("\nExisting sessions (Ctrl+C to abort):");
+        for (i, s) in sessions.iter().enumerate() {
+            let title = s.title.clone().unwrap_or_else(|| "-".into());
+            println!(
+                "  [{:>2}] {} {} {} {}",
+                i,
+                s.id,
+                s.model,
+                s.updated_at.format("%Y-%m-%d %H:%M"),
+                title
+            );
+        }
+        println!("  [ N]  create a new session");
+        print!("> ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(SessionChoice::New);
+        }
+        let trimmed = line.trim().to_lowercase();
+        if trimmed == "n" || trimmed.is_empty() {
+            return Ok(SessionChoice::New);
+        }
+        if let Ok(idx) = trimmed.parse::<usize>() {
+            if let Some(s) = sessions.get(idx) {
+                return Ok(SessionChoice::Resume(s.id));
+            }
+        }
+        println!("invalid choice; try again.");
+    }
 }
 
 async fn run_loop(
