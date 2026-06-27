@@ -11,6 +11,7 @@ pub(crate) enum ChatEntry {
     Assistant {
         text: String,
         completed: bool,
+        #[allow(dead_code)]
         tool_calls: Vec<ToolCallInfo>,
     },
     Tool {
@@ -78,6 +79,7 @@ impl App {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
+    #[allow(dead_code)]
     pub fn quit(&mut self) {
         self.quit = true;
     }

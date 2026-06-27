@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub(crate) enum UiEvent {
     Key(KeyEvent),
+    #[allow(dead_code)]
     Resize(u16, u16),
     Paste(String),
     /// Ctrl+C 或 poll/read 出错时发出，主循环据此退出。
