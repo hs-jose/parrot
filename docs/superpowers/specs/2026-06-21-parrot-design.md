@@ -15,6 +15,8 @@ Parrot 是一个 Rust 实现的 LLM agent，兼具**通用编程助手**（类�
 
 - **Phase 1**: CLI + daemon，Anthropic API 单一提供商，跑通 ReAct 全链路
 - **Phase 1.5**: TUI 客户端
+  - **Phase 1.5a**: 协议扩展 + daemon 处理器 + CLI 子命令 ✅
+  - **Phase 1.5b**: TUI 客户端 ✅
 - **Phase 2**: IM 接入（Discord 等），OpenAI + Ollama 适配器，MCP client
 - **Phase 3**: 混合路由、模型故障切换、规划子模式
 
@@ -1022,13 +1024,13 @@ CI 默认跑回放，开发者本地偶尔 `RECORD=1 cargo test --test cassette`
 
 ### Phase 1.5
 
-- ✅ TUI 客户端（ratatui + mpsc 喂 WS 事件到事件循环）— 设计就绪，待 Phase 1.5b 实施
+- ✅ TUI 客户端（ratatui + mpsc 喂 WS 事件到事件循环）— 2026-06-25 完成（Phase 1.5b）
 - ✅ 工具二次确认流程（`ConfirmToolCall` 协议消息）
 - ✅ Session 历史搜索与管理（CLI 子命令）
 - ✅ `ListSessions` / `ResumeSession` 协议消息 + daemon 处理器
 - ✅ `ToolList` 消息（替换当前 `ListTools` 用 `TextDelta` 回传 JSON 的临时实现）
 
-> 详细规范与实施状态见 [`2026-06-21-parrot-phase-1.5.md`](2026-06-21-parrot-phase-1.5.md)。该文档拆分自本文档以控制单文件规模——主文档保留架构与 Phase 1 基线，phase-1.5 文档专注该阶段的协议扩展、daemon 处理器、CLI 子命令、二次确认流程、TUI（Phase 1.5b 待实施）。
+> 详细规范与实施状态见 [`2026-06-21-parrot-phase-1.5.md`](2026-06-21-parrot-phase-1.5.md)。该文档拆分自本文档以控制单文件规模——主文档保留架构与 Phase 1 基线，phase-1.5 文档专注该阶段的协议扩展、daemon 处理器、CLI 子命令、二次确认流程、TUI（Phase 1.5b 已实施 2026-06-25）。
 
 ### Phase 2
 

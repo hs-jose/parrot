@@ -424,44 +424,72 @@ Some(ServerMessage::ToolCallConfirmationRequired { tool_name, arguments, .. }) =
 6. E2E 测试覆盖上述每条
 7. 文档回填 ✅，标记 TUI 为 Phase 1.5b
 
-## 8. Phase 1.5b — TUI 客户端（独立批次）
+## 8. Phase 1.5b — TUI 客户端（已实施 2026-06-25）
 
-> 单独成批，因为 ratatui + crossterm 是一整套新代码，且依赖 Phase 1.5a 的协议扩展全部就绪。
+**实施决策：** 不开新 crate、不开新 bin、不开 feature gate。TUI 作为 `parrot` bin 的 `src/tui/` 模块；按 tty 自动分发默认开启 TUI，`--simple` / `-m` / 非 tty 走原 CLI 流式/rustyline 路径。共享握手代码抽到 `src/cli/conn.rs`。
 
-布局（ratatui 三栏）：
+### 8.1 包内结构
 
 ```
-┌────────────────────────────────────────────┐
-│ Parrot TUI  | session: <uuid>  model: ...  │  ← 状态栏 (顶部)
-├────────────────────────────────────────────┤
-│ user: 帮我读 src/lib.rs                    │
-│ assistant: 好的，我先看看 [tool: file_read] │
-│   → src/lib.rs (3.2KB)                     │
-│ assistant: 这个文件定义了...               │  ← 消息流 (滚动区)
-│                                            │
-├────────────────────────────────────────────┤
-│ > _                                        │  ← 输入框 (底部，多行)
-│ [Enter 发送 / Ctrl+C 退出 / Ctrl+R 滚动]   │
-└────────────────────────────────────────────┘
+src/
+├── cli/
+│   ├── main.rs          # dispatch + 子命令
+│   ├── conn.rs          # Connection / connect / wait_hello / create_session / wait_session_resumed
+│   └── stream.rs        # 单消息流式输出 print_stream
+└── tui/
+    ├── mod.rs           # run_tui 入口 + tokio::select! 事件循环
+    ├── app.rs           # App / ChatEntry / Mode 状态机（单元测试）
+    ├── confirm.rs       # 二次确认 modal 文本格式化（单元测试）
+    ├── input.rs         # UiEvent + crossterm 阻塞线程读入
+    └── ui.rs            # ratatui 三栏 + modal 浮层渲染
 ```
 
-事件循环：
+### 8.2 启动流程
 
-```rust
-// src/tui/main.rs
-#[tokio::main]
-async fn main() -> Result<()> {
-    let conn = WsTransportClient::new().connect(..).await?;
-    terminal_init()?;            // enter raw mode
-    let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(64);
-    tokio::spawn(async move { ws_to_ui(conn.receiver, ui_tx).await; });
-    run_app(terminal, conn.sender, ui_rx).await
-}
-```
+1. 入口 `parrot` bin 决定走 TUI（tty 且无 `-m`）/ 流式（`-m`/非 tty）/ rustyline（`--simple`）。
+2. 走 TUI 时先 `ListSessions` → 文本列表页（MVP）→ 用户选 N 新建 / 选索引 resume。
+3. 选定后 `enable_raw_mode` + `EnterAlternateScreen`，进入 `tokio::select!` 主循环。
 
-依赖：`ratatui`, `crossterm`。TUI 只依赖 protocol + transport，不依赖 core。`Cargo.toml` 新增 `[[bin]] name = "parrot-tui"`。
+> **后期修正：** `Connection.session_id` 字段在 Task 3 引入后，Task 10 重构为由会话列表页 `choose_session` 直接产出 `SessionId` 并传入 `App::new`，原 `conn.session_id` 字段被去除——握手阶段不再持有 session id，session id 仅在选定会话后才存在。
 
-确认提示在 TUI 用模态浮层（输入框上方临时条 + y/n 快捷键），不阻塞渲染。
+### 8.3 异步架构
+
+- crossterm 输入：独立 `std::thread` 跑阻塞 `event::poll(Duration::from_millis(100))`+`event::read`，通过 `tokio::sync::mpsc::Sender::blocking_send` 喂入主循环（Windows 输入可靠性最佳）。
+- WS 接收：`conn.receiver.recv()` 在 select! 另一分支。
+- 重绘：50ms tick + 任何事件触发 `terminal.draw`。
+- 终止：Ctrl+C / AgentEnd / 连接关闭 → disable_raw_mode + LeaveAlternateScreen。
+
+### 8.4 状态机
+
+`App::apply_event(AgentEvent)` 把生命周期事件落到 `Vec<ChatEntry>`：
+- `TurnStart` → `ChatEntry::User`
+- `MessageStart/MessageDelta/MessageEnd` 累积到 `ChatEntry::Assistant`（fallback final_content 由服务端权威覆盖）
+- `ToolStart`/`ToolEnd` → `ChatEntry::Tool`（result 字段由 ToolEnd 回填）
+- `ToolConfirmRequired` → `Mode::ConfirmPending` + `pending_confirmation`
+- `ReplayIntegrityWarning` → `ChatEntry::Warning`
+- `AgentEnd` → `ended=true`，主循环退出
+
+纯逻辑可单测（`src/tui/app.rs::tests` + `src/tui/confirm.rs::tests`）；UI/输入/主循环无单测，靠手动冒烟。
+
+### 8.5 二次确认 modal
+
+`Mode==ConfirmPending` 时，`draw` 在屏幕中央叠一个 60×14 `Clear + Paragraph` modal，文本由 `confirm::format_confirmation` 格式化：
+- 第 1 行：`Approve tool call?`
+- 第 2 行：`Tool: <name>`
+- 其余：`Arguments:\n<json pretty 最多 8 行/400 字符截断>`
+
+键位：`y/Y` Approve、`n/N/Esc` Reject，发出 `ConfirmToolCall` 后回 `Mode::Normal`。
+
+### 8.6 依赖
+
+`Cargo.toml` 新增 `ratatui 0.29`、`crossterm 0.28`、`tui-textarea 0.7` 同时进 workspace 与 parrot bin `[dependencies]`。删除 `atty` 依赖（改用 `std::io::IsTerminal`）。
+
+### 8.7 测试
+
+- `cargo test --package parrot --bin parrot tui::app::tests`：11 个状态机单测
+- `cargo test --package parrot --bin parrot tui::confirm::tests`：2 个 modal 格式化单测
+- `cargo test --workspace`：68 + 13 = 81 测试全过
+- `cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` 干净
 
 ## 9. 与主设计文档的关系
 
