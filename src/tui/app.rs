@@ -11,8 +11,6 @@ pub(crate) enum ChatEntry {
     Assistant {
         text: String,
         completed: bool,
-        #[allow(dead_code)]
-        tool_calls: Vec<ToolCallInfo>,
     },
     Tool {
         tool_call_id: String,
@@ -44,7 +42,6 @@ pub(crate) struct App {
     pub mode: Mode,
     pub pending_confirmation: Option<PendingConfirmation>,
     pub ended: bool,
-    pub quit: bool,
     pub scroll_offset: u16,
     cur_assistant_text: HashMap<Uuid, String>,
     cur_assistant_tools: HashMap<Uuid, Vec<ToolCallInfo>>,
@@ -59,16 +56,11 @@ impl App {
             mode: Mode::Normal,
             pending_confirmation: None,
             ended: false,
-            quit: false,
             scroll_offset: 0,
             cur_assistant_text: HashMap::new(),
             cur_assistant_tools: HashMap::new(),
             cur_assistant_completed: HashMap::new(),
         }
-    }
-
-    pub fn push_user_input(&mut self, text: String) {
-        self.entries.push(ChatEntry::User(text));
     }
 
     pub fn scroll_up(&mut self, n: u16) {
@@ -77,11 +69,6 @@ impl App {
 
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
-    }
-
-    #[allow(dead_code)]
-    pub fn quit(&mut self) {
-        self.quit = true;
     }
 
     pub fn confirm_decision(
@@ -108,7 +95,7 @@ impl App {
             // TUI 默认不处理其他 ServerMessage（HelloAck 已在握手期完成；SessionList/History 等由列表页消费）
             _ => {}
         }
-        self.quit || self.ended
+        self.ended
     }
 
     pub fn apply_event(&mut self, ev: AgentEvent) {
@@ -229,7 +216,6 @@ impl App {
             self.entries.push(ChatEntry::Assistant {
                 text,
                 completed: true,
-                tool_calls: Vec::new(), // 工具单独以 ChatEntry::Tool 形式由 ToolStart 流入
             });
         }
         // 清掉 completed marker 防止重复 flush
@@ -260,7 +246,6 @@ mod tests {
         assert!(app.entries.is_empty());
         assert_eq!(app.mode, Mode::Normal);
         assert!(!app.ended);
-        assert!(!app.quit);
     }
 
     #[test]
@@ -454,12 +439,5 @@ mod tests {
             },
         });
         assert!(matches!(app.entries.last(), Some(ChatEntry::Warning(_))));
-    }
-
-    #[test]
-    fn quit_flag_via_quit_method() {
-        let mut app = App::new(sid());
-        app.quit();
-        assert!(app.quit);
     }
 }

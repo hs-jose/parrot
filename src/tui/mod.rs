@@ -22,6 +22,14 @@ use crate::conn::{create_session, wait_session_resumed, Connection};
 use crate::tui::app::Mode;
 use crate::tui::input::{spawn_input_thread, UiEvent};
 
+struct RawModeGuard;
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    }
+}
+
 pub(crate) async fn run_tui(mut conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 先发 ListSessions；若空或选 New 则发 CreateSession；若选已有项则发 ResumeSession。
     let session_id = match choose_session(&mut conn).await? {
@@ -37,6 +45,7 @@ pub(crate) async fn run_tui(mut conn: Connection) -> Result<(), Box<dyn std::err
     let mut app = app::App::new(session_id);
 
     enable_raw_mode()?;
+    let _raw_guard = RawModeGuard;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -159,11 +168,20 @@ async fn run_loop(
                     }
                 }
             }
-            Some(msg) = conn.receiver.recv() => {
-                let should_quit = app.apply_server_message(msg);
-                *dirty = true;
-                if should_quit {
-                    break;
+            msg = conn.receiver.recv() => {
+                match msg {
+                    Some(m) => {
+                        let should_quit = app.apply_server_message(m);
+                        *dirty = true;
+                        if should_quit {
+                            break;
+                        }
+                    }
+                    None => {
+                        app.entries.push(app::ChatEntry::Error("Connection closed".into()));
+                        *dirty = true;
+                        break;
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -213,7 +231,6 @@ async fn handle_key(
             KeyCode::Enter => {
                 let text = input.lines().join("\n");
                 if !text.trim().is_empty() {
-                    app.push_user_input(text.clone());
                     *input = TextArea::default();
                     conn.sender
                         .send(ClientMessage::Chat {
