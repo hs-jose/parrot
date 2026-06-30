@@ -27,6 +27,9 @@ struct Cli {
     #[arg(short, long)]
     message: Option<String>,
 
+    #[arg(short, long)]
+    session: Option<String>,
+
     #[arg(long)]
     simple: bool,
 
@@ -50,8 +53,18 @@ struct SessionsCmd {
 #[derive(Subcommand)]
 enum SessionsAction {
     List,
-    Show { session_id: String },
-    Resume { session_id: String },
+    Show {
+        session_id: String,
+    },
+    Resume {
+        session_id: String,
+    },
+    /// Export a session's event log as JSON (Vec<PersistedAgentEvent>).
+    /// Output can be saved to a file for TUI replay tests:
+    ///   parrot sessions export <id> > tests/tui_replay/my_fixture.json
+    Export {
+        session_id: String,
+    },
 }
 
 async fn run_rustyline_loop(
@@ -246,9 +259,19 @@ async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::er
     let server_version = wait_hello(&mut conn.receiver).await?;
     eprintln!("Connected to server v{}", server_version);
 
+    let session_id = if let Some(sid_str) = &cli.session {
+        let id: SessionId = sid_str
+            .parse()
+            .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", sid_str, e))?;
+        conn.sender
+            .send(ClientMessage::ResumeSession { session_id: id })
+            .await?;
+        wait_session_resumed(&mut conn.receiver).await?
+    } else {
+        create_session(&conn.sender, &mut conn.receiver).await?
+    };
+
     if let Some(message) = cli.message {
-        // -m "..." : 一发即停，非交互，自动 Reject 工具确认
-        let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
         conn.sender
             .send(ClientMessage::Chat {
                 session_id,
@@ -260,14 +283,11 @@ async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::er
     }
 
     if cli.simple || !std::io::stdin().is_terminal() {
-        // --simple 或非 tty：仍走 rustyline 行编辑 + 流式打印，但用户不可操作确认（自动 Reject）
-        let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
         run_rustyline_loop(&mut conn, session_id).await?;
         return Ok(());
     }
 
-    // 默认：tty 且无消息 → TUI（session 由 TUI 内部列表页建立）
-    tui::run_tui(conn).await
+    tui::run_tui(conn, session_id).await
 }
 
 async fn run_sessions(
@@ -337,6 +357,31 @@ async fn run_sessions(
             eprintln!("Resumed session {}", id);
             run_rustyline_loop(&mut conn, id).await?;
             Ok(())
+        }
+        SessionsAction::Export { session_id } => {
+            let id: SessionId = session_id
+                .parse()
+                .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
+            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let server_version = wait_hello(&mut conn.receiver).await?;
+            eprintln!("Connected to server v{}", server_version);
+            conn.sender
+                .send(ClientMessage::GetHistory { session_id: id })
+                .await?;
+            loop {
+                match conn.receiver.recv().await {
+                    Some(ServerMessage::History { events, .. }) => {
+                        let json = serde_json::to_string_pretty(&events)?;
+                        println!("{}", json);
+                        return Ok(());
+                    }
+                    Some(ServerMessage::Error { message, .. }) => {
+                        return Err(format!("Server error: {}", message).into());
+                    }
+                    Some(msg) => eprintln!("Unexpected message: {:?}", msg),
+                    None => return Err("Connection closed".into()),
+                }
+            }
         }
     }
 }

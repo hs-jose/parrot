@@ -3,6 +3,9 @@ pub(crate) mod confirm;
 pub(crate) mod input;
 pub(crate) mod ui;
 
+#[cfg(test)]
+mod replay_test;
+
 use std::io::Stdout;
 use std::time::Duration;
 
@@ -18,9 +21,9 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
-use crate::conn::{create_session, wait_session_resumed, Connection};
+use crate::conn::Connection;
 use crate::tui::app::Mode;
-use crate::tui::input::{spawn_input_thread, UiEvent};
+use crate::tui::input::{spawn_input_thread, MouseGuard, UiEvent};
 
 struct RawModeGuard;
 impl Drop for RawModeGuard {
@@ -30,19 +33,30 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub(crate) async fn run_tui(mut conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 先发 ListSessions；若空或选 New 则发 CreateSession；若选已有项则发 ResumeSession。
-    let session_id = match choose_session(&mut conn).await? {
-        SessionChoice::New => create_session(&conn.sender, &mut conn.receiver).await?,
-        SessionChoice::Resume(id) => {
-            conn.sender
-                .send(ClientMessage::ResumeSession { session_id: id })
-                .await?;
-            wait_session_resumed(&mut conn.receiver).await?
-        }
-    };
-
+pub(crate) async fn run_tui(
+    mut conn: Connection,
+    session_id: SessionId,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = app::App::new(session_id);
+
+    // Load prior conversation history for resumed sessions.
+    conn.sender
+        .send(ClientMessage::GetHistory { session_id })
+        .await?;
+    loop {
+        match conn.receiver.recv().await {
+            Some(ServerMessage::History { events, .. }) => {
+                app.load_history(&events);
+                break;
+            }
+            Some(ServerMessage::Error { message, .. }) => {
+                eprintln!("Failed to load history: {}", message);
+                break;
+            }
+            Some(_) => {}
+            None => return Err("Connection closed waiting for history".into()),
+        }
+    }
 
     enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
@@ -55,6 +69,7 @@ pub(crate) async fn run_tui(mut conn: Connection) -> Result<(), Box<dyn std::err
 
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(128);
     let _input_handle = spawn_input_thread(ui_tx);
+    let _mouse_guard = MouseGuard;
 
     let mut dirty = true;
     let result = run_loop(
@@ -72,65 +87,6 @@ pub(crate) async fn run_tui(mut conn: Connection) -> Result<(), Box<dyn std::err
     let mut stdout = std::io::stdout();
     let _ = execute!(stdout, LeaveAlternateScreen);
     result
-}
-
-enum SessionChoice {
-    New,
-    Resume(SessionId),
-}
-
-/// 轻量文本列表（不开 ratatui）。
-async fn choose_session(
-    conn: &mut Connection,
-) -> Result<SessionChoice, Box<dyn std::error::Error>> {
-    conn.sender.send(ClientMessage::ListSessions).await?;
-    let sessions = loop {
-        match conn.receiver.recv().await {
-            Some(ServerMessage::SessionList { sessions }) => break sessions,
-            Some(ServerMessage::Error { message, .. }) => {
-                return Err(format!("ListSessions error: {}", message).into());
-            }
-            Some(other) => {
-                eprintln!("Unexpected message waiting for session list: {:?}", other);
-            }
-            None => return Err("Connection closed waiting for session list".into()),
-        }
-    };
-    if sessions.is_empty() {
-        println!("No prior sessions; creating a new one.");
-        return Ok(SessionChoice::New);
-    }
-    loop {
-        println!("\nExisting sessions (Ctrl+C to abort):");
-        for (i, s) in sessions.iter().enumerate() {
-            let title = s.title.clone().unwrap_or_else(|| "-".into());
-            println!(
-                "  [{:>2}] {} {} {} {}",
-                i,
-                s.id,
-                s.model,
-                s.updated_at.format("%Y-%m-%d %H:%M"),
-                title
-            );
-        }
-        println!("  [ N]  create a new session");
-        print!("> ");
-        std::io::Write::flush(&mut std::io::stdout())?;
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line)? == 0 {
-            return Ok(SessionChoice::New);
-        }
-        let trimmed = line.trim().to_lowercase();
-        if trimmed == "n" || trimmed.is_empty() {
-            return Ok(SessionChoice::New);
-        }
-        if let Ok(idx) = trimmed.parse::<usize>() {
-            if let Some(s) = sessions.get(idx) {
-                return Ok(SessionChoice::Resume(s.id));
-            }
-        }
-        println!("invalid choice; try again.");
-    }
 }
 
 async fn run_loop(
@@ -164,6 +120,14 @@ async fn run_loop(
                                 break;
                             }
                         }
+                        *dirty = true;
+                    }
+                    UiEvent::MouseScrollUp => {
+                        app.scroll_up(3);
+                        *dirty = true;
+                    }
+                    UiEvent::MouseScrollDown => {
+                        app.scroll_down(3);
                         *dirty = true;
                     }
                 }
@@ -242,11 +206,19 @@ async fn handle_key(
                 Ok(None)
             }
             KeyCode::PageUp => {
-                app.scroll_up(5);
+                app.scroll_up(10);
                 Ok(None)
             }
             KeyCode::PageDown => {
-                app.scroll_down(5);
+                app.scroll_down(10);
+                Ok(None)
+            }
+            KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.scroll_up(1);
+                Ok(None)
+            }
+            KeyCode::Down if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.scroll_down(1);
                 Ok(None)
             }
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Ok(Some(true)),

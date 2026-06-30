@@ -282,4 +282,27 @@ impl SessionManager {
     pub fn contains(&self, id: &Uuid) -> bool {
         self.sessions.contains_key(id)
     }
+
+    /// Check if a session is healthy: engine still running (cmd_tx open) and
+    /// event receiver still available (not taken by a relay task). Used by
+    /// the daemon's `resume_session` to decide whether to short-circuit or
+    /// clean up and re-resume from disk.
+    pub fn is_healthy(&self, id: &Uuid) -> bool {
+        match self.sessions.get(id) {
+            Some(h) => !h.cmd_tx.is_closed() && h.event_rx.is_some(),
+            None => false,
+        }
+    }
+
+    /// Remove a session from the manager and abort its engine task. Used by
+    /// the daemon's `resume_session` to clean up stale handles (engine exited
+    /// or event receiver already taken) before re-spawning from disk.
+    pub fn remove(&mut self, id: &Uuid) -> bool {
+        if let Some(handle) = self.sessions.remove(id) {
+            handle.abort_handle.abort();
+            true
+        } else {
+            false
+        }
+    }
 }

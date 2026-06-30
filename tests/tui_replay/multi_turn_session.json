@@ -1,0 +1,162 @@
+[
+  {
+    "seq": 0,
+    "ts": "2026-01-01T00:00:00Z",
+    "type": "AgentStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "model": "claude-sonnet-4-6",
+    "provider": "anthropic",
+    "system_prompt_hash": "abcdef0123456789",
+    "resumed_from_seq": null
+  },
+  {
+    "seq": 1,
+    "ts": "2026-01-01T00:00:01Z",
+    "type": "TurnStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "user_message": "hello"
+  },
+  {
+    "seq": 2,
+    "ts": "2026-01-01T00:00:01Z",
+    "type": "MessageStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "message_id": "11111111-2222-3333-4444-555555555555"
+  },
+  {
+    "seq": 3,
+    "ts": "2026-01-01T00:00:02Z",
+    "type": "MessageEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "message_id": "11111111-2222-3333-4444-555555555555",
+    "final_content": "Hi there!\nHow can I help you today?",
+    "tool_calls": [],
+    "stop_reason": "EndTurn",
+    "usage": { "input_tokens": 10, "output_tokens": 8 }
+  },
+  {
+    "seq": 4,
+    "ts": "2026-01-01T00:00:02Z",
+    "type": "TurnEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "stop_reason": "EndTurn",
+    "usage": { "input_tokens": 10, "output_tokens": 8 }
+  },
+  {
+    "seq": 5,
+    "ts": "2026-01-01T00:00:10Z",
+    "type": "TurnStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "user_message": "list files in the current directory"
+  },
+  {
+    "seq": 6,
+    "ts": "2026-01-01T00:00:10Z",
+    "type": "MessageStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "message_id": "22222222-3333-4444-5555-666666666666"
+  },
+  {
+    "seq": 7,
+    "ts": "2026-01-01T00:00:11Z",
+    "type": "MessageEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "message_id": "22222222-3333-4444-5555-666666666666",
+    "final_content": "Let me check that for you.",
+    "tool_calls": [
+      {
+        "tool_call_id": "tc_001",
+        "tool_name": "file_list",
+        "arguments": { "path": "." }
+      }
+    ],
+    "stop_reason": "ToolUse",
+    "usage": { "input_tokens": 15, "output_tokens": 12 }
+  },
+  {
+    "seq": 8,
+    "ts": "2026-01-01T00:00:11Z",
+    "type": "ToolStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "parent_message_id": "22222222-3333-4444-5555-666666666666",
+    "tool_call_id": "tc_001",
+    "tool_name": "file_list",
+    "arguments": { "path": "." }
+  },
+  {
+    "seq": 9,
+    "ts": "2026-01-01T00:00:12Z",
+    "type": "ToolEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "tool_call_id": "tc_001",
+    "result": {
+      "content": "file1.txt\nfile2.rs\nREADME.md",
+      "is_error": false
+    }
+  },
+  {
+    "seq": 10,
+    "ts": "2026-01-01T00:00:12Z",
+    "type": "MessageStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "message_id": "33333333-4444-5555-6666-777777777777"
+  },
+  {
+    "seq": 11,
+    "ts": "2026-01-01T00:00:13Z",
+    "type": "MessageEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "message_id": "33333333-4444-5555-6666-777777777777",
+    "final_content": "Found 3 files:\nfile1.txt\nfile2.rs\nREADME.md",
+    "tool_calls": [],
+    "stop_reason": "EndTurn",
+    "usage": { "input_tokens": 20, "output_tokens": 15 }
+  },
+  {
+    "seq": 12,
+    "ts": "2026-01-01T00:00:13Z",
+    "type": "TurnEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "stop_reason": "EndTurn",
+    "usage": { "input_tokens": 20, "output_tokens": 15 }
+  },
+  {
+    "seq": 13,
+    "ts": "2026-01-01T00:00:20Z",
+    "type": "TurnStart",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "user_message": "delete everything"
+  },
+  {
+    "seq": 14,
+    "ts": "2026-01-01T00:00:21Z",
+    "type": "TurnEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "turn_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    "stop_reason": {
+      "Error": "provider error: api error 401: {\"error\":{\"message\":\"invalid api key\"}}"
+    },
+    "usage": { "input_tokens": 0, "output_tokens": 0 }
+  },
+  {
+    "seq": 15,
+    "ts": "2026-01-01T00:00:30Z",
+    "type": "AgentEnd",
+    "session_id": "11111111-1111-1111-1111-111111111111",
+    "reason": "ClientClose",
+    "total_usage": { "input_tokens": 45, "output_tokens": 35 }
+  }
+]

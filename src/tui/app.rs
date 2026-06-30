@@ -1,4 +1,7 @@
-use parrot_protocol::agent_event::{AgentEvent, MessageDeltaPayload, ToolCallInfo};
+use parrot_protocol::agent_event::{
+    AgentEndReason, AgentEvent, MessageDeltaPayload, PersistedAgentEvent, ToolCallInfo,
+    TurnStopReason,
+};
 use parrot_protocol::types::{ConfirmDecision, ToolOutput};
 use parrot_protocol::{ServerMessage, SessionId};
 use serde_json::Value;
@@ -10,7 +13,6 @@ pub(crate) enum ChatEntry {
     User(String),
     Assistant {
         text: String,
-        completed: bool,
     },
     Tool {
         tool_call_id: String,
@@ -46,6 +48,7 @@ pub(crate) struct App {
     cur_assistant_text: HashMap<Uuid, String>,
     cur_assistant_tools: HashMap<Uuid, Vec<ToolCallInfo>>,
     cur_assistant_completed: HashMap<Uuid, bool>,
+    current_message_id: Option<Uuid>,
 }
 
 impl App {
@@ -60,6 +63,7 @@ impl App {
             cur_assistant_text: HashMap::new(),
             cur_assistant_tools: HashMap::new(),
             cur_assistant_completed: HashMap::new(),
+            current_message_id: None,
         }
     }
 
@@ -101,18 +105,25 @@ impl App {
     pub fn apply_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::AgentStart { .. } => {}
-            AgentEvent::AgentEnd { .. } => {
+            AgentEvent::AgentEnd { reason, .. } => {
+                if let AgentEndReason::FatalError(msg) = reason {
+                    self.entries.push(ChatEntry::Error(msg));
+                }
                 self.ended = true;
             }
             AgentEvent::TurnStart { user_message, .. } => {
                 self.entries.push(ChatEntry::User(user_message));
             }
-            AgentEvent::TurnEnd { .. } => {
+            AgentEvent::TurnEnd { stop_reason, .. } => {
                 self.flush_open_assistant();
                 self.scroll_offset = 0;
+                if let TurnStopReason::Error(msg) = stop_reason {
+                    self.entries.push(ChatEntry::Error(msg));
+                }
             }
             AgentEvent::MessageStart { message_id, .. } => {
                 self.flush_open_assistant();
+                self.current_message_id = Some(message_id);
                 self.cur_assistant_text.insert(message_id, String::new());
                 self.cur_assistant_tools.insert(message_id, Vec::new());
                 self.cur_assistant_completed.insert(message_id, false);
@@ -197,33 +208,41 @@ impl App {
     }
 
     /// 把当前 (任一) 已完成的 assistant message 从内部 map 落地成 entries。
-    /// 单 turn 内不知何时 TurnEnd，所以保守地：任一已 completed 的 message 立即落地一条；
-    /// 处理 TurnEnd 时把全部 uncompleted 也清空（丢弃空文本，多余没 Problem）。
+    /// 只移除已 emit 的 message 的 map entries；未完成的保留在 map 里等后续 MessageEnd。
     fn flush_open_assistant(&mut self) {
-        let mut still_open: Vec<Uuid> = Vec::new();
-        let mut to_emit: Vec<(Uuid, String, Vec<ToolCallInfo>)> = Vec::new();
+        let mut completed_ids: Vec<Uuid> = Vec::new();
         for (mid, done) in &self.cur_assistant_completed {
             if *done {
-                if let Some(text) = self.cur_assistant_text.remove(mid) {
-                    let tools = self.cur_assistant_tools.remove(mid).unwrap_or_default();
-                    to_emit.push((*mid, text, tools));
-                }
-            } else {
-                still_open.push(*mid);
+                completed_ids.push(*mid);
             }
         }
-        for (_mid, text, _tools) in to_emit {
-            self.entries.push(ChatEntry::Assistant {
-                text,
-                completed: true,
-            });
+        for mid in completed_ids {
+            if let Some(text) = self.cur_assistant_text.remove(&mid) {
+                let _tools = self.cur_assistant_tools.remove(&mid);
+                self.cur_assistant_completed.remove(&mid);
+                self.entries.push(ChatEntry::Assistant { text });
+                if self.current_message_id == Some(mid) {
+                    self.current_message_id = None;
+                }
+            }
         }
-        // 清掉 completed marker 防止重复 flush
-        for mid in still_open {
-            // keep open message maps intact
-            let _ = mid;
+    }
+
+    /// Load persisted events (from GetHistory) into the app, rebuilding
+    /// entries as if the events had been received live. Used when resuming
+    /// an existing session so the TUI shows prior conversation.
+    pub fn load_history(&mut self, events: &[PersistedAgentEvent]) {
+        for ev in events {
+            self.apply_event(ev.event.clone());
         }
-        self.cur_assistant_completed.clear();
+    }
+
+    /// Returns the accumulated text of the in-progress assistant message,
+    /// if any. Used by the UI to render streaming text before MessageEnd.
+    pub fn streaming_text(&self) -> Option<&str> {
+        self.current_message_id
+            .and_then(|mid| self.cur_assistant_text.get(&mid))
+            .map(|s| s.as_str())
     }
 }
 

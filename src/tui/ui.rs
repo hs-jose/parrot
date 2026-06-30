@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::tui::app::{App, ChatEntry, Mode};
 use crate::tui::confirm::format_confirmation;
@@ -43,38 +43,84 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut items: Vec<ListItem<'_>> = Vec::new();
+    let mut lines: Vec<Line<'_>> = Vec::new();
     for e in &app.entries {
-        items.push(ListItem::new(entry_text(e)));
+        entry_lines(e, &mut lines);
     }
-    let mut state = ListState::default();
-    // 滚动偏移：把 cursor 推到底，再减用户向上 offset
-    let total = items.len();
+    if let Some(text) = app.streaming_text() {
+        if !text.is_empty() {
+            let text_lines: Vec<&str> = text.lines().collect();
+            for (i, l) in text_lines.iter().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("assistant> ", Style::default().fg(Color::Cyan)),
+                        Span::raw(*l),
+                        Span::raw("▌"),
+                    ]));
+                } else {
+                    lines.push(Line::from(format!("          {}", l)));
+                }
+            }
+        }
+    }
+
     let view_h = inner.height as usize;
-    let last = total.saturating_sub(1);
-    let selected = last.saturating_sub(app.scroll_offset as usize);
-    state.select(Some(selected));
-    // 强制 ratatui 不滚过头：用一个新的 List with start_corner 不便，干脆限制 selected 不越过 last - view_h + 1
-    let selected_clamped = selected
-        .min(last)
-        .max(last.saturating_sub(view_h.saturating_sub(1)));
-    state.select(Some(selected_clamped));
-    let list = List::new(items)
-        .style(Style::default())
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, inner, &mut state);
+    let col_width = inner.width as usize;
+    let total_visual_lines: usize = lines
+        .iter()
+        .map(|l| {
+            let w = l.width();
+            if w == 0 || col_width == 0 {
+                1
+            } else {
+                w.div_ceil(col_width)
+            }
+        })
+        .sum();
+
+    let max_scroll = total_visual_lines.saturating_sub(view_h);
+    let scroll = max_scroll.saturating_sub(app.scroll_offset as usize);
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
+    f.render_widget(para, inner);
 }
 
-fn entry_text(e: &ChatEntry) -> ratatui::text::Text<'static> {
-    let text = match e {
-        ChatEntry::User(s) => format!("user> {}", s),
-        ChatEntry::Assistant {
-            text, completed, ..
-        } => {
-            if *completed {
-                format!("assistant> {}", text)
+fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
+    let user_style = Style::default().fg(Color::Green);
+    let assistant_style = Style::default().fg(Color::Cyan);
+    let tool_style = Style::default().fg(Color::Yellow);
+    let error_style = Style::default().fg(Color::Red);
+    let warn_style = Style::default().fg(Color::Magenta);
+
+    match e {
+        ChatEntry::User(s) => {
+            for (i, l) in s.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("user> ", user_style),
+                        Span::raw(l.to_string()),
+                    ]));
+                } else {
+                    lines.push(Line::from(format!("      {}", l)));
+                }
+            }
+        }
+        ChatEntry::Assistant { text, .. } => {
+            if text.is_empty() {
+                lines.push(Line::from(Span::styled("assistant> ", assistant_style)));
             } else {
-                format!("assistant> {}▌", text)
+                for (i, l) in text.lines().enumerate() {
+                    if i == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled("assistant> ", assistant_style),
+                            Span::raw(l.to_string()),
+                        ]));
+                    } else {
+                        lines.push(Line::from(format!("          {}", l)));
+                    }
+                }
             }
         }
         ChatEntry::Tool {
@@ -88,12 +134,24 @@ fn entry_text(e: &ChatEntry) -> ratatui::text::Text<'static> {
                 Some(r) => format!(" [ok: {}]", truncate_str(&r.content, 60)),
                 None => " [...]".to_string(),
             };
-            format!("  tool: {} {}{}", tool_name, arguments, rsummary)
+            lines.push(Line::from(Span::styled(
+                format!("  tool: {} {}{}", tool_name, arguments, rsummary),
+                tool_style,
+            )));
         }
-        ChatEntry::Error(s) => format!("[error] {}", s),
-        ChatEntry::Warning(s) => format!("[warn] {}", s),
-    };
-    ratatui::text::Text::from(text)
+        ChatEntry::Error(s) => {
+            lines.push(Line::from(Span::styled(
+                format!("[error] {}", s),
+                error_style,
+            )));
+        }
+        ChatEntry::Warning(s) => {
+            lines.push(Line::from(Span::styled(
+                format!("[warn] {}", s),
+                warn_style,
+            )));
+        }
+    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

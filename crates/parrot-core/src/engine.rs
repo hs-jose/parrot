@@ -216,7 +216,10 @@ impl ReActEngine {
                     let (stop_reason, turn_usage) = match turn_result {
                         Ok((sr, u)) => (sr, u),
                         Err(AgentError::Aborted) => (TurnStopReason::Aborted, Usage::default()),
-                        Err(e) => (TurnStopReason::Error(e.to_string()), Usage::default()),
+                        Err(e) => {
+                            tracing::error!(session_id = %session_id, error = %e, "turn failed");
+                            (TurnStopReason::Error(e.to_string()), Usage::default())
+                        }
                     };
 
                     {
@@ -233,13 +236,6 @@ impl ReActEngine {
                     };
                     let _ = event_tx.send(turn_end.clone()).await.ok();
                     let _ = event_log.append(turn_end);
-
-                    if matches!(stop_reason, TurnStopReason::Error(_)) {
-                        // A fatal turn error ends the session.
-                        *end_reason.lock().unwrap() =
-                            AgentEndReason::FatalError("turn error".into());
-                        break;
-                    }
                 }
                 Some(SessionCmd::Abort) => {
                     // Top-level abort with no active turn — ignore.
