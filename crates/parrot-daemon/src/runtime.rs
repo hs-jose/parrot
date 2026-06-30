@@ -93,12 +93,15 @@ pub async fn run_with_confirm_timeout(
         SessionManager::new(
             Arc::clone(&tool_registry),
             Arc::clone(&provider_registry),
-            default_config,
+            default_config.clone(),
             sessions_dir,
             working_dir,
         )
         .with_confirm_config(confirm_config),
     ));
+    // Wrap once in an Arc so each spawned handler can share the daemon's
+    // current default config without per-connection cloning.
+    let default_config = Arc::new(default_config);
 
     let ws_server = WsTransportServer::new(&config.daemon.host, config.daemon.port);
     let listener = ws_server.bind().await?;
@@ -111,6 +114,7 @@ pub async fn run_with_confirm_timeout(
                 let session_store = Arc::clone(&session_store);
                 let provider_registry = Arc::clone(&provider_registry);
                 let confirm_router = Arc::clone(&confirm_router);
+                let default_config = Arc::clone(&default_config);
 
                 tokio::spawn(async move {
                     handle_connection(
@@ -120,6 +124,7 @@ pub async fn run_with_confirm_timeout(
                         session_store,
                         provider_registry,
                         confirm_router,
+                        default_config,
                     )
                     .await;
                 });
@@ -142,6 +147,7 @@ async fn handle_connection(
     session_store: Arc<SessionStore>,
     provider_registry: Arc<ProviderRegistry>,
     confirm_router: Arc<ConfirmRouter>,
+    default_config: Arc<GenerateConfig>,
 ) {
     let client_id = client.id;
     info!("Handling connection from client {}", client_id);
@@ -199,7 +205,10 @@ async fn handle_connection(
                     system_prompt: c.system_prompt,
                 });
 
-                let model_for_meta = proto_config.as_ref().and_then(|c| c.model.clone());
+                let model_for_meta = proto_config
+                    .as_ref()
+                    .and_then(|c| c.model.clone())
+                    .or_else(|| Some(default_config.model.clone()));
                 let system_prompt_for_meta =
                     proto_config.as_ref().and_then(|c| c.system_prompt.clone());
 
@@ -385,7 +394,7 @@ async fn handle_connection(
                     session_id,
                     &session_manager,
                     &session_store,
-                    &provider_registry,
+                    &default_config,
                 )
                 .await
                 {
@@ -517,24 +526,36 @@ async fn read_history(
 
 /// Resume a previously-persisted session. Steps:
 ///   1. If the session is already live in the `SessionManager`, do nothing.
-///   2. Otherwise read `meta.json`, run `EventLog::replay_for_resume`
+///   2. Otherwise read `meta.json` only to confirm the session exists on
+///      disk (its `meta.model` / `meta.system_prompt` are intentionally
+///      NOT reused — resume treats the persisted session as pure
+///      conversation history fed to the daemon's current `default_config`,
+///      so a changed `parrot.toml` takes effect on resume rather than
+///      resurrecting a now-dead config), run `EventLog::replay_for_resume`
 ///      (truncates partial turns, writes corrupted.log, returns optional
-///      IntegrityIssue), rebuild the context, and spawn a fresh engine task
-///      via `create_resumed_session` with the resume metadata.
+///      IntegrityIssue), rebuild the context, and spawn a fresh engine
+///      task via `create_resumed_session` with the resume metadata.
 async fn resume_session(
     session_id: uuid::Uuid,
     session_manager: &RwLock<SessionManager>,
     session_store: &SessionStore,
-    provider_registry: &ProviderRegistry,
+    default_config: &GenerateConfig,
 ) -> Result<(), String> {
     if session_manager.read().await.contains(&session_id) {
         return Ok(());
     }
 
-    let meta = session_store
+    // Confirm the session exists on disk. We do NOT read back
+    // `meta.model` / `meta.system_prompt`: those come from
+    // `default_config` so the resumed session follows the current daemon
+    // config, not the one it was originally created under.
+    let on_disk = session_store
         .read_meta(session_id)
         .map_err(|e| format!("read meta: {e}"))?
-        .ok_or_else(|| format!("session {session_id} not found on disk"))?;
+        .is_some();
+    if !on_disk {
+        return Err(format!("session {session_id} not found on disk"));
+    }
 
     let sessions_dir = session_store.sessions_dir();
     let session_dir = sessions_dir.join(session_id.to_string());
@@ -544,28 +565,17 @@ async fn resume_session(
         .map_err(|e| format!("replay: {e}"))?;
 
     let replayed_context = rebuild_context(&events);
-
-    let gen_config = GenerateConfig {
-        model: meta.model.clone(),
-        temperature: None,
-        max_tokens: Some(8192),
-        stop_sequences: None,
-    };
-
-    if provider_registry.resolve(&meta.model).await.is_none() {
-        return Err(format!(
-            "model '{}' is not registered with any provider; cannot resume session {}",
-            meta.model, session_id
-        ));
-    }
-
     let resumed_from_seq = events.len() as u64;
 
     let mut mgr = session_manager.write().await;
     mgr.create_resumed_session(
         session_id,
-        gen_config,
-        meta.system_prompt.clone(),
+        default_config.clone(),
+        // No per-session prompt on resume: the engine injects the daemon
+        // default system prompt (`default_system_prompt()`) when this is
+        // `None`, keeping resumed sessions consistent with the current
+        // daemon policy rather than resurrecting an old persona.
+        None,
         replayed_context,
         resumed_from_seq,
         integrity_issue,
