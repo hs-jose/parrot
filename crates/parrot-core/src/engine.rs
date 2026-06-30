@@ -307,14 +307,13 @@ impl ReActEngine {
                 .map_err(AgentError::Provider)?;
 
             let message_id = Uuid::new_v4();
-            let _ = event_tx
-                .send(AgentEvent::MessageStart {
-                    session_id,
-                    turn_id,
-                    message_id,
-                })
-                .await
-                .ok();
+            let message_start = AgentEvent::MessageStart {
+                session_id,
+                turn_id,
+                message_id,
+            };
+            let _ = event_tx.send(message_start.clone()).await.ok();
+            let _ = event_log.append(message_start);
 
             let mut accumulated_text = String::new();
             let mut tool_calls: Vec<PendingToolCall> = Vec::new();

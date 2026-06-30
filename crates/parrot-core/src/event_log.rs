@@ -199,7 +199,13 @@ pub fn truncate_to_last_complete_turn(
         }
     }
 
-    // Partial turn: find last TurnEnd and check for trailing events.
+    // Partial turn: find the last complete TurnEnd. Anything after it is the
+    // "tail". Within the tail, lifecycle boundary markers (AgentStart /
+    // AgentEnd / ReplayIntegrityWarning) are NOT turn content — a lone
+    // trailing AgentEnd after a closed turn, or a resume's leading
+    // AgentStart with no turn started yet, are clean and must be kept. The
+    // partial turn begins at the first `TurnStart` in the tail; if there is
+    // none, the tail is clean and we keep everything.
     let last_turn_end_idx = events
         .iter()
         .enumerate()
@@ -207,23 +213,32 @@ pub fn truncate_to_last_complete_turn(
         .find_map(|(i, ev)| matches!(&ev.event, AgentEvent::TurnEnd { .. }).then_some(i));
 
     let tail_start = last_turn_end_idx.map(|i| i + 1).unwrap_or(0);
-    let tail = &events[tail_start..];
 
-    if tail.is_empty() {
+    let partial_start = events[tail_start..]
+        .iter()
+        .enumerate()
+        .map(|(i, _)| tail_start + i)
+        .find(|i| matches!(&events[*i].event, AgentEvent::TurnStart { .. }));
+
+    let Some(partial_start) = partial_start else {
+        // Tail contains only lifecycle markers (or is empty) — clean prefix.
         return (events, Vec::new(), None);
-    }
+    };
+
+    let (keep, drop) = events.split_at(partial_start);
+    let drop = drop.to_vec();
 
     let mut issue = IntegrityIssue {
         kind: IntegrityIssueKind::PartialTurn,
-        dropped_event_count: tail.len() as u32,
-        first_dropped_seq: tail.first().map(|e| e.seq).unwrap_or(0),
-        last_dropped_seq: tail.last().map(|e| e.seq).unwrap_or(0),
+        dropped_event_count: drop.len() as u32,
+        first_dropped_seq: drop.first().map(|e| e.seq).unwrap_or(0),
+        last_dropped_seq: drop.last().map(|e| e.seq).unwrap_or(0),
         dangling_turn_ids: Vec::new(),
         dangling_message_ids: Vec::new(),
         dangling_tool_call_ids: Vec::new(),
     };
 
-    for ev in tail {
+    for ev in &drop {
         match &ev.event {
             AgentEvent::TurnStart { turn_id, .. } => issue.dangling_turn_ids.push(*turn_id),
             AgentEvent::MessageStart { message_id, .. } => {
@@ -236,8 +251,7 @@ pub fn truncate_to_last_complete_turn(
         }
     }
 
-    let (keep, drop) = events.split_at(tail_start);
-    (keep.to_vec(), drop.to_vec(), Some(issue))
+    (keep.to_vec(), drop, Some(issue))
 }
 
 /// Rebuild a `Vec<ChatMessage>` from a replayed event log. Only
@@ -438,6 +452,88 @@ mod tests {
         assert_eq!(drop.len(), 1);
         let issue = issue.expect("expected integrity issue");
         assert_eq!(issue.kind, IntegrityIssueKind::EventsAfterAgentEnd);
+    }
+
+    /// Regression: a lone trailing `AgentEnd` after a closed turn is a clean
+    /// shutdown marker, not a partial turn. Must be kept, no integrity issue.
+    #[test]
+    fn truncate_lone_trailing_agent_end_is_kept() {
+        let sid = Uuid::new_v4();
+        let tid = Uuid::new_v4();
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: tid,
+                    user_message: "hi".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::TurnEnd {
+                    session_id: sid,
+                    turn_id: tid,
+                    stop_reason: TurnStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                2,
+                AgentEvent::AgentEnd {
+                    session_id: sid,
+                    reason: parrot_protocol::agent_event::AgentEndReason::ClientClose,
+                    total_usage: Usage::default(),
+                },
+            ),
+        ];
+        let (keep, drop, issue) = truncate_to_last_complete_turn(events.clone());
+        assert_eq!(keep.len(), 3, "AgentEnd must be kept");
+        assert!(drop.is_empty());
+        assert!(issue.is_none());
+    }
+
+    /// Regression: a resume's leading `AgentStart{resumed_from_seq}` that
+    /// arrives before any new turn is a lifecycle marker, not a partial turn.
+    /// Must be kept (matches the user-reported bug where `corrupted.log`
+    /// showed a lone `AgentStart` being dropped as `PartialTurn`).
+    #[test]
+    fn truncate_lone_trailing_resume_agent_start_is_kept() {
+        let sid = Uuid::new_v4();
+        let tid = Uuid::new_v4();
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: tid,
+                    user_message: "hi".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::TurnEnd {
+                    session_id: sid,
+                    turn_id: tid,
+                    stop_reason: TurnStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                2,
+                AgentEvent::AgentStart {
+                    session_id: sid,
+                    model: "m".into(),
+                    provider: "p".into(),
+                    system_prompt_hash: "h".into(),
+                    resumed_from_seq: Some(2),
+                },
+            ),
+        ];
+        let (keep, drop, issue) = truncate_to_last_complete_turn(events.clone());
+        assert_eq!(keep.len(), 3, "resume AgentStart must be kept");
+        assert!(drop.is_empty());
+        assert!(issue.is_none());
     }
 
     #[test]
