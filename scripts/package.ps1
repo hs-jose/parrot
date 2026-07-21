@@ -27,7 +27,9 @@ $userDataDir = "$env:LOCALAPPDATA"
 
 $zipPath = Join-Path $distDir "$packageName.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath }
-Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath
+Push-Location $distDir
+Compress-Archive -Path $packageName -DestinationPath $zipPath
+Pop-Location
 
 Write-Host "Done:"
 Write-Host "  Stage:  $stageDir"
