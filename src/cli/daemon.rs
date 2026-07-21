@@ -32,9 +32,7 @@ pub async fn ensure_running(config: &AppConfig) -> Result<(), Box<dyn std::error
         .open(&log_path)?;
 
     let mut cmd = std::process::Command::new(&daemon_path);
-    cmd.stdout(log_file.try_clone()?)
-        .stderr(log_file)
-        .current_dir(daemon_path.parent().unwrap_or_else(|| Path::new(".")));
+    cmd.stdout(log_file.try_clone()?).stderr(log_file);
 
     #[cfg(windows)]
     {
