@@ -1,4 +1,5 @@
 mod conn;
+mod daemon;
 mod stream;
 #[path = "../tui/mod.rs"]
 mod tui;
