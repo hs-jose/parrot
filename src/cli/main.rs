@@ -252,6 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    crate::daemon::ensure_running(config).await?;
     let token_path = cli
         .token_file
         .clone()
@@ -296,6 +297,7 @@ async fn run_sessions(
     cli: Cli,
     config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::daemon::ensure_running(config).await?;
     let token_path = cli
         .token_file
         .clone()
@@ -388,6 +390,7 @@ async fn run_sessions(
 }
 
 async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    crate::daemon::ensure_running(config).await?;
     let token_path = cli
         .token_file
         .clone()
@@ -412,6 +415,7 @@ async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::err
 }
 
 async fn run_tools(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    crate::daemon::ensure_running(config).await?;
     let token_path = cli
         .token_file
         .clone()

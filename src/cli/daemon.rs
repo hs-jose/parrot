@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use parrot_config::AppConfig;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
