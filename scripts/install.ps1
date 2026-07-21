@@ -17,7 +17,11 @@ Copy-Item "$sourceDir\bin\parrot.exe" $binDir -Force
 Copy-Item "$sourceDir\bin\parrotd.exe" $binDir -Force
 
 if (-not (Test-Path "$configDir\parrot.toml")) {
-    Copy-Item "$sourceDir\config\parrot.toml" $configDir\parrot.toml
+    $projectRoot = Split-Path -Parent $PSScriptRoot
+    $userDataDir = $env:LOCALAPPDATA
+    (Get-Content "$projectRoot\scripts\parrot.toml.template") `
+        -replace '\{USER_DATA_DIR\}', $userDataDir.Replace('\', '/') `
+        | Set-Content "$configDir\parrot.toml"
     Write-Host "Created default config at $configDir\parrot.toml"
 }
 

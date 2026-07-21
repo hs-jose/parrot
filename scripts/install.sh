@@ -20,7 +20,10 @@ cp "$SOURCE_DIR/bin/parrot" "$BIN_DIR/"
 cp "$SOURCE_DIR/bin/parrotd" "$BIN_DIR/"
 
 if [ ! -f "$CONFIG_DIR/parrot.toml" ]; then
-    cp "$SOURCE_DIR/config/parrot.toml" "$CONFIG_DIR/parrot.toml"
+    PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    USER_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+    sed "s|{USER_DATA_DIR}|$USER_DATA_DIR|g" "$PROJECT_ROOT/scripts/parrot.toml.template" \
+        > "$CONFIG_DIR/parrot.toml"
     echo "Created default config at $CONFIG_DIR/parrot.toml"
 fi
 
