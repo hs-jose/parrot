@@ -23,7 +23,7 @@ use tui_textarea::TextArea;
 
 use crate::conn::Connection;
 use crate::tui::app::Mode;
-use crate::tui::input::{spawn_input_thread, MouseGuard, UiEvent};
+use crate::tui::input::{spawn_input_thread, UiEvent};
 
 struct RawModeGuard;
 impl Drop for RawModeGuard {
@@ -69,7 +69,6 @@ pub(crate) async fn run_tui(
 
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(128);
     let _input_handle = spawn_input_thread(ui_tx);
-    let _mouse_guard = MouseGuard;
 
     let mut dirty = true;
     let result = run_loop(
@@ -120,14 +119,6 @@ async fn run_loop(
                                 break;
                             }
                         }
-                        *dirty = true;
-                    }
-                    UiEvent::MouseScrollUp => {
-                        app.scroll_up(3);
-                        *dirty = true;
-                    }
-                    UiEvent::MouseScrollDown => {
-                        app.scroll_down(3);
                         *dirty = true;
                     }
                 }

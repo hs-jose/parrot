@@ -1,7 +1,8 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+use serde_json::Value;
 
 use crate::tui::app::{App, ChatEntry, Mode};
 use crate::tui::confirm::format_confirmation;
@@ -17,28 +18,29 @@ mod palette {
     pub const USER_FG: Color = Color::Rgb(125, 207, 255); // 青 #7dcfff
     pub const AI_FG: Color = Color::Rgb(255, 158, 100); // 暖橙 #ff9e64
     pub const TOOL_FG: Color = Color::Rgb(224, 175, 104); // 黄 #e0af68
+    pub const OK_FG: Color = Color::Rgb(158, 206, 106); // 绿 #9ece6a
     pub const ERROR_FG: Color = Color::Rgb(247, 118, 142); // 红 #f7768e
     pub const WARN_FG: Color = Color::Rgb(187, 154, 247); // 紫 #bb9af7
     pub const BODY_FG: Color = Color::Rgb(171, 178, 191); // 柔和正文
     pub const DIM: Color = Color::Rgb(86, 95, 137); // 注释灰 #565f89
-    pub const INPUT_PROMPT: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
+    pub const INPUT_BORDER: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
 }
 
 pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &App, input: &tui_textarea::TextArea<'_>) {
     let area = f.area();
-    // 参考 steer-tui：输入区按内容行数动态增长，+2 对应 title 行 + 底部 padding 行；
-    // 上限不超过终端高度的 1/3，避免长输入把对话区挤没。
+    // 输入区按内容行数动态增长，+2 为上下边框；上限不超过终端高度的 1/3，
+    // 避免长输入把对话区挤没。
     let input_lines = input.lines().len().max(1) as u16;
     let max_input = (area.height / 3).max(3);
     let input_lines = input_lines.min(max_input);
-    let input_height = input_lines + 2; // +1 title 行 + 1 底 padding（与 steer required_height 一致）
+    let input_height = input_lines + 2; // 上下边框
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),            // 标题栏
-            Constraint::Min(1),               // 对话区（占满剩余）
-            Constraint::Length(input_height), // 输入区（动态）
+            Constraint::Min(3),               // 对话卡片（占满剩余）
+            Constraint::Length(input_height), // 输入卡片（动态）
             Constraint::Length(1),            // 状态栏
         ])
         .split(area);
@@ -73,7 +75,7 @@ fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_default();
     if !session_title.is_empty() {
         spans.push(Span::styled(
-            format!("   {session_title}"),
+            format!(" · {session_title}"),
             Style::default().fg(palette::TITLE_FG),
         ));
     }
@@ -96,22 +98,26 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let line = Line::from(vec![
         Span::styled(" ", Style::default()),
         Span::styled(model, Style::default().fg(palette::STATUS_FG)),
-        Span::styled("  •  ", Style::default().fg(palette::DIM)),
+        Span::styled("  ·  ", Style::default().fg(palette::DIM)),
         Span::styled(usage_str, Style::default().fg(palette::STATUS_FG)),
-        Span::styled("  •  ", Style::default().fg(palette::DIM)),
+        Span::styled("  ·  ", Style::default().fg(palette::DIM)),
         Span::styled(
             format!("session {short_sid}"),
             Style::default().fg(palette::DIM),
         ),
-        Span::raw(if app.ended { "  • ended" } else { "" }),
+        Span::raw(if app.ended { "  · ended" } else { "" }),
     ]);
     let bar = Paragraph::new(line).style(Style::default().bg(palette::STATUS_BG));
     f.render_widget(bar, area);
 }
 
 fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    // 左侧细边框作为对话区边界，也保证 Paragraph 的可用宽度与滚动计算一致。
-    let block = Block::default().borders(Borders::LEFT);
+    // 对话卡片：圆角边框 + 水平内边距，让内容不贴边。
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::DIM))
+        .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -165,7 +171,7 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         }
     } else if app.is_thinking() {
         lines.push(Line::from(Span::styled(
-            "Thinking…",
+            "  Thinking…",
             Style::default()
                 .fg(palette::AI_FG)
                 .add_modifier(Modifier::DIM),
@@ -173,7 +179,7 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
     if app.is_working() {
         lines.push(Line::from(Span::styled(
-            "Working…",
+            "  Working…",
             Style::default()
                 .fg(palette::AI_FG)
                 .add_modifier(Modifier::DIM),
@@ -228,39 +234,68 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
             result,
             ..
         } => {
-            let rsummary = match result {
-                Some(r) if r.is_error => {
-                    format!(" [error: {}]", truncate_str(&r.content, 60))
-                }
-                Some(r) => format!(" [ok: {}]", truncate_str(&r.content, 60)),
-                None => " […]".to_string(),
-            };
-            let args_str = if arguments.is_null() {
+            // 单行紧凑展示：`▸ 工具名 关键参数 ✓/✗/…`，避免原始 JSON 和长
+            // 结果内容刷屏。
+            let args = compact_args(arguments);
+            let args_str = if args.is_empty() {
                 String::new()
             } else {
-                format!(" {}", arguments)
+                format!(" {}", truncate_str(&args, 48))
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("▸ {tool_name}{args_str}{rsummary}"),
+                    format!("▸ {tool_name}{args_str}"),
                     Style::default().fg(palette::TOOL_FG),
                 ),
-            ]));
+            ];
+            match result {
+                Some(r) if r.is_error => {
+                    spans.push(Span::styled(
+                        format!("  ✗ {}", truncate_str(&r.content, 60)),
+                        Style::default().fg(palette::ERROR_FG),
+                    ));
+                }
+                Some(_) => {
+                    spans.push(Span::styled("  ✓", Style::default().fg(palette::OK_FG)));
+                }
+                None => {
+                    spans.push(Span::styled("  …", Style::default().fg(palette::DIM)));
+                }
+            }
+            lines.push(Line::from(spans));
         }
         ChatEntry::Error(s) => {
             lines.push(Line::from(Span::styled(
-                format!("[error] {s}"),
+                format!("  [error] {s}"),
                 Style::default().fg(palette::ERROR_FG),
             )));
         }
         ChatEntry::Warning(s) => {
             lines.push(Line::from(Span::styled(
-                format!("[warn] {s}"),
+                format!("  [warn] {s}"),
                 Style::default().fg(palette::WARN_FG),
             )));
         }
     }
+}
+
+/// 将工具参数压缩成单行展示串：单字段对象直接取值（如 `{"path":"x"}` → `x`），
+/// 多字段对象退化为紧凑 JSON，由调用方再截断。
+fn compact_args(args: &Value) -> String {
+    if args.is_null() {
+        return String::new();
+    }
+    if let Some(obj) = args.as_object() {
+        if obj.len() == 1 {
+            if let Some(v) = obj.values().next() {
+                if let Some(s) = v.as_str() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    serde_json::to_string(args).unwrap_or_default()
 }
 
 /// 将正文按行展开，统一缩进两格 + 柔和正文色。
@@ -279,13 +314,14 @@ fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
 }
 
 fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::TextArea<'_>) {
-    // 参考 steer-tui 的 InputPanel：无边框 + padding，底 padding 在输入文字与状态栏
-    // 之间留出一行空白，避免"贴太近"。title 行作为输入提示。
+    // 输入卡片：圆角蓝边框标示焦点；快捷键提示收进边框标题，不再占用内容行。
     let block = Block::default()
-        .borders(Borders::NONE)
-        .padding(Padding::new(1, 1, 0, 1))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::INPUT_BORDER))
+        .padding(Padding::horizontal(1))
         .title(Span::styled(
-            " Submit: Enter | Quit: Ctrl+C ",
+            " Enter 发送 · PgUp/PgDn 翻页 · Ctrl+C 退出 ",
             Style::default().fg(palette::DIM),
         ));
     let inner = block.inner(area);
@@ -302,7 +338,7 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
     let prompt = Paragraph::new(Span::styled(
         "> ",
         Style::default()
-            .fg(palette::INPUT_PROMPT)
+            .fg(palette::INPUT_BORDER)
             .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(prompt, prompt_area);
@@ -349,10 +385,94 @@ fn draw_confirm_modal(f: &mut ratatui::Frame<'_>, area: Rect, text: &str) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Confirmation required (y=approve / n=reject / Esc=reject)"),
+                .border_type(BorderType::Rounded)
+                .title(" Confirmation (y=approve / n=reject / Esc=reject) "),
         )
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
     f.render_widget(Clear, modal_area);
     f.render_widget(para, modal_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parrot_protocol::types::ToolOutput;
+    use parrot_protocol::SessionId;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn compact_args_single_field_object_uses_value() {
+        let v = serde_json::json!({"path": "src/main.rs"});
+        assert_eq!(compact_args(&v), "src/main.rs");
+    }
+
+    #[test]
+    fn compact_args_multi_field_falls_back_to_json() {
+        let v = serde_json::json!({"a": 1, "b": 2});
+        let s = compact_args(&v);
+        assert!(s.contains("\"a\":1"));
+        assert!(s.contains("\"b\":2"));
+    }
+
+    #[test]
+    fn compact_args_null_is_empty() {
+        assert_eq!(compact_args(&Value::Null), "");
+    }
+
+    #[test]
+    fn truncate_str_appends_ellipsis() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "hello…");
+    }
+
+    /// 用 TestBackend 在多种终端尺寸下真实渲染一遍，保证布局在小窗口下
+    /// 不 panic（边框/padding/折行/滚动计算的边界组合）。
+    #[test]
+    fn draw_renders_without_panic_at_various_sizes() {
+        for (w, h) in [(80u16, 24u16), (40, 12), (30, 8), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut app = App::new(SessionId::new_v4());
+            app.entries.push(ChatEntry::User {
+                text: "你好，帮我看一下 main.rs 的结构".into(),
+                time: "14:32".into(),
+            });
+            app.entries.push(ChatEntry::Tool {
+                tool_call_id: "t1".into(),
+                tool_name: "file_read".into(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+                result: Some(ToolOutput {
+                    content: "ok".into(),
+                    is_error: false,
+                }),
+            });
+            app.entries.push(ChatEntry::Assistant {
+                text: "这个文件的结构如下：……".into(),
+                time: "14:33".into(),
+            });
+            app.entries.push(ChatEntry::Error("boom".into()));
+            let input = tui_textarea::TextArea::default();
+            terminal.draw(|f| draw(f, &app, &input)).unwrap();
+        }
+    }
+
+    /// 渲染出的对话卡片应带圆角边框（╭/╰），输入卡片在对话卡片下方。
+    #[test]
+    fn draw_renders_rounded_borders_around_chat_and_input() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let app = App::new(SessionId::new_v4());
+        let input = tui_textarea::TextArea::default();
+        terminal.draw(|f| draw(f, &app, &input)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains('╭'),
+            "expected rounded top corner, got:\n{text}"
+        );
+        assert!(
+            text.contains('╰'),
+            "expected rounded bottom corner, got:\n{text}"
+        );
+    }
 }
