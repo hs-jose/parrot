@@ -91,6 +91,7 @@ tokio               = { workspace = true }
 clap                = { workspace = true }
 rustyline           = { workspace = true }
 uuid                = { workspace = true }
-ratatui             = { workspace = true }
+ratatui             = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm           = { workspace = true }
 tui-textarea        = { workspace = true }
+chrono              = { workspace = true }

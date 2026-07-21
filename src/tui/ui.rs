@@ -1,24 +1,51 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 use crate::tui::app::{App, ChatEntry, Mode};
 use crate::tui::confirm::format_confirmation;
 
+/// Tokyo Night 风格调色板。所有 UI 颜色集中管理，方便整体调整。
+mod palette {
+    use ratatui::style::Color;
+
+    pub const TITLE_BG: Color = Color::Rgb(36, 58, 100); // 标题栏底：深蓝
+    pub const TITLE_FG: Color = Color::Rgb(192, 202, 245); // #c0caf5
+    pub const STATUS_BG: Color = Color::Rgb(36, 40, 59); // #24283b
+    pub const STATUS_FG: Color = Color::Rgb(169, 177, 214); // 较暗文本
+    pub const USER_FG: Color = Color::Rgb(125, 207, 255); // 青 #7dcfff
+    pub const AI_FG: Color = Color::Rgb(255, 158, 100); // 暖橙 #ff9e64
+    pub const TOOL_FG: Color = Color::Rgb(224, 175, 104); // 黄 #e0af68
+    pub const ERROR_FG: Color = Color::Rgb(247, 118, 142); // 红 #f7768e
+    pub const WARN_FG: Color = Color::Rgb(187, 154, 247); // 紫 #bb9af7
+    pub const BODY_FG: Color = Color::Rgb(171, 178, 191); // 柔和正文
+    pub const DIM: Color = Color::Rgb(86, 95, 137); // 注释灰 #565f89
+    pub const INPUT_PROMPT: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
+}
+
 pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &App, input: &tui_textarea::TextArea<'_>) {
     let area = f.area();
+    // 参考 steer-tui：输入区按内容行数动态增长，+2 对应 title 行 + 底部 padding 行；
+    // 上限不超过终端高度的 1/3，避免长输入把对话区挤没。
+    let input_lines = input.lines().len().max(1) as u16;
+    let max_input = (area.height / 3).max(3);
+    let input_lines = input_lines.min(max_input);
+    let input_height = input_lines + 2; // +1 title 行 + 1 底 padding（与 steer required_height 一致）
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // status bar
-            Constraint::Min(5),    // entries
-            Constraint::Length(3), // input
+            Constraint::Length(1),            // 标题栏
+            Constraint::Min(1),               // 对话区（占满剩余）
+            Constraint::Length(input_height), // 输入区（动态）
+            Constraint::Length(1),            // 状态栏
         ])
         .split(area);
-    draw_status(f, chunks[0], app);
+    draw_title(f, chunks[0], app);
     draw_entries(f, chunks[1], app);
     draw_input(f, chunks[2], input);
+    draw_status(f, chunks[3], app);
     if app.mode == Mode::ConfirmPending {
         if let Some(p) = &app.pending_confirmation {
             draw_confirm_modal(f, area, &format_confirmation(p));
@@ -26,102 +53,174 @@ pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &App, input: &tui_textarea::
     }
 }
 
+/// 标题栏：深蓝底 + 白色加粗 "Parrot"，后跟会话标题（首条用户消息截断）。
+fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        " Parrot",
+        Style::default()
+            .fg(palette::TITLE_FG)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let session_title = app
+        .entries
+        .iter()
+        .find_map(|e| match e {
+            ChatEntry::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .map(|t| truncate_str(&t, 48))
+        .unwrap_or_default();
+    if !session_title.is_empty() {
+        spans.push(Span::styled(
+            format!("   {session_title}"),
+            Style::default().fg(palette::TITLE_FG),
+        ));
+    }
+    let bar = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(palette::TITLE_BG))
+        .alignment(Alignment::Left);
+    f.render_widget(bar, area);
+}
+
+/// 状态栏：灰色底，显示 模型 / 累计 token / 会话短 id。
 fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let model = if app.model.is_empty() {
+        "model -".to_string()
+    } else {
+        app.model.clone()
+    };
+    let usage = &app.total_usage;
+    let usage_str = format!("{} in / {} out", usage.input_tokens, usage.output_tokens);
+    let short_sid: String = app.session_id.to_string().chars().take(8).collect();
     let line = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(model, Style::default().fg(palette::STATUS_FG)),
+        Span::styled("  •  ", Style::default().fg(palette::DIM)),
+        Span::styled(usage_str, Style::default().fg(palette::STATUS_FG)),
+        Span::styled("  •  ", Style::default().fg(palette::DIM)),
         Span::styled(
-            format!(" Parrot  |  session: {}  ", app.session_id),
-            Style::default().add_modifier(Modifier::BOLD),
+            format!("session {short_sid}"),
+            Style::default().fg(palette::DIM),
         ),
-        Span::raw(if app.ended { "| ended" } else { "" }),
+        Span::raw(if app.ended { "  • ended" } else { "" }),
     ]);
-    let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
+    let bar = Paragraph::new(line).style(Style::default().bg(palette::STATUS_BG));
     f.render_widget(bar, area);
 }
 
 fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    // 左侧细边框作为对话区边界，也保证 Paragraph 的可用宽度与滚动计算一致。
     let block = Block::default().borders(Borders::LEFT);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    for e in &app.entries {
+    let n = app.entries.len();
+    for (idx, e) in app.entries.iter().enumerate() {
         entry_lines(e, &mut lines);
+        // 只在消息之间留空行，最后一条之后不加，避免底部多一行空白把
+        // 真实内容顶出可见区。
+        let is_last = idx + 1 == n;
+        if !is_last {
+            match e {
+                ChatEntry::Error(_) | ChatEntry::Warning(_) => {}
+                _ => lines.push(Line::from("")),
+            }
+        }
     }
+
+    let blink = blink_cursor();
+
+    // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。
     if let Some(text) = app.streaming_text() {
-        if !text.is_empty() {
-            let text_lines: Vec<&str> = text.lines().collect();
-            for (i, l) in text_lines.iter().enumerate() {
+        lines.push(header_line("AI", palette::AI_FG, None));
+        if text.is_empty() {
+            lines.push(Line::from(Span::styled(
+                blink,
+                Style::default()
+                    .fg(palette::AI_FG)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            for (i, l) in text.lines().enumerate() {
                 if i == 0 {
                     lines.push(Line::from(vec![
-                        Span::styled("assistant> ", Style::default().fg(Color::Cyan)),
-                        Span::raw(*l),
-                        Span::raw("▌"),
+                        Span::raw("  "),
+                        Span::styled(l.to_string(), Style::default().fg(palette::BODY_FG)),
+                        Span::styled(
+                            blink,
+                            Style::default()
+                                .fg(palette::AI_FG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ]));
                 } else {
-                    lines.push(Line::from(format!("          {}", l)));
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(l.to_string(), Style::default().fg(palette::BODY_FG)),
+                    ]));
                 }
             }
         }
+    } else if app.is_thinking() {
+        lines.push(Line::from(Span::styled(
+            "Thinking…",
+            Style::default()
+                .fg(palette::AI_FG)
+                .add_modifier(Modifier::DIM),
+        )));
+    }
+    if app.is_working() {
+        lines.push(Line::from(Span::styled(
+            "Working…",
+            Style::default()
+                .fg(palette::AI_FG)
+                .add_modifier(Modifier::DIM),
+        )));
     }
 
     let view_h = inner.height as usize;
-    let col_width = inner.width as usize;
-    let total_visual_lines: usize = lines
-        .iter()
-        .map(|l| {
-            let w = l.width();
-            if w == 0 || col_width == 0 {
-                1
-            } else {
-                w.div_ceil(col_width)
-            }
-        })
-        .sum();
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
 
+    // 用 ratatui 的 line_count 精确算折行后的真实可视行数（与渲染一致），
+    // 避免手动 div_ceil 估算偏差导致末尾内容被推出可见区。
+    let total_visual_lines = if inner.width > 0 {
+        para.line_count(inner.width)
+    } else {
+        0
+    };
     let max_scroll = total_visual_lines.saturating_sub(view_h);
     let scroll = max_scroll.saturating_sub(app.scroll_offset as usize);
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
-    f.render_widget(para, inner);
+    f.render_widget(para.scroll((scroll as u16, 0)), inner);
+}
+
+/// 构造角色标题行：`You · 14:32` / `AI · 14:32`。time 为 None 时省略时间部分。
+fn header_line(role: &str, fg: Color, time: Option<&str>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        role.to_string(),
+        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+    ));
+    if let Some(t) = time {
+        spans.push(Span::styled(
+            format!(" · {t}"),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
-    let user_style = Style::default().fg(Color::Green);
-    let assistant_style = Style::default().fg(Color::Cyan);
-    let tool_style = Style::default().fg(Color::Yellow);
-    let error_style = Style::default().fg(Color::Red);
-    let warn_style = Style::default().fg(Color::Magenta);
-
     match e {
-        ChatEntry::User(s) => {
-            for (i, l) in s.lines().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("user> ", user_style),
-                        Span::raw(l.to_string()),
-                    ]));
-                } else {
-                    lines.push(Line::from(format!("      {}", l)));
-                }
-            }
+        ChatEntry::User { text, time } => {
+            lines.push(header_line("You", palette::USER_FG, Some(time)));
+            push_body(text, lines);
         }
-        ChatEntry::Assistant { text, .. } => {
-            if text.is_empty() {
-                lines.push(Line::from(Span::styled("assistant> ", assistant_style)));
-            } else {
-                for (i, l) in text.lines().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::styled("assistant> ", assistant_style),
-                            Span::raw(l.to_string()),
-                        ]));
-                    } else {
-                        lines.push(Line::from(format!("          {}", l)));
-                    }
-                }
-            }
+        ChatEntry::Assistant { text, time } => {
+            lines.push(header_line("AI", palette::AI_FG, Some(time)));
+            push_body(text, lines);
         }
         ChatEntry::Tool {
             tool_name,
@@ -130,27 +229,103 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
             ..
         } => {
             let rsummary = match result {
-                Some(r) if r.is_error => format!(" [error: {}]", truncate_str(&r.content, 60)),
+                Some(r) if r.is_error => {
+                    format!(" [error: {}]", truncate_str(&r.content, 60))
+                }
                 Some(r) => format!(" [ok: {}]", truncate_str(&r.content, 60)),
-                None => " [...]".to_string(),
+                None => " […]".to_string(),
             };
-            lines.push(Line::from(Span::styled(
-                format!("  tool: {} {}{}", tool_name, arguments, rsummary),
-                tool_style,
-            )));
+            let args_str = if arguments.is_null() {
+                String::new()
+            } else {
+                format!(" {}", arguments)
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("▸ {tool_name}{args_str}{rsummary}"),
+                    Style::default().fg(palette::TOOL_FG),
+                ),
+            ]));
         }
         ChatEntry::Error(s) => {
             lines.push(Line::from(Span::styled(
-                format!("[error] {}", s),
-                error_style,
+                format!("[error] {s}"),
+                Style::default().fg(palette::ERROR_FG),
             )));
         }
         ChatEntry::Warning(s) => {
             lines.push(Line::from(Span::styled(
-                format!("[warn] {}", s),
-                warn_style,
+                format!("[warn] {s}"),
+                Style::default().fg(palette::WARN_FG),
             )));
         }
+    }
+}
+
+/// 将正文按行展开，统一缩进两格 + 柔和正文色。
+fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
+    let body_style = Style::default().fg(palette::BODY_FG);
+    if text.is_empty() {
+        lines.push(Line::from(Span::raw("  ")));
+        return;
+    }
+    for l in text.lines() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(l.to_string(), body_style),
+        ]));
+    }
+}
+
+fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::TextArea<'_>) {
+    // 参考 steer-tui 的 InputPanel：无边框 + padding，底 padding 在输入文字与状态栏
+    // 之间留出一行空白，避免"贴太近"。title 行作为输入提示。
+    let block = Block::default()
+        .borders(Borders::NONE)
+        .padding(Padding::new(1, 1, 0, 1))
+        .title(Span::styled(
+            " Submit: Enter | Quit: Ctrl+C ",
+            Style::default().fg(palette::DIM),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // 左侧 "> " 提示符列，textarea 随其后渲染。
+    let prompt_w = 2;
+    let prompt_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: prompt_w,
+        height: inner.height,
+    };
+    let prompt = Paragraph::new(Span::styled(
+        "> ",
+        Style::default()
+            .fg(palette::INPUT_PROMPT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(prompt, prompt_area);
+
+    let text_area = Rect {
+        x: inner.x + prompt_w,
+        y: inner.y,
+        width: inner.width.saturating_sub(prompt_w),
+        height: inner.height,
+    };
+    f.render_widget(input, text_area);
+}
+
+/// 500ms 周期的闪烁光标块，用于模拟流式打字中。
+fn blink_cursor() -> &'static str {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if (ms / 500).is_multiple_of(2) {
+        "█"
+    } else {
+        " "
     }
 }
 
@@ -162,17 +337,6 @@ fn truncate_str(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
-}
-
-fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::TextArea<'_>) {
-    // tui-textarea 0.7's `block()` is a getter, not a builder setter; render the
-    // block ourselves and the textarea into its inner area (mirrors draw_entries).
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title("Input (Enter to send, Ctrl+C to quit)");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    f.render_widget(input, inner);
 }
 
 fn draw_confirm_modal(f: &mut ratatui::Frame<'_>, area: Rect, text: &str) {

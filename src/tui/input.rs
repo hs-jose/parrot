@@ -19,8 +19,12 @@ pub(crate) enum UiEvent {
 /// 在独立 std::thread 跑 crossterm 阻塞 `event::poll` + `event::read`，
 /// 通过 mpsc::Sender::blocking_send 把 UiEvent 注入主 tokio 循环。
 /// Windows 输入可靠性最佳路径（不依赖 event-stream feature）。
+///
+/// 启用 `EnableMouseCapture` 以接收鼠标滚轮事件用于翻页；代价是终端
+/// 原生的文本选择会被劫持（Windows Terminal 尤其明显）。如需复制文本，
+/// 可用键盘中断后从滚动回看（buffer 仍在），后续如需兼顾可加按键复制。
 pub(crate) fn spawn_input_thread(tx: mpsc::Sender<UiEvent>) -> std::thread::JoinHandle<()> {
-    // Enable mouse capture so we receive scroll wheel events.
+    // 启用鼠标捕获以接收滚轮。
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
 
     std::thread::spawn(move || loop {
@@ -48,13 +52,12 @@ pub(crate) fn spawn_input_thread(tx: mpsc::Sender<UiEvent>) -> std::thread::Join
                     Err(_) => break,
                 },
                 Event::Mouse(m) => {
-                    let scroll_up = matches!(m.kind, crossterm::event::MouseEventKind::ScrollUp);
-                    let scroll_down =
-                        matches!(m.kind, crossterm::event::MouseEventKind::ScrollDown);
-                    if scroll_up && tx.blocking_send(UiEvent::MouseScrollUp).is_err() {
+                    let up = matches!(m.kind, crossterm::event::MouseEventKind::ScrollUp);
+                    let down = matches!(m.kind, crossterm::event::MouseEventKind::ScrollDown);
+                    if up && tx.blocking_send(UiEvent::MouseScrollUp).is_err() {
                         break;
                     }
-                    if scroll_down && tx.blocking_send(UiEvent::MouseScrollDown).is_err() {
+                    if down && tx.blocking_send(UiEvent::MouseScrollDown).is_err() {
                         break;
                     }
                 }
@@ -68,7 +71,7 @@ pub(crate) fn spawn_input_thread(tx: mpsc::Sender<UiEvent>) -> std::thread::Join
     })
 }
 
-/// Disable mouse capture on drop to restore terminal state.
+/// 退出时关闭鼠标捕获，恢复终端原生选择能力（程序一旦退出即可正常选复制）。
 pub(crate) struct MouseGuard;
 impl Drop for MouseGuard {
     fn drop(&mut self) {

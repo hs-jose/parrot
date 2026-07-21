@@ -263,6 +263,28 @@ impl LlmProvider for AnthropicProvider {
         let anthropic_messages = Self::convert_messages(messages);
         let anthropic_tools = Self::convert_tools(tools);
 
+        tracing::info!(
+            "chat_stream: {} messages, roles: {:?}",
+            anthropic_messages.len(),
+            anthropic_messages
+                .iter()
+                .map(|m| m.role.as_str())
+                .collect::<Vec<_>>()
+        );
+        for (i, m) in anthropic_messages.iter().enumerate() {
+            let preview = if m.content.is_string() {
+                m.content
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            } else {
+                m.content.to_string().chars().take(120).collect::<String>()
+            };
+            tracing::info!("  msg[{}] role={} preview={:?}", i, m.role, preview);
+        }
+
         let request = AnthropicRequest {
             model: model.to_string(),
             messages: anthropic_messages,

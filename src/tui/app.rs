@@ -1,18 +1,30 @@
+use chrono::Local;
 use parrot_protocol::agent_event::{
     AgentEndReason, AgentEvent, MessageDeltaPayload, PersistedAgentEvent, ToolCallInfo,
     TurnStopReason,
 };
-use parrot_protocol::types::{ConfirmDecision, ToolOutput};
+use parrot_protocol::types::{ConfirmDecision, ToolOutput, Usage};
 use parrot_protocol::{ServerMessage, SessionId};
 use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// 客户端本地时间戳，格式 `HH:MM`。协议事件本身不携带发生时间，
+/// 因此在事件到达时打戳；replay 场景下历史消息会统一显示为"当前"时间，
+/// 这是为了避免给 `apply_event` 签名注入时间参数而做的取舍。
+fn stamp() -> String {
+    Local::now().format("%H:%M").to_string()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ChatEntry {
-    User(String),
+    User {
+        text: String,
+        time: String,
+    },
     Assistant {
         text: String,
+        time: String,
     },
     Tool {
         tool_call_id: String,
@@ -49,6 +61,16 @@ pub(crate) struct App {
     cur_assistant_tools: HashMap<Uuid, Vec<ToolCallInfo>>,
     cur_assistant_completed: HashMap<Uuid, bool>,
     current_message_id: Option<Uuid>,
+    /// 模型名（来自 `AgentStart`），用于状态栏展示。
+    pub model: String,
+    /// Provider 名（来自 `AgentStart`）。
+    pub provider: String,
+    /// 累计 token 用量（来自 `TurnEnd` / `AgentEnd` 的权威值）。
+    pub total_usage: Usage,
+    /// 当前是否处于一轮对话中（`TurnStart` → `TurnEnd`）。
+    turn_active: bool,
+    /// 正在执行、尚未 `ToolEnd` 的工具数量。
+    tools_in_flight: u32,
 }
 
 impl App {
@@ -64,7 +86,24 @@ impl App {
             cur_assistant_tools: HashMap::new(),
             cur_assistant_completed: HashMap::new(),
             current_message_id: None,
+            model: String::new(),
+            provider: String::new(),
+            total_usage: Usage::default(),
+            turn_active: false,
+            tools_in_flight: 0,
         }
+    }
+
+    /// `Thinking...`：一轮进行中、还没有流式文本、也没有工具在跑。
+    pub fn is_thinking(&self) -> bool {
+        self.turn_active
+            && self.tools_in_flight == 0
+            && self.streaming_text().is_none_or(|s| s.is_empty())
+    }
+
+    /// `Working...`：有工具正在执行。
+    pub fn is_working(&self) -> bool {
+        self.turn_active && self.tools_in_flight > 0
     }
 
     pub fn scroll_up(&mut self, n: u16) {
@@ -104,19 +143,60 @@ impl App {
 
     pub fn apply_event(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::AgentStart { .. } => {}
-            AgentEvent::AgentEnd { reason, .. } => {
+            AgentEvent::AgentStart {
+                model, provider, ..
+            } => {
+                self.model = model;
+                self.provider = provider;
+                // A new AgentStart means the session lifecycle has restarted
+                // (e.g. after a resume). Clear any previous AgentEnd marker so
+                // subsequent turns are processed instead of quitting the TUI.
+                self.ended = false;
+            }
+            AgentEvent::AgentEnd {
+                reason,
+                total_usage,
+                ..
+            } => {
                 if let AgentEndReason::FatalError(msg) = reason {
                     self.entries.push(ChatEntry::Error(msg));
                 }
+                // AgentEnd 的 total_usage 是整段会话权威合计，覆盖本地累加值。
+                self.total_usage = total_usage;
+                self.turn_active = false;
+                self.tools_in_flight = 0;
+                self.discard_incomplete_assistant();
                 self.ended = true;
             }
             AgentEvent::TurnStart { user_message, .. } => {
-                self.entries.push(ChatEntry::User(user_message));
+                self.turn_active = true;
+                self.tools_in_flight = 0;
+                self.entries.push(ChatEntry::User {
+                    text: user_message,
+                    time: stamp(),
+                });
             }
-            AgentEvent::TurnEnd { stop_reason, .. } => {
+            AgentEvent::TurnEnd {
+                stop_reason, usage, ..
+            } => {
                 self.flush_open_assistant();
+                // 丢弃任何未完成的流式 assistant 状态。daemon 在 Abort 时
+                // 会跳过 MessageEnd 只发 TurnEnd{Aborted}；若不清场，残留的
+                // current_message_id 会让下一轮 streaming_text() 读到上一轮
+                // 被中断的部分文本，表现为“新回答接续上一条”。
+                self.discard_incomplete_assistant();
                 self.scroll_offset = 0;
+                // TurnEnd.usage 是本轮合计；累加进运行总量。
+                self.total_usage.input_tokens = self
+                    .total_usage
+                    .input_tokens
+                    .saturating_add(usage.input_tokens);
+                self.total_usage.output_tokens = self
+                    .total_usage
+                    .output_tokens
+                    .saturating_add(usage.output_tokens);
+                self.turn_active = false;
+                self.tools_in_flight = 0;
                 if let TurnStopReason::Error(msg) = stop_reason {
                     self.entries.push(ChatEntry::Error(msg));
                 }
@@ -158,6 +238,7 @@ impl App {
                 arguments,
                 ..
             } => {
+                self.tools_in_flight = self.tools_in_flight.saturating_add(1);
                 self.entries.push(ChatEntry::Tool {
                     tool_call_id,
                     tool_name,
@@ -171,6 +252,7 @@ impl App {
                 result,
                 ..
             } => {
+                self.tools_in_flight = self.tools_in_flight.saturating_sub(1);
                 for e in self.entries.iter_mut() {
                     if let ChatEntry::Tool {
                         tool_call_id: id,
@@ -220,12 +302,25 @@ impl App {
             if let Some(text) = self.cur_assistant_text.remove(&mid) {
                 let _tools = self.cur_assistant_tools.remove(&mid);
                 self.cur_assistant_completed.remove(&mid);
-                self.entries.push(ChatEntry::Assistant { text });
+                self.entries.push(ChatEntry::Assistant {
+                    text,
+                    time: stamp(),
+                });
                 if self.current_message_id == Some(mid) {
                     self.current_message_id = None;
                 }
             }
         }
+    }
+
+    /// 清除所有未完成的流式 assistant 状态（Abort / TurnEnd 兜底）。
+    /// 已落地为 entries 的内容不受影响；这里只丢弃内部 map 中那些
+    /// 没有等到 MessageEnd 的残留，并重置 current_message_id。
+    fn discard_incomplete_assistant(&mut self) {
+        self.cur_assistant_text.clear();
+        self.cur_assistant_tools.clear();
+        self.cur_assistant_completed.clear();
+        self.current_message_id = None;
     }
 
     /// Load persisted events (from GetHistory) into the app, rebuilding
@@ -276,7 +371,7 @@ mod tests {
             user_message: "hi".into(),
         });
         assert_eq!(app.entries.len(), 1);
-        assert!(matches!(app.entries[0], ChatEntry::User(ref s) if s == "hi"));
+        assert!(matches!(app.entries[0], ChatEntry::User { ref text, .. } if text == "hi"));
     }
 
     #[test]
@@ -424,6 +519,50 @@ mod tests {
             },
         });
         assert!(app.ended);
+    }
+
+    #[test]
+    fn agent_start_after_agent_end_resets_ended_for_resumed_session() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+
+        // History load replays an old AgentEnd from a previous disconnect.
+        app.apply_event(AgentEvent::AgentEnd {
+            session_id: sid_v,
+            reason: AgentEndReason::ClientClose,
+            total_usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        });
+        assert!(app.ended);
+
+        // Resumed engine emits a new AgentStart.
+        let should_quit = app.apply_server_message(ServerMessage::AgentEvent {
+            event: AgentEvent::AgentStart {
+                session_id: sid_v,
+                model: "claude".into(),
+                provider: "anthropic".into(),
+                system_prompt_hash: "hash".into(),
+                resumed_from_seq: Some(2),
+            },
+        });
+        assert!(!should_quit);
+        assert!(!app.ended);
+
+        // New user turn should then be processed normally.
+        let should_quit = app.apply_server_message(ServerMessage::AgentEvent {
+            event: AgentEvent::TurnStart {
+                session_id: sid_v,
+                turn_id: Uuid::new_v4(),
+                user_message: "hi again".into(),
+            },
+        });
+        assert!(!should_quit);
+        assert!(matches!(
+            app.entries.last(),
+            Some(ChatEntry::User { text, .. }) if text == "hi again"
+        ));
     }
 
     #[test]

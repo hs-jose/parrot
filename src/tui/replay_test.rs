@@ -48,13 +48,17 @@ fn replay_multi_turn_session() {
     );
 
     // Turn 1: user "hello" → assistant "Hi there!\n..."
-    assert!(matches!(&app.entries[0], ChatEntry::User(s) if s == "hello"));
-    assert!(matches!(&app.entries[1], ChatEntry::Assistant { text } if text.contains("Hi there!")));
+    assert!(matches!(&app.entries[0], ChatEntry::User { ref text, .. } if text == "hello"));
+    assert!(
+        matches!(&app.entries[1], ChatEntry::Assistant { ref text, .. } if text.contains("Hi there!"))
+    );
 
     // Turn 2: user → assistant → tool → assistant
-    assert!(matches!(&app.entries[2], ChatEntry::User(s) if s.contains("list files")));
     assert!(
-        matches!(&app.entries[3], ChatEntry::Assistant { text } if text.contains("Let me check"))
+        matches!(&app.entries[2], ChatEntry::User { ref text, .. } if text.contains("list files"))
+    );
+    assert!(
+        matches!(&app.entries[3], ChatEntry::Assistant { ref text, .. } if text.contains("Let me check"))
     );
     match &app.entries[4] {
         ChatEntry::Tool {
@@ -68,11 +72,13 @@ fn replay_multi_turn_session() {
         other => panic!("expected Tool entry, got {:?}", other),
     }
     assert!(
-        matches!(&app.entries[5], ChatEntry::Assistant { text } if text.contains("Found 3 files"))
+        matches!(&app.entries[5], ChatEntry::Assistant { ref text, .. } if text.contains("Found 3 files"))
     );
 
     // Turn 3: user → error (no assistant message, TurnEnd has Error)
-    assert!(matches!(&app.entries[6], ChatEntry::User(s) if s == "delete everything"));
+    assert!(
+        matches!(&app.entries[6], ChatEntry::User { ref text, .. } if text == "delete everything")
+    );
     assert!(matches!(&app.entries[7], ChatEntry::Error(s) if s.contains("invalid api key")));
 
     // AgentEnd{ClientClose} → ended=true
@@ -88,7 +94,7 @@ fn replay_multi_line_assistant_preserved() {
 
     // The first assistant response has a newline; verify it's preserved.
     match &app.entries[1] {
-        ChatEntry::Assistant { text } => {
+        ChatEntry::Assistant { text, .. } => {
             assert!(
                 text.contains('\n'),
                 "multi-line text should preserve newlines"
