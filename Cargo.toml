@@ -95,3 +95,4 @@ ratatui             = { workspace = true, features = ["unstable-rendered-line-in
 crossterm           = { workspace = true }
 tui-textarea        = { workspace = true }
 chrono              = { workspace = true }
+dirs                = { workspace = true }

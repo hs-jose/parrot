@@ -91,8 +91,24 @@ pub fn daemon_binary_path() -> Option<PathBuf> {
 }
 
 /// Returns the path for daemon logs.
+///
+/// If `config.session.data_dir` is empty or relative, falls back to the
+/// platform-appropriate user data directory (e.g. `%LOCALAPPDATA%/parrot`
+/// on Windows, `$XDG_DATA_HOME/parrot` on Unix).
 pub fn daemon_log_path(config: &AppConfig) -> PathBuf {
-    Path::new(&config.session.data_dir).join("daemon.log")
+    let base = if config.session.data_dir.is_empty() {
+        dirs::data_dir()
+    } else {
+        let p = Path::new(&config.session.data_dir);
+        if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            dirs::data_dir()
+        }
+    };
+    base.map(|b| b.join("parrot"))
+        .unwrap_or_else(|| PathBuf::from("parrot"))
+        .join("daemon.log")
 }
 
 #[cfg(test)]
