@@ -11,6 +11,7 @@ use parrot_protocol::agent_event::{
 };
 use parrot_protocol::types::{ConfirmDecision, Usage};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -258,6 +259,11 @@ impl ReActEngine {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// Top-level ReAct loop: stream an LLM message, push it to context, then
+    /// execute any tool calls the model requested; repeat until EndTurn / no
+    /// tool calls / MaxIterations. Abort (raised by any sub-step) propagates
+    /// as `AgentError::Aborted` so the caller (`run`) can emit
+    /// `TurnEnd { Aborted }`.
     #[allow(clippy::too_many_arguments)]
     async fn handle_turn(
         &self,
@@ -269,8 +275,6 @@ impl ReActEngine {
         event_log: &mut EventLog,
         cmd_rx: &mut mpsc::Receiver<SessionCmd>,
     ) -> Result<(TurnStopReason, Usage), AgentError> {
-        let session_id = self.session_id;
-
         // Push user message to context.
         context.push(ChatMessage {
             role: ChatRole::User,
@@ -286,147 +290,16 @@ impl ReActEngine {
         for iteration in 0..MAX_REACT_ITERATIONS {
             context_manager.prune(context);
 
-            let provider = self
-                .provider_registry
-                .resolve(&self.config.model)
-                .await
-                .ok_or_else(|| {
-                    AgentError::Config(format!(
-                        "No provider found for model: {}",
-                        self.config.model
-                    ))
-                })?;
+            let msg = self
+                .stream_llm_message(turn_id, context, &tool_defs, event_tx, event_log, cmd_rx)
+                .await?;
 
-            let mut stream = provider
-                .chat_stream(&self.config.model, context, &tool_defs, &self.config)
-                .await
-                .map_err(AgentError::Provider)?;
-
-            let message_id = Uuid::new_v4();
-            let message_start = AgentEvent::MessageStart {
-                session_id,
-                turn_id,
-                message_id,
-            };
-            let _ = event_tx.send(message_start.clone()).await.ok();
-            let _ = event_log.append(message_start);
-
-            let mut accumulated_text = String::new();
-            let mut tool_calls: Vec<PendingToolCall> = Vec::new();
-            let mut msg_stop = MessageStopReason::EndTurn;
-            let mut msg_usage = Usage::default();
-            let mut aborted = false;
-
-            loop {
-                tokio::select! {
-                    biased;
-                    Some(cmd) = cmd_rx.recv() => {
-                        match cmd {
-                            SessionCmd::Abort => {
-                                tracing::info!("Abort received mid-stream, cancelling turn");
-                                drop(stream);
-                                aborted = true;
-                                break;
-                            }
-                            SessionCmd::Chat { .. } => {
-                                tracing::warn!(
-                                    "Chat command received while a turn is in flight; ignoring"
-                                );
-                            }
-                        }
-                    }
-                    event = stream.inner.recv() => {
-                        let Some(event) = event else { break };
-                        match event {
-                            ProviderStreamEvent::TextDelta { delta } => {
-                                accumulated_text.push_str(&delta);
-                                let _ = event_tx.send(AgentEvent::MessageDelta {
-                                    session_id,
-                                    message_id,
-                                    payload: MessageDeltaPayload::TextDelta { delta },
-                                }).await.ok();
-                            }
-                            ProviderStreamEvent::ToolCallStart { id, name } => {
-                                tool_calls.push(PendingToolCall {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    arguments: String::new(),
-                                    arguments_json: None,
-                                });
-                                let _ = event_tx.send(AgentEvent::MessageDelta {
-                                    session_id,
-                                    message_id,
-                                    payload: MessageDeltaPayload::ToolCallStart {
-                                        tool_call_id: id,
-                                        tool_name: name,
-                                    },
-                                }).await.ok();
-                            }
-                            ProviderStreamEvent::ToolCallDelta { id, args_delta } => {
-                                if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
-                                    tc.arguments.push_str(&args_delta);
-                                }
-                                let _ = event_tx.send(AgentEvent::MessageDelta {
-                                    session_id,
-                                    message_id,
-                                    payload: MessageDeltaPayload::ToolCallArgsDelta {
-                                        tool_call_id: id,
-                                        args_delta,
-                                    },
-                                }).await.ok();
-                            }
-                            ProviderStreamEvent::ToolCallEnd { id, arguments: _ } => {
-                                if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
-                                    tc.arguments_json = Some(
-                                        serde_json::from_str(&tc.arguments)
-                                            .unwrap_or(serde_json::Value::Object(Default::default())),
-                                    );
-                                }
-                            }
-                            ProviderStreamEvent::Finish { stop_reason, usage } => {
-                                msg_stop = stop_reason.into();
-                                msg_usage = usage;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if aborted {
-                // No MessageEnd on abort — the stream was interrupted, so
-                // final_content would be incomplete. The client uses
-                // TurnEnd{Aborted} as the boundary.
-                return Err(AgentError::Aborted);
-            }
-
-            // Emit MessageEnd with final snapshot.
-            let tool_calls_info: Vec<ToolCallInfo> = tool_calls
-                .iter()
-                .map(|tc| ToolCallInfo {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    arguments: tc.arguments_json.clone().unwrap_or(serde_json::Value::Null),
-                })
-                .collect();
-
-            let message_end = AgentEvent::MessageEnd {
-                session_id,
-                turn_id,
-                message_id,
-                final_content: accumulated_text.clone(),
-                tool_calls: tool_calls_info.clone(),
-                stop_reason: msg_stop.clone(),
-                usage: msg_usage.clone(),
-            };
-            let _ = event_tx.send(message_end.clone()).await.ok();
-            let _ = event_log.append(message_end);
-
-            turn_usage.input_tokens += msg_usage.input_tokens;
-            turn_usage.output_tokens += msg_usage.output_tokens;
+            turn_usage.input_tokens += msg.msg_usage.input_tokens;
+            turn_usage.output_tokens += msg.msg_usage.output_tokens;
 
             // Push assistant message to context.
-            let core_tcs: Vec<CoreToolCallInfo> = tool_calls
+            let core_tcs: Vec<CoreToolCallInfo> = msg
+                .tool_calls
                 .iter()
                 .map(|tc| CoreToolCallInfo {
                     id: tc.id.clone(),
@@ -436,7 +309,7 @@ impl ReActEngine {
                 .collect();
             context.push(ChatMessage {
                 role: ChatRole::Assistant,
-                content: accumulated_text.clone(),
+                content: msg.accumulated_text.clone(),
                 tool_call_id: None,
                 tool_name: None,
                 tool_calls: if core_tcs.is_empty() {
@@ -447,196 +320,23 @@ impl ReActEngine {
             });
 
             // If no tool calls (or EndTurn), turn ends here.
-            if msg_stop == MessageStopReason::EndTurn || tool_calls.is_empty() {
+            if msg.msg_stop == MessageStopReason::EndTurn || msg.tool_calls.is_empty() {
                 let _ = event_log.maybe_snapshot(context);
                 return Ok((TurnStopReason::EndTurn, turn_usage));
             }
 
             // Execute each tool: ToolStart → [ToolConfirmRequired] → ToolEnd.
-            for tc in &tool_calls {
-                let tool_start = AgentEvent::ToolStart {
-                    session_id,
+            for tc in &msg.tool_calls {
+                self.run_one_tool(
                     turn_id,
-                    parent_message_id: message_id,
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    arguments: tc.arguments_json.clone().unwrap_or(serde_json::Value::Null),
-                };
-                let _ = event_tx.send(tool_start.clone()).await.ok();
-                let _ = event_log.append(tool_start);
-
-                let tool_ctx = ToolContext {
-                    working_dir: self.working_dir.clone(),
-                    max_file_size_bytes: 10 * 1024 * 1024,
-                };
-
-                let args = tc.arguments_json.clone().unwrap_or(serde_json::Value::Null);
-                let tool_name_for_err = tc.name.clone();
-                let tool_id = tc.id.clone();
-
-                // Phase 1.5: confirmation flow.
-                let needs_confirm = self
-                    .confirm_config
-                    .require_confirmation
-                    .iter()
-                    .any(|pat| tc.name.starts_with(pat.as_str()))
-                    && self.confirm_config.router.is_some();
-
-                let decision = if needs_confirm {
-                    let router = self.confirm_config.router.as_ref().unwrap().clone();
-                    let (ctx_tx, ctx_rx) = oneshot::channel::<ConfirmDecision>();
-
-                    router
-                        .register(self.session_id, tool_id.clone(), ctx_tx)
-                        .await;
-
-                    let _ = event_tx
-                        .send(AgentEvent::ToolConfirmRequired {
-                            session_id,
-                            turn_id,
-                            tool_call_id: tool_id.clone(),
-                            tool_name: tc.name.clone(),
-                            arguments: args.clone(),
-                        })
-                        .await
-                        .ok();
-
-                    let mut confirm_fut = Box::pin(async {
-                        match tokio::time::timeout(self.confirm_config.timeout, ctx_rx).await {
-                            Ok(Ok(d)) => d,
-                            Ok(Err(_)) => ConfirmDecision::Timeout,
-                            Err(_) => ConfirmDecision::Timeout,
-                        }
-                    });
-
-                    let waited = tokio::select! {
-                        biased;
-                        Some(cmd) = cmd_rx.recv() => {
-                            match cmd {
-                                SessionCmd::Abort => {
-                                    tracing::info!(
-                                        "Abort received during confirmation wait for '{}'",
-                                        tool_name_for_err
-                                    );
-                                    router.unregister(&self.session_id, &tool_id).await;
-                                    let result = parrot_protocol::types::ToolOutput {
-                                        content: "aborted before execution".to_string(),
-                                        is_error: true,
-                                    };
-                                    let tool_end = AgentEvent::ToolEnd {
-                                        session_id,
-                                        turn_id,
-                                        tool_call_id: tool_id.clone(),
-                                        result: result.clone(),
-                                    };
-                                    let _ = event_tx.send(tool_end.clone()).await.ok();
-                                    let _ = event_log.append(tool_end);
-                                    context.push(ChatMessage {
-                                        role: ChatRole::Tool,
-                                        content: result.content,
-                                        tool_call_id: Some(tool_id.clone()),
-                                        tool_name: Some(tc.name.clone()),
-                                        tool_calls: None,
-                                    });
-                                    return Err(AgentError::Aborted);
-                                }
-                                SessionCmd::Chat { .. } => {
-                                    tracing::warn!(
-                                        "Chat command received during confirmation wait; ignoring"
-                                    );
-                                    confirm_fut.as_mut().await
-                                }
-                            }
-                        }
-                        d = confirm_fut.as_mut() => d,
-                    };
-
-                    router.unregister(&self.session_id, &tool_id).await;
-                    waited
-                } else {
-                    ConfirmDecision::Approve
-                };
-
-                let result = if matches!(decision, ConfirmDecision::Approve) {
-                    let args_for_tool = args.clone();
-                    let tool_name_for_exec = tc.name.clone();
-                    let tool_id_for_exec = tool_id.clone();
-
-                    let result = tokio::select! {
-                        biased;
-                        Some(cmd) = cmd_rx.recv() => {
-                            match cmd {
-                                SessionCmd::Abort => {
-                                    tracing::info!(
-                                        "Abort received during tool execution '{}'; cancelling",
-                                        tool_name_for_err
-                                    );
-                                    let aborted_output = parrot_protocol::types::ToolOutput {
-                                        content: "aborted before execution".to_string(),
-                                        is_error: true,
-                                    };
-                                    let tool_end = AgentEvent::ToolEnd {
-                                        session_id,
-                                        turn_id,
-                                        tool_call_id: tool_id_for_exec.clone(),
-                                        result: aborted_output.clone(),
-                                    };
-                                    let _ = event_tx.send(tool_end.clone()).await.ok();
-                                    let _ = event_log.append(tool_end);
-                                    context.push(ChatMessage {
-                                        role: ChatRole::Tool,
-                                        content: aborted_output.content,
-                                        tool_call_id: Some(tool_id_for_exec.clone()),
-                                        tool_name: Some(tool_name_for_exec.clone()),
-                                        tool_calls: None,
-                                    });
-                                    return Err(AgentError::Aborted);
-                                }
-                                SessionCmd::Chat { .. } => {
-                                    tracing::warn!(
-                                        "Chat command received during tool execution; ignoring"
-                                    );
-                                    self.execute_tool(&tc.name, args.clone(), &tool_ctx).await
-                                }
-                            }
-                        }
-                        r = async {
-                            self.execute_tool(&tc.name, args_for_tool, &tool_ctx).await
-                        } => r,
-                    };
-
-                    result.unwrap_or_else(|e| parrot_protocol::types::ToolOutput {
-                        content: format!("Error: {}", e),
-                        is_error: true,
-                    })
-                } else {
-                    let reason = if matches!(decision, ConfirmDecision::Reject) {
-                        "user rejected"
-                    } else {
-                        "confirmation timeout"
-                    };
-                    parrot_protocol::types::ToolOutput {
-                        content: reason.to_string(),
-                        is_error: true,
-                    }
-                };
-
-                let tool_end = AgentEvent::ToolEnd {
-                    session_id,
-                    turn_id,
-                    tool_call_id: tc.id.clone(),
-                    result: result.clone(),
-                };
-                let _ = event_tx.send(tool_end.clone()).await.ok();
-                let _ = event_log.append(tool_end);
-
-                context.push(ChatMessage {
-                    role: ChatRole::Tool,
-                    content: result.content,
-                    tool_call_id: Some(tc.id.clone()),
-                    tool_name: Some(tc.name.clone()),
-                    tool_calls: None,
-                });
+                    msg.message_id,
+                    tc,
+                    context,
+                    event_tx,
+                    event_log,
+                    cmd_rx,
+                )
+                .await?;
             }
 
             // Continue the ReAct loop for the next LLM call.
@@ -647,6 +347,341 @@ impl ReActEngine {
 
         // Max iterations reached.
         Ok((TurnStopReason::MaxIterations, turn_usage))
+    }
+
+    /// Stream exactly one LLM message: resolves the provider, emits
+    /// `MessageStart`, drains the provider stream (forwarding `MessageDelta`
+    /// events) until `Finish`, then emits `MessageEnd` and returns the
+    /// accumulated content + tool calls. Aborts mid-stream by returning
+    /// `Err(AgentError::Aborted)` without emitting `MessageEnd` (the client
+    /// uses `TurnEnd { Aborted }` as the boundary, matching the original
+    /// single-loop behavior).
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_llm_message(
+        &self,
+        turn_id: Uuid,
+        context: &[ChatMessage],
+        tool_defs: &[crate::tool::ToolDefinition],
+        event_tx: &mpsc::Sender<AgentEvent>,
+        event_log: &mut EventLog,
+        cmd_rx: &mut mpsc::Receiver<SessionCmd>,
+    ) -> Result<StreamedMessage, AgentError> {
+        let session_id = self.session_id;
+
+        let provider = self
+            .provider_registry
+            .resolve(&self.config.model)
+            .await
+            .ok_or_else(|| {
+                AgentError::Config(format!(
+                    "No provider found for model: {}",
+                    self.config.model
+                ))
+            })?;
+
+        let mut stream = provider
+            .chat_stream(&self.config.model, context, tool_defs, &self.config)
+            .await
+            .map_err(AgentError::Provider)?;
+
+        let message_id = Uuid::new_v4();
+        let message_start = AgentEvent::MessageStart {
+            session_id,
+            turn_id,
+            message_id,
+        };
+        let _ = event_tx.send(message_start.clone()).await.ok();
+        let _ = event_log.append(message_start);
+
+        let mut accumulated_text = String::new();
+        let mut tool_calls: Vec<PendingToolCall> = Vec::new();
+        let mut msg_stop = MessageStopReason::EndTurn;
+        let mut msg_usage = Usage::default();
+        let mut aborted = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                Some(cmd) = cmd_rx.recv() => match cmd {
+                    SessionCmd::Abort => {
+                        tracing::info!("Abort received mid-stream, cancelling turn");
+                        drop(stream);
+                        aborted = true;
+                        break;
+                    }
+                    SessionCmd::Chat { .. } => {
+                        tracing::warn!(
+                            "Chat command received while a turn is in flight; ignoring"
+                        );
+                    }
+                },
+                event = stream.inner.recv() => {
+                    let Some(event) = event else { break };
+                    match event {
+                        ProviderStreamEvent::TextDelta { delta } => {
+                            accumulated_text.push_str(&delta);
+                            let _ = event_tx.send(AgentEvent::MessageDelta {
+                                session_id,
+                                message_id,
+                                payload: MessageDeltaPayload::TextDelta { delta },
+                            }).await.ok();
+                        }
+                        ProviderStreamEvent::ToolCallStart { id, name } => {
+                            tool_calls.push(PendingToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: String::new(),
+                                arguments_json: None,
+                            });
+                            let _ = event_tx.send(AgentEvent::MessageDelta {
+                                session_id,
+                                message_id,
+                                payload: MessageDeltaPayload::ToolCallStart {
+                                    tool_call_id: id,
+                                    tool_name: name,
+                                },
+                            }).await.ok();
+                        }
+                        ProviderStreamEvent::ToolCallDelta { id, args_delta } => {
+                            if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
+                                tc.arguments.push_str(&args_delta);
+                            }
+                            let _ = event_tx.send(AgentEvent::MessageDelta {
+                                session_id,
+                                message_id,
+                                payload: MessageDeltaPayload::ToolCallArgsDelta {
+                                    tool_call_id: id,
+                                    args_delta,
+                                },
+                            }).await.ok();
+                        }
+                        ProviderStreamEvent::ToolCallEnd { id, arguments: _ } => {
+                            if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
+                                tc.arguments_json = Some(
+                                    serde_json::from_str(&tc.arguments)
+                                        .unwrap_or(serde_json::Value::Object(Default::default())),
+                                );
+                            }
+                        }
+                        ProviderStreamEvent::Finish { stop_reason, usage } => {
+                            msg_stop = stop_reason.into();
+                            msg_usage = usage;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if aborted {
+            // No MessageEnd on abort — the stream was interrupted, so
+            // final_content would be incomplete. The client uses
+            // TurnEnd{Aborted} as the boundary.
+            return Err(AgentError::Aborted);
+        }
+
+        // Emit MessageEnd with final snapshot.
+        let tool_calls_info: Vec<ToolCallInfo> = tool_calls
+            .iter()
+            .map(|tc| ToolCallInfo {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                arguments: tc.arguments_json.clone().unwrap_or(serde_json::Value::Null),
+            })
+            .collect();
+
+        let message_end = AgentEvent::MessageEnd {
+            session_id,
+            turn_id,
+            message_id,
+            final_content: accumulated_text.clone(),
+            tool_calls: tool_calls_info,
+            stop_reason: msg_stop.clone(),
+            usage: msg_usage.clone(),
+        };
+        let _ = event_tx.send(message_end.clone()).await.ok();
+        let _ = event_log.append(message_end);
+
+        Ok(StreamedMessage {
+            message_id,
+            accumulated_text,
+            tool_calls,
+            msg_stop,
+            msg_usage,
+        })
+    }
+
+    /// Run a single tool: emit `ToolStart`, optionally await user
+    /// confirmation, execute the tool (cancelable by `Abort`), emit
+    /// `ToolEnd`, and push the `Tool` message into `context`. On `Abort`
+    /// (during confirmation wait or execution), emits an
+    /// "aborted before execution" `ToolEnd`, pushes the matching `Tool`
+    /// context entry, and returns `Err(AgentError::Aborted)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_tool(
+        &self,
+        turn_id: Uuid,
+        parent_message_id: Uuid,
+        tc: &PendingToolCall,
+        context: &mut Vec<ChatMessage>,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        event_log: &mut EventLog,
+        cmd_rx: &mut mpsc::Receiver<SessionCmd>,
+    ) -> Result<(), AgentError> {
+        let session_id = self.session_id;
+        let args = tc.arguments_json.clone().unwrap_or(serde_json::Value::Null);
+
+        let tool_start = AgentEvent::ToolStart {
+            session_id,
+            turn_id,
+            parent_message_id,
+            tool_call_id: tc.id.clone(),
+            tool_name: tc.name.clone(),
+            arguments: args.clone(),
+        };
+        let _ = event_tx.send(tool_start.clone()).await.ok();
+        let _ = event_log.append(tool_start);
+
+        let tool_ctx = ToolContext {
+            working_dir: self.working_dir.clone(),
+            max_file_size_bytes: 10 * 1024 * 1024,
+        };
+
+        // Phase 1.5: confirmation flow.
+        let needs_confirm = self
+            .confirm_config
+            .require_confirmation
+            .iter()
+            .any(|pat| tc.name.starts_with(pat.as_str()))
+            && self.confirm_config.router.is_some();
+
+        let decision = if needs_confirm {
+            self.await_confirmation(
+                turn_id, &tc.id, &tc.name, &args, context, event_tx, event_log, cmd_rx,
+            )
+            .await?
+        } else {
+            ConfirmDecision::Approve
+        };
+
+        let result = if matches!(decision, ConfirmDecision::Approve) {
+            match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args, &tool_ctx)).await {
+                Abortable::Completed(r) => {
+                    r.unwrap_or_else(|e| parrot_protocol::types::ToolOutput {
+                        content: format!("Error: {}", e),
+                        is_error: true,
+                    })
+                }
+                Abortable::Aborted => {
+                    emit_aborted_tool_end(
+                        session_id,
+                        turn_id,
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        event_tx,
+                        event_log,
+                        context,
+                    )
+                    .await;
+                    return Err(AgentError::Aborted);
+                }
+            }
+        } else {
+            let reason = if matches!(decision, ConfirmDecision::Reject) {
+                "user rejected"
+            } else {
+                "confirmation timeout"
+            };
+            parrot_protocol::types::ToolOutput {
+                content: reason.to_string(),
+                is_error: true,
+            }
+        };
+
+        let tool_end = AgentEvent::ToolEnd {
+            session_id,
+            turn_id,
+            tool_call_id: tc.id.clone(),
+            result: result.clone(),
+        };
+        let _ = event_tx.send(tool_end.clone()).await.ok();
+        let _ = event_log.append(tool_end);
+
+        context.push(ChatMessage {
+            role: ChatRole::Tool,
+            content: result.content,
+            tool_call_id: Some(tc.id.clone()),
+            tool_name: Some(tc.name.clone()),
+            tool_calls: None,
+        });
+
+        Ok(())
+    }
+
+    /// Wait for a user-approved `ConfirmDecision` for a tool call.
+    /// Emits `ToolConfirmRequired`, registers a one-shot with the router,
+    /// then races the (timeout-bounded) confirmation future against `Abort`.
+    /// On `Abort`, unregisters and emits an "aborted before execution"
+    /// `ToolEnd` + context entry, then returns `Err(AgentError::Aborted)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn await_confirmation(
+        &self,
+        turn_id: Uuid,
+        tool_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+        context: &mut Vec<ChatMessage>,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        event_log: &mut EventLog,
+        cmd_rx: &mut mpsc::Receiver<SessionCmd>,
+    ) -> Result<ConfirmDecision, AgentError> {
+        let session_id = self.session_id;
+        let router = self.confirm_config.router.as_ref().unwrap().clone();
+        let (ctx_tx, ctx_rx) = oneshot::channel::<ConfirmDecision>();
+
+        router
+            .register(self.session_id, tool_id.to_string(), ctx_tx)
+            .await;
+
+        let _ = event_tx
+            .send(AgentEvent::ToolConfirmRequired {
+                session_id,
+                turn_id,
+                tool_call_id: tool_id.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: args.clone(),
+            })
+            .await
+            .ok();
+
+        let confirm_fut = async {
+            match tokio::time::timeout(self.confirm_config.timeout, ctx_rx).await {
+                Ok(Ok(d)) => d,
+                Ok(Err(_)) => ConfirmDecision::Timeout,
+                Err(_) => ConfirmDecision::Timeout,
+            }
+        };
+
+        let decision = match race_with_abort(cmd_rx, confirm_fut).await {
+            Abortable::Completed(d) => d,
+            Abortable::Aborted => {
+                router.unregister(&self.session_id, tool_id).await;
+                emit_aborted_tool_end(
+                    session_id,
+                    turn_id,
+                    tool_id.to_string(),
+                    tool_name.to_string(),
+                    event_tx,
+                    event_log,
+                    context,
+                )
+                .await;
+                return Err(AgentError::Aborted);
+            }
+        };
+
+        router.unregister(&self.session_id, tool_id).await;
+        Ok(decision)
     }
 
     async fn execute_tool(
@@ -670,6 +705,90 @@ struct PendingToolCall {
     name: String,
     arguments: String,
     arguments_json: Option<serde_json::Value>,
+}
+
+/// Result of a single streamed LLM message, consumed by `handle_turn` to
+/// push the assistant turn to `context` and (when tool calls are present)
+/// drive the next iteration of the ReAct loop.
+struct StreamedMessage {
+    message_id: Uuid,
+    accumulated_text: String,
+    tool_calls: Vec<PendingToolCall>,
+    msg_stop: MessageStopReason,
+    msg_usage: Usage,
+}
+
+/// Race a future against an `Abort` command from `cmd_rx`. Preserves the
+/// original single-loop semantics bit-for-bit:
+/// - `Abort` → `Abortable::Aborted` (caller emits its own cleanup).
+/// - `Chat { .. }` while the operation is in flight → log a warning and
+///   **then await the future with no further abort checks** (i.e., once a
+///   stray `Chat` shows up during confirmation/tool-exec, `Abort` is no
+///   longer honored for that specific operation — matching the previous
+///   behavior where the offending branch awaited the inner future directly).
+/// - Future completion → `Abortable::Completed(value)`.
+///
+/// This replaces the two repeated `tokio::select!` blocks (confirm-wait and
+/// tool-exec) so callers stay short and the "Abort wins, Chat is noise"
+/// policy lives in exactly one place.
+enum Abortable<T> {
+    Completed(T),
+    Aborted,
+}
+
+async fn race_with_abort<F, R>(cmd_rx: &mut mpsc::Receiver<SessionCmd>, future: F) -> Abortable<R>
+where
+    F: Future<Output = R>,
+{
+    let mut fut = Box::pin(future);
+    tokio::select! {
+        biased;
+        Some(cmd) = cmd_rx.recv() => match cmd {
+            SessionCmd::Abort => Abortable::Aborted,
+            SessionCmd::Chat { .. } => {
+                tracing::warn!("Chat command received during operation; ignoring");
+                // Finish the operation without honoring further aborts —
+                // matches the pre-refactor behavior where the offending arm
+                // awaited the inner future directly.
+                Abortable::Completed(fut.as_mut().await)
+            }
+        },
+        r = &mut fut => Abortable::Completed(r),
+    }
+}
+
+/// Emit the "aborted before execution" `ToolEnd` + push the matching `Tool`
+/// message to `context`. Centralizes the abort-cleanup duplicated between
+/// the confirmation-wait and tool-execution paths in the original loop.
+#[allow(clippy::too_many_arguments)]
+async fn emit_aborted_tool_end(
+    session_id: Uuid,
+    turn_id: Uuid,
+    tool_call_id: String,
+    tool_name: String,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    event_log: &mut EventLog,
+    context: &mut Vec<ChatMessage>,
+) {
+    let result = parrot_protocol::types::ToolOutput {
+        content: "aborted before execution".to_string(),
+        is_error: true,
+    };
+    let tool_end = AgentEvent::ToolEnd {
+        session_id,
+        turn_id,
+        tool_call_id: tool_call_id.clone(),
+        result: result.clone(),
+    };
+    let _ = event_tx.send(tool_end.clone()).await.ok();
+    let _ = event_log.append(tool_end);
+    context.push(ChatMessage {
+        role: ChatRole::Tool,
+        content: result.content,
+        tool_call_id: Some(tool_call_id),
+        tool_name: Some(tool_name),
+        tool_calls: None,
+    });
 }
 
 /// RAII guard that emits `AgentEnd` on drop unless already fired. Ensures
