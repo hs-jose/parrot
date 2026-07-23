@@ -19,8 +19,10 @@ use crate::stream::print_stream;
 #[derive(Parser)]
 #[command(name = "parrot", version, about = "Parrot LLM Agent CLI")]
 struct Cli {
-    #[arg(long, default_value = "ws://127.0.0.1:9876")]
-    connect: String,
+    /// 显式指定要连接的 daemon URL（例如手动起的 `parrotd`）。
+    /// 不提供时自动起一个绑定随机端口的 `parrotd` 子进程，退出即终止。
+    #[arg(long)]
+    connect: Option<String>,
 
     #[arg(long)]
     token_file: Option<String>,
@@ -251,13 +253,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Resolve the daemon connect URL. If `--connect` is provided, use it
+/// verbatim (caller is responsible for that daemon running). Otherwise
+/// spawn a fresh parrotd child on a random local port and keep the
+/// kill-on-drop guard alive in the returned `DaemonChild`.
+async fn resolve_connect(
+    cli: &Cli,
+    config: &AppConfig,
+) -> Result<(String, Option<crate::daemon::DaemonChild>), Box<dyn std::error::Error>> {
+    match &cli.connect {
+        Some(url) => Ok((url.clone(), None)),
+        None => {
+            let (url, guard) = crate::daemon::ensure_running(config).await?;
+            Ok((url, Some(guard)))
+        }
+    }
+}
+
 async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::daemon::ensure_running(config).await?;
+    let (connect_url, _guard) = resolve_connect(&cli, config).await?;
     let token_path = cli
         .token_file
         .clone()
         .unwrap_or_else(|| config.daemon.auth_token_file.clone());
-    let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+    let mut conn = connect_with_token(&connect_url, &token_path).await?;
     let server_version = wait_hello(&mut conn.receiver).await?;
     eprintln!("Connected to server v{}", server_version);
 
@@ -297,14 +316,14 @@ async fn run_sessions(
     cli: Cli,
     config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    crate::daemon::ensure_running(config).await?;
+    let (connect_url, _guard) = resolve_connect(&cli, config).await?;
     let token_path = cli
         .token_file
         .clone()
         .unwrap_or_else(|| config.daemon.auth_token_file.clone());
     match action {
         SessionsAction::List => {
-            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let mut conn = connect_with_token(&connect_url, &token_path).await?;
             let server_version = wait_hello(&mut conn.receiver).await?;
             eprintln!("Connected to server v{}", server_version);
             conn.sender.send(ClientMessage::ListSessions).await?;
@@ -326,7 +345,7 @@ async fn run_sessions(
             let id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let mut conn = connect_with_token(&connect_url, &token_path).await?;
             let server_version = wait_hello(&mut conn.receiver).await?;
             eprintln!("Connected to server v{}", server_version);
             conn.sender
@@ -350,7 +369,7 @@ async fn run_sessions(
             let session_id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let mut conn = connect_with_token(&connect_url, &token_path).await?;
             let server_version = wait_hello(&mut conn.receiver).await?;
             eprintln!("Connected to server v{}", server_version);
             conn.sender
@@ -365,7 +384,7 @@ async fn run_sessions(
             let id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+            let mut conn = connect_with_token(&connect_url, &token_path).await?;
             let server_version = wait_hello(&mut conn.receiver).await?;
             eprintln!("Connected to server v{}", server_version);
             conn.sender
@@ -390,12 +409,12 @@ async fn run_sessions(
 }
 
 async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::daemon::ensure_running(config).await?;
+    let (connect_url, _guard) = resolve_connect(&cli, config).await?;
     let token_path = cli
         .token_file
         .clone()
         .unwrap_or_else(|| config.daemon.auth_token_file.clone());
-    let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+    let mut conn = connect_with_token(&connect_url, &token_path).await?;
     let server_version = wait_hello(&mut conn.receiver).await?;
     eprintln!("Connected to server v{}", server_version);
     conn.sender.send(ClientMessage::ListModels).await?;
@@ -415,12 +434,12 @@ async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::err
 }
 
 async fn run_tools(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::daemon::ensure_running(config).await?;
+    let (connect_url, _guard) = resolve_connect(&cli, config).await?;
     let token_path = cli
         .token_file
         .clone()
         .unwrap_or_else(|| config.daemon.auth_token_file.clone());
-    let mut conn = connect_with_token(&cli.connect, &token_path).await?;
+    let mut conn = connect_with_token(&connect_url, &token_path).await?;
     let server_version = wait_hello(&mut conn.receiver).await?;
     eprintln!("Connected to server v{}", server_version);
     let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
