@@ -9,11 +9,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// 客户端本地时间戳，格式 `HH:MM`。协议事件本身不携带发生时间，
-/// 因此在事件到达时打戳；replay 场景下历史消息会统一显示为"当前"时间，
-/// 这是为了避免给 `apply_event` 签名注入时间参数而做的取舍。
+/// 客户端本地时间戳，格式 `HH:MM:SS`（精确到秒）。协议事件本身不携带
+/// 发生时间，因此在事件到达时打戳；replay 场景下历史消息会统一显示为
+/// "当前"时间，这是为了避免给 `apply_event` 签名注入时间参数而做的取舍。
 fn stamp() -> String {
-    Local::now().format("%H:%M").to_string()
+    Local::now().format("%H:%M:%S").to_string()
 }
 
 #[derive(Debug, Clone)]

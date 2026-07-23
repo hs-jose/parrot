@@ -140,7 +140,7 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。
     if let Some(text) = app.streaming_text() {
-        lines.push(header_line("AI", palette::AI_FG, None));
+        lines.push(header_line("●", palette::AI_FG, None));
         if text.is_empty() {
             lines.push(Line::from(Span::styled(
                 blink,
@@ -202,7 +202,8 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(para.scroll((scroll as u16, 0)), inner);
 }
 
-/// 构造角色标题行：`You · 14:32` / `AI · 14:32`。time 为 None 时省略时间部分。
+/// 构造消息标题行：`> 14:32:05`（用户）/ `● 14:32:10`（助手）。
+/// time 为 None 时省略时间部分（流式渲染中）。
 fn header_line(role: &str, fg: Color, time: Option<&str>) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
@@ -221,11 +222,11 @@ fn header_line(role: &str, fg: Color, time: Option<&str>) -> Line<'static> {
 fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
     match e {
         ChatEntry::User { text, time } => {
-            lines.push(header_line("You", palette::USER_FG, Some(time)));
+            lines.push(header_line(">", palette::USER_FG, Some(time)));
             push_body(text, lines);
         }
         ChatEntry::Assistant { text, time } => {
-            lines.push(header_line("AI", palette::AI_FG, Some(time)));
+            lines.push(header_line("●", palette::AI_FG, Some(time)));
             push_body(text, lines);
         }
         ChatEntry::Tool {
@@ -321,7 +322,7 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
         .border_style(Style::default().fg(palette::INPUT_BORDER))
         .padding(Padding::horizontal(1))
         .title(Span::styled(
-            " Enter 发送 · PgUp/PgDn 翻页 · Ctrl+C 退出 ",
+            " Enter 发送 · Shift+Enter 换行 · PgUp/PgDn 翻页 · Ctrl+C 退出 ",
             Style::default().fg(palette::DIM),
         ));
     let inner = block.inner(area);

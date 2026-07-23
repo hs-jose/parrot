@@ -183,6 +183,19 @@ async fn handle_key(
             _ => Ok(None),
         },
         Mode::Normal => match k.code {
+            // Shift+Enter / Ctrl+Enter / Ctrl+J 插入换行（不同终端对
+            // 组合键的上报不一致，三种都接住）。必须放在裸 Enter 分支之前。
+            KeyCode::Enter
+                if k.modifiers.contains(KeyModifiers::SHIFT)
+                    || k.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                input.insert_newline();
+                Ok(None)
+            }
+            KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.insert_newline();
+                Ok(None)
+            }
             KeyCode::Enter => {
                 let text = input.lines().join("\n");
                 if !text.trim().is_empty() {
