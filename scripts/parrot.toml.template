@@ -1,5 +1,7 @@
 [daemon]
 host = "127.0.0.1"
+# parrotd standalone 默认端口；CLI 自动起子进程时会通过 PARROTD_PORT
+# 覆盖为一个随机端口，所以这个值只在手动运行 `parrotd` 时生效。
 port = 9876
 auth_token_file = "{USER_DATA_DIR}/parrot/token"
 
@@ -20,7 +22,12 @@ allowlist = []
 denylist = ["rm -rf /", "sudo", "chmod 777"]
 require_confirmation = ["git push", "rm"]
 
+# Provider 配置示例：安装后会读到这里。`api_key` 支持 `${ENV_VAR}`
+# 占位符，从环境变量读取（推荐：避免把 key 留在磁盘上）。取消下面的
+# 注释并按需修改即可使用。
 [[providers]]
-# id = "anthropic"
-# api_key = "sk-..."
-# default_model = "claude-sonnet-4-6"
+id = "anthropic"
+api_key = "${ANTHROPIC_API_KEY}"
+default_model = "claude-sonnet-4-6"
+# base_url = "https://api.anthropic.com"
+# models = ["claude-sonnet-4-6"]
