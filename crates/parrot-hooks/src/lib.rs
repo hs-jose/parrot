@@ -20,7 +20,14 @@ pub fn build_registry(cfg: &HooksConfig) -> Arc<HookRegistry> {
             "dangerous_command_blocker" => {
                 reg.register(Arc::new(dangerous_command_blocker::DangerousCommandBlocker))
             }
-            "redact_secrets" => reg.register(Arc::new(redact_secrets::RedactSecrets)),
+            "redact_secrets" => {
+                let hook_cfg = cfg
+                    .configs
+                    .get("redact_secrets")
+                    .and_then(|v| redact_secrets::RedactSecretsConfig::deserialize(v.clone()).ok())
+                    .unwrap_or_default();
+                reg.register(Arc::new(redact_secrets::RedactSecrets::new(hook_cfg)))
+            }
             "shell_denylist" => {
                 let hook_cfg = cfg
                     .configs
