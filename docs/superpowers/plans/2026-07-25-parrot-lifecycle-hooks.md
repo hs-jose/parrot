@@ -1,10 +1,12 @@
 # Parrot Lifecycle Hooks Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Note:** The detailed step-by-step code snippets below reflect the original implementation. The API was subsequently refactored in commit `32e0431` to a single `HookRegistry::run(event, working_dir, emit)` entry point, with `HookAction` as the per-hook return type and `HookResult` as the aggregated registry output. See the design spec `docs/superpowers/specs/2026-07-25-parrot-lifecycle-hooks-design.md` for the canonical, current API.
 
 **Goal:** Add six lifecycle hook extension points (`agent_start`, `agent_end`, `turn_start`, `tool_call`, `tool_execution_start`, `tool_result`) to the Parrot ReAct engine, with three execution strategies (fire-and-forget / waterfall / bail), a Rust `Hook` trait + `HookRegistry`, daemon-side built-in implementations controlled by `parrot.toml`, and a `HookFired` wire event for observability.
 
-**Architecture:** `parrot-core` gains a `hooks` module (zero-IO, pure trait + types). `ReActEngine` gets `with_hooks(Arc<HookRegistry>)` and inserts six dispatch calls into existing lifecycle boundaries without reshaping control flow. `parrot-protocol` gains `AgentEvent::HookFired` (non-persistent, wire-only). `parrot-config` gains `HooksConfig`. `parrot-daemon` builds the `HookRegistry` from config and provides two built-in hooks (`dangerous_command_blocker`, `redact_secrets`). Resume stays hook-free: hook side-effects surface through existing persisted state (`ToolEnd.result` is post-hook content; injected messages land in snapshots).
+**Architecture:** `parrot-core` gains a `hooks` module (zero-IO, pure trait + types). `ReActEngine` gets `with_hooks(Arc<HookRegistry>)` and calls `HookRegistry::run(event, &working_dir, &mut emit)` at six lifecycle boundaries without reshaping control flow. `parrot-protocol` gains `AgentEvent::HookFired` (non-persistent, wire-only). `parrot-config` gains `HooksConfig`. `parrot-daemon` builds the `HookRegistry` from config and provides two built-in hooks (`dangerous_command_blocker`, `redact_secrets`). Resume stays hook-free: hook side-effects surface through existing persisted state (`ToolEnd.result` is post-hook content; injected messages land in snapshots).
 
 **Tech Stack:** Rust workspace, `async-trait`, `bitflags = 2`, existing `tokio::time::timeout`, existing `tracing` crates. No new external services.
 
@@ -27,11 +29,11 @@
 | `crates/parrot-protocol/src/agent_event.rs` | Add `AgentEvent::HookFired` + `TurnStopReason::BlockedHook`; update `is_persistent()`, `session_id()` | Modified |
 | `crates/parrot-protocol/tests/roundtrip.rs` | Roundtrip cases for new variants | Modified |
 | `crates/parrot-core/Cargo.toml` | Add `bitflags = "2"` direct dep | Modified |
-| `crates/parrot-core/src/hooks.rs` | `Hook` trait, `HookRegistry`, `HookEvent`, `HookResult`, `HookCtx`, `HookPoints`, result enums, `RecordingHook` test helper | Created |
+| `crates/parrot-core/src/hooks.rs` | `Hook` trait, `HookRegistry`, `HookEvent`, `HookAction`, `HookResult`, `HookCtx`, `HookPoints` | Created |
 | `crates/parrot-core/src/lib.rs` | `pub mod hooks;` + re-exports | Modified |
-| `crates/parrot-core/src/engine.rs` | `with_hooks`, `hooks` field, 6 dispatch call sites, `AgentEndGuard::hooks`, `TurnStopReason::BlockedHook` emit path | Modified |
+| `crates/parrot-core/src/engine.rs` | `with_hooks`, `hooks` field, 6 `run()` call sites, `make_emit` helper, `AgentEndGuard::hooks`, `TurnStopReason::BlockedHook` emit path | Modified |
 | `crates/parrot-core/src/session.rs` | `SessionManager::hooks` + `with_hooks`, pass to engine in `spawn_session` + `create_resumed_session` | Modified |
-| `crates/parrot-core/tests/hooks_test.rs` | Integration tests: RecordingHook used by engine flow tests | Created |
+| `crates/parrot-core/tests/hooks_test.rs` | Integration tests: RecordingHook + `run()` API tests | Created |
 | `crates/parrot-config/src/config.rs` | `HooksConfig`, `AppConfig.hooks`, defaults | Modified |
 | `crates/parrot-daemon/src/lib.rs` | `pub mod hooks;` | Modified |
 | `crates/parrot-daemon/Cargo.toml` | Add deps if needed (`regex` for blocker) | Modified |
@@ -185,7 +187,7 @@ git commit -m "feat(protocol): add HookFired AgentEvent + BlockedHook TurnStopRe
 - Create: `crates/parrot-core/tests/hooks_test.rs`
 
 **Interfaces:**
-- Produces: `parrot_core::hooks::{Hook, HookRegistry, HookEvent, HookResult, HookCtx, HookPoints, TurnStartDecision, ToolCallDecision, ToolResultDecision, NoHooks}` — consumed by Task 3 (engine), Task 4 (session), Task 6 (daemon hooks), Task 7 (runtime).
+- Produces: `parrot_core::hooks::{Hook, HookRegistry, HookEvent, HookAction, HookResult, HookCtx, HookPoints}` — consumed by Task 3 (engine), Task 4 (session), Task 6 (daemon hooks), Task 7 (runtime).
 
 - [ ] **Step 1: Add bitflags to parrot-core Cargo.toml**
 
@@ -649,10 +651,10 @@ git commit -m "feat(core): add Hook trait + HookRegistry with three execution st
 - Modify: `crates/parrot-core/src/engine.rs`
 
 **Interfaces:**
-- Consumes: `crate::hooks::{HookRegistry, TurnStartDecision, ToolCallDecision, ToolResultDecision}` from Task 2
+- Consumes: `crate::hooks::{HookEvent, HookRegistry, HookResult}` from Task 2
 - Consumes: `AgentEvent::HookFired`, `TurnStopReason::BlockedHook` from Task 1
 - Produces: `ReActEngine::with_hooks(Arc<HookRegistry>)` builder consumed by Task 4
-- Note: Engine emits `HookFired` wire events for observability. To do that without bloating every dispatch helper, the engine carries a small private helper `emit_hook_fired` that takes `Option<&str>` result_kind.
+- Note: Engine emits `HookFired` wire events via a `make_emit` closure passed to `HookRegistry::run`. `run` calls `emit` for every hook outcome, including `block`, `inject_messages`, `replace_result`, `noop`, `timeout`, `error`.
 
 - [ ] **Step 1: Write failing test for tool_call hook block flow**
 
@@ -1640,7 +1642,7 @@ git commit -m "test(e2e): tool_call hook blocks dangerous command end-to-end"
 - Spec §10 `parrot.toml` `[hooks]` → Task 5.
 - Spec §11 built-in hooks → Task 6 + 2 sample implementations.
 - Spec §12 crate placement matrix → each crate touched in its own task.
-- Spec §8 retry/timeout semantics → Task 2's `bounded()` + Task 2's `timeout_and_error_are_fail_open_noop` test.
+- Spec §8 retry/timeout semantics → Task 2's `call_with_timeout()` + Task 2's `timeout_and_error_are_fail_open_noop` test.
 - Spec §9.3 resume behavior — confirmed: no HookFired persistence, no replay needed; existing snapshot/ToolEnd already carries post-hook state.
 - Spec §13 engine edit detail (AgentEndGuard, with_hooks, etc.) → Task 3 inline edits match.
 - `BlockedHook(String)` only emitted by `turn_start` block; `tool_call` block uses `ToolEnd{is_error=true}`. Matches Task 3 Step 7 & 8.

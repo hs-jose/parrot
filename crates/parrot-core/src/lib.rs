@@ -12,9 +12,7 @@ pub mod types;
 pub use confirm::ConfirmRouter;
 pub use error::{AgentError, ProviderError};
 pub use event_log::{rebuild_context, EventLog};
-pub use hooks::{
-    Hook, HookAction, HookCtx, HookEvent, HookPoints, HookRegistry, HookResult,
-};
+pub use hooks::{Hook, HookAction, HookCtx, HookEvent, HookPoints, HookRegistry, HookResult};
 pub use provider::{
     ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
 };

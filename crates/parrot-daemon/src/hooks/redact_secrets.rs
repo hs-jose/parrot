@@ -31,8 +31,14 @@ impl Hook for RedactSecrets {
         ev: HookEvent<'_>,
         _ctx: &HookCtx<'_>,
     ) -> Result<HookAction, parrot_core::AgentError> {
-        if let HookEvent::ToolResult { tool_name, result, .. } = ev {
-            if matches!(tool_name, "read" | "shell_exec" | "bash" | "shell" | "file_read") {
+        if let HookEvent::ToolResult {
+            tool_name, result, ..
+        } = ev
+        {
+            if matches!(
+                tool_name,
+                "read" | "shell_exec" | "bash" | "shell" | "file_read"
+            ) {
                 let mut content = result.content.clone();
                 let mut changed = false;
                 for re in patterns() {
@@ -43,7 +49,10 @@ impl Hook for RedactSecrets {
                     }
                 }
                 if changed {
-                    return Ok(HookAction::ReplaceResult { content, is_error: result.is_error });
+                    return Ok(HookAction::ReplaceResult {
+                        content,
+                        is_error: result.is_error,
+                    });
                 }
             }
         }

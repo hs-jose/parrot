@@ -39,20 +39,74 @@ async fn empty_registry_returns_defaults_without_emit() {
     let mut emit = make_emit(Arc::clone(&sink));
 
     assert_eq!(
-        reg.run(HookEvent::TurnStart { session_id: sid, turn_id: tid, user_message: "hi" }, path(), &mut emit).await,
+        reg.run(
+            HookEvent::TurnStart {
+                session_id: sid,
+                turn_id: tid,
+                user_message: "hi"
+            },
+            path(),
+            &mut emit
+        )
+        .await,
         HookResult::Continue
     );
     assert_eq!(
-        reg.run(HookEvent::ToolCall { session_id: sid, turn_id: tid, parent_message_id: mid, tool_call_id: "tc1", tool_name: "echo", arguments: &args }, path(), &mut emit).await,
+        reg.run(
+            HookEvent::ToolCall {
+                session_id: sid,
+                turn_id: tid,
+                parent_message_id: mid,
+                tool_call_id: "tc1",
+                tool_name: "echo",
+                arguments: &args
+            },
+            path(),
+            &mut emit
+        )
+        .await,
         HookResult::Continue
     );
     assert_eq!(
-        reg.run(HookEvent::ToolResult { session_id: sid, turn_id: tid, tool_call_id: "tc1", tool_name: "echo", input: &args, result: &out }, path(), &mut emit).await,
+        reg.run(
+            HookEvent::ToolResult {
+                session_id: sid,
+                turn_id: tid,
+                tool_call_id: "tc1",
+                tool_name: "echo",
+                input: &args,
+                result: &out
+            },
+            path(),
+            &mut emit
+        )
+        .await,
         HookResult::Continue
     );
-    reg.run(HookEvent::AgentStart { session_id: sid, model: "claude-x", provider: "anthropic" }, path(), &mut emit).await;
-    reg.run(HookEvent::AgentEnd { session_id: sid }, path(), &mut emit).await;
-    reg.run(HookEvent::ToolExecutionStart { session_id: sid, turn_id: tid, tool_call_id: "tc1", tool_name: "echo", arguments: &args }, path(), &mut emit).await;
+    reg.run(
+        HookEvent::AgentStart {
+            session_id: sid,
+            model: "claude-x",
+            provider: "anthropic",
+        },
+        path(),
+        &mut emit,
+    )
+    .await;
+    reg.run(HookEvent::AgentEnd { session_id: sid }, path(), &mut emit)
+        .await;
+    reg.run(
+        HookEvent::ToolExecutionStart {
+            session_id: sid,
+            turn_id: tid,
+            tool_call_id: "tc1",
+            tool_name: "echo",
+            arguments: &args,
+        },
+        path(),
+        &mut emit,
+    )
+    .await;
 
     // Empty-registry fast path never invokes the emit callback.
     assert!(
@@ -94,7 +148,11 @@ impl RecordingHook {
         }
     }
     fn pop(&self) -> HookAction {
-        self.outcomes.lock().unwrap().pop().unwrap_or(HookAction::NoOp)
+        self.outcomes
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or(HookAction::NoOp)
     }
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().unwrap().clone()
@@ -137,7 +195,9 @@ async fn tool_call_bail_on_first_block() {
     reg.register(Arc::new(RecordingHook::with_order_log(
         "a",
         HookPoints::TOOL_CALL,
-        vec![HookAction::Block { reason: "nope".into() }],
+        vec![HookAction::Block {
+            reason: "nope".into(),
+        }],
         Arc::clone(&order_log),
     )));
     let b = Arc::new(RecordingHook::with_order_log(
@@ -164,7 +224,13 @@ async fn tool_call_bail_on_first_block() {
             &mut emit,
         )
         .await;
-    assert_eq!(out, HookResult::Block { hook_id: "a".into(), reason: "nope".into() });
+    assert_eq!(
+        out,
+        HookResult::Block {
+            hook_id: "a".into(),
+            reason: "nope".into()
+        }
+    );
     // b never ran: bail short-circuited before reaching it.
     assert!(b_weak.calls().is_empty());
     assert_eq!(order_log.lock().unwrap().as_slice(), ["a"]);
@@ -183,13 +249,19 @@ async fn tool_result_waterfall_last_wins() {
     let h1 = Arc::new(RecordingHook::with_order_log(
         "a",
         HookPoints::TOOL_RESULT,
-        vec![HookAction::ReplaceResult { content: "first".into(), is_error: false }],
+        vec![HookAction::ReplaceResult {
+            content: "first".into(),
+            is_error: false,
+        }],
         Arc::clone(&order_log),
     ));
     let h2 = Arc::new(RecordingHook::with_order_log(
         "b",
         HookPoints::TOOL_RESULT,
-        vec![HookAction::ReplaceResult { content: "second".into(), is_error: true }],
+        vec![HookAction::ReplaceResult {
+            content: "second".into(),
+            is_error: true,
+        }],
         Arc::clone(&order_log),
     ));
     let h1_weak = Arc::clone(&h1);
@@ -217,7 +289,11 @@ async fn tool_result_waterfall_last_wins() {
         .await;
     assert_eq!(
         out,
-        HookResult::Replace { hook_id: "b".into(), content: "second".into(), is_error: true }
+        HookResult::Replace {
+            hook_id: "b".into(),
+            content: "second".into(),
+            is_error: true
+        }
     );
     assert_eq!(h1_weak.calls(), vec!["tool_result"]);
     assert_eq!(h2_weak.calls(), vec!["tool_result"]);
@@ -292,9 +368,17 @@ async fn timeout_and_error_are_fail_open_noop() {
     struct Slow;
     #[async_trait::async_trait]
     impl Hook for Slow {
-        fn id(&self) -> &'static str { "slow" }
-        fn supported(&self) -> HookPoints { HookPoints::TOOL_CALL }
-        async fn handle(&self, _: HookEvent<'_>, _: &HookCtx<'_>) -> Result<HookAction, parrot_core::AgentError> {
+        fn id(&self) -> &'static str {
+            "slow"
+        }
+        fn supported(&self) -> HookPoints {
+            HookPoints::TOOL_CALL
+        }
+        async fn handle(
+            &self,
+            _: HookEvent<'_>,
+            _: &HookCtx<'_>,
+        ) -> Result<HookAction, parrot_core::AgentError> {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok(HookAction::NoOp)
         }
@@ -302,10 +386,21 @@ async fn timeout_and_error_are_fail_open_noop() {
     struct Boom;
     #[async_trait::async_trait]
     impl Hook for Boom {
-        fn id(&self) -> &'static str { "boom" }
-        fn supported(&self) -> HookPoints { HookPoints::TURN_START }
-        async fn handle(&self, _: HookEvent<'_>, _: &HookCtx<'_>) -> Result<HookAction, parrot_core::AgentError> {
-            Err(parrot_core::AgentError::ToolExecution { tool: "x".into(), message: "boom".into() })
+        fn id(&self) -> &'static str {
+            "boom"
+        }
+        fn supported(&self) -> HookPoints {
+            HookPoints::TURN_START
+        }
+        async fn handle(
+            &self,
+            _: HookEvent<'_>,
+            _: &HookCtx<'_>,
+        ) -> Result<HookAction, parrot_core::AgentError> {
+            Err(parrot_core::AgentError::ToolExecution {
+                tool: "x".into(),
+                message: "boom".into(),
+            })
         }
     }
     let mut reg = HookRegistry::new(Duration::from_millis(50));
@@ -357,7 +452,10 @@ async fn timeout_and_error_are_fail_open_noop() {
         assert_eq!(sink[1].1, "turn_start");
         assert_eq!(sink[1].2, "error");
         let summary = sink[1].3.as_ref().expect("error summary must be Some");
-        assert!(summary.contains("boom"), "error summary must preserve AgentError detail, got: {summary}");
+        assert!(
+            summary.contains("boom"),
+            "error summary must preserve AgentError detail, got: {summary}"
+        );
     }
 }
 
@@ -366,9 +464,17 @@ async fn fire_and_forget_emits_noop_on_completed() {
     struct NoopHook;
     #[async_trait::async_trait]
     impl Hook for NoopHook {
-        fn id(&self) -> &'static str { "noop-1" }
-        fn supported(&self) -> HookPoints { HookPoints::AGENT_START }
-        async fn handle(&self, _: HookEvent<'_>, _: &HookCtx<'_>) -> Result<HookAction, parrot_core::AgentError> {
+        fn id(&self) -> &'static str {
+            "noop-1"
+        }
+        fn supported(&self) -> HookPoints {
+            HookPoints::AGENT_START
+        }
+        async fn handle(
+            &self,
+            _: HookEvent<'_>,
+            _: &HookCtx<'_>,
+        ) -> Result<HookAction, parrot_core::AgentError> {
             Ok(HookAction::NoOp)
         }
     }
@@ -377,7 +483,11 @@ async fn fire_and_forget_emits_noop_on_completed() {
     let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
     let mut emit = make_emit(Arc::clone(&sink));
     reg.run(
-        HookEvent::AgentStart { session_id: Uuid::new_v4(), model: "m", provider: "p" },
+        HookEvent::AgentStart {
+            session_id: Uuid::new_v4(),
+            model: "m",
+            provider: "p",
+        },
         path(),
         &mut emit,
     )

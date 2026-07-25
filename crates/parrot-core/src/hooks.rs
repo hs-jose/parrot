@@ -116,7 +116,11 @@ pub enum HookResult {
     /// One or more TurnStart hooks injected messages (accumulated across all hooks).
     Inject { messages: Vec<ChatMessage> },
     /// A ToolResult hook replaced the output (last-write-wins).
-    Replace { hook_id: String, content: String, is_error: bool },
+    Replace {
+        hook_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 /// Internal: a hook call timed out or returned `Err`.
@@ -136,7 +140,11 @@ pub struct HookCtx<'a> {
 pub trait Hook: Send + Sync {
     fn id(&self) -> &'static str;
     fn supported(&self) -> HookPoints;
-    async fn handle(&self, event: HookEvent<'_>, ctx: &HookCtx<'_>) -> Result<HookAction, AgentError>;
+    async fn handle(
+        &self,
+        event: HookEvent<'_>,
+        ctx: &HookCtx<'_>,
+    ) -> Result<HookAction, AgentError>;
 }
 
 pub struct HookRegistry {
@@ -146,7 +154,10 @@ pub struct HookRegistry {
 
 impl HookRegistry {
     pub fn new(timeout: Duration) -> Self {
-        Self { handlers: Vec::new(), timeout }
+        Self {
+            handlers: Vec::new(),
+            timeout,
+        }
     }
 
     pub fn empty() -> Self {
@@ -218,27 +229,48 @@ impl HookRegistry {
             match &outcome {
                 Ok(HookAction::Block { reason }) => {
                     emit(hook.id(), kind, "block", Some(reason.clone()));
-                    return HookResult::Block { hook_id: hook.id().into(), reason: reason.clone() };
+                    return HookResult::Block {
+                        hook_id: hook.id().into(),
+                        reason: reason.clone(),
+                    };
                 }
                 Ok(HookAction::InjectMessages { messages }) => {
-                    emit(hook.id(), kind, "inject_messages", Some(format!("{} messages", messages.len())));
+                    emit(
+                        hook.id(),
+                        kind,
+                        "inject_messages",
+                        Some(format!("{} messages", messages.len())),
+                    );
                     inject_acc.extend(messages.clone());
                 }
                 Ok(HookAction::ReplaceResult { content, is_error }) => {
-                    emit(hook.id(), kind, "replace_result", Some(format!("{} bytes, is_error={}", content.len(), is_error)));
+                    emit(
+                        hook.id(),
+                        kind,
+                        "replace_result",
+                        Some(format!("{} bytes, is_error={}", content.len(), is_error)),
+                    );
                     replace_last = Some((hook.id().to_string(), content.clone(), *is_error));
                 }
                 Ok(HookAction::NoOp) => emit(hook.id(), kind, "noop", None),
                 Err(HookFailure::Timeout) => emit(hook.id(), kind, "timeout", None),
-                Err(HookFailure::Error(detail)) => emit(hook.id(), kind, "error", Some(detail.clone())),
+                Err(HookFailure::Error(detail)) => {
+                    emit(hook.id(), kind, "error", Some(detail.clone()))
+                }
             }
         }
 
         if let Some((hook_id, content, is_error)) = replace_last {
-            return HookResult::Replace { hook_id, content, is_error };
+            return HookResult::Replace {
+                hook_id,
+                content,
+                is_error,
+            };
         }
         if !inject_acc.is_empty() {
-            return HookResult::Inject { messages: inject_acc };
+            return HookResult::Inject {
+                messages: inject_acc,
+            };
         }
         HookResult::Continue
     }

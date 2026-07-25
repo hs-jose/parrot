@@ -41,7 +41,12 @@ impl Hook for DangerousCommandBlocker {
         ev: HookEvent<'_>,
         _ctx: &HookCtx<'_>,
     ) -> Result<HookAction, parrot_core::AgentError> {
-        if let HookEvent::ToolCall { tool_name, arguments, .. } = ev {
+        if let HookEvent::ToolCall {
+            tool_name,
+            arguments,
+            ..
+        } = ev
+        {
             if matches!(tool_name, "shell_exec" | "bash" | "shell") {
                 if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
                     for (re, label) in patterns() {

@@ -1313,6 +1313,7 @@ dependencies = [
 name = "parrot-daemon"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "hex",
  "parrot-config",
@@ -1322,6 +1323,7 @@ dependencies = [
  "parrot-tools",
  "parrot-transport",
  "rand",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

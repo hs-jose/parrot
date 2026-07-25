@@ -154,7 +154,11 @@ impl ReActEngine {
         let mut emit = make_emit(session_id, &event_tx);
         self.hooks
             .run(
-                HookEvent::AgentStart { session_id, model: &self.config.model, provider: &provider_id },
+                HookEvent::AgentStart {
+                    session_id,
+                    model: &self.config.model,
+                    provider: &provider_id,
+                },
                 &self.working_dir,
                 &mut emit,
             )
@@ -199,7 +203,11 @@ impl ReActEngine {
                     let turn_start_outcome = self
                         .hooks
                         .run(
-                            HookEvent::TurnStart { session_id, turn_id, user_message: &message },
+                            HookEvent::TurnStart {
+                                session_id,
+                                turn_id,
+                                user_message: &message,
+                            },
                             &self.working_dir,
                             &mut emit,
                         )
@@ -685,9 +693,9 @@ impl ReActEngine {
                 .await
         };
         let result = match tool_result_decision {
-            HookResult::Replace { content, is_error, .. } => {
-                parrot_protocol::types::ToolOutput { content, is_error }
-            }
+            HookResult::Replace {
+                content, is_error, ..
+            } => parrot_protocol::types::ToolOutput { content, is_error },
             _ => result,
         };
 
@@ -917,7 +925,9 @@ impl AgentEndGuard {
         let mut emit = make_emit(self.session_id, &self.event_tx);
         self.hooks
             .run(
-                HookEvent::AgentEnd { session_id: self.session_id },
+                HookEvent::AgentEnd {
+                    session_id: self.session_id,
+                },
                 &self.working_dir,
                 &mut emit,
             )

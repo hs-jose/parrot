@@ -39,15 +39,17 @@ Parrot 的差异化优势是"Rust 原生、启动快、trait-based DI、core zer
 ## 4. 整体架构
 
 ```text
-                          ┌────────────────────────────────────────────┐
-                          │       parrot-core/src/hooks.rs             │
-                          │  ┌──────────────────────────────────────┐   │
-   engine 调用 ─────────▶ │  │ HookRegistry                         │   │
-                          │  │  - Vec<Arc<dyn Hook>> (注册顺序)     │   │
-                          │  │  - on_<point>() helper（三策略）    │   │
-                          │  └──────────────────────────────────────┘   │
-                          │  + Hook / HookEvent / HookResult / HookCtx │
-                          └────────────────────────────────────────────┘
+                          ┌─────────────────────────────────────────────┐
+                          │        parrot-core/src/hooks.rs             │
+                          │  ┌──────────────────────────────────────┐    │
+   engine 调用 ─────────▶ │  │ HookRegistry                         │    │
+                          │  │  - Vec<Arc<dyn Hook>> (注册顺序)     │    │
+                          │  │  - run(event, working_dir, emit)     │    │
+                          │  │    单入口 dispatch 三策略            │    │
+                          │  └──────────────────────────────────────┘    │
+                          │  + Hook / HookEvent / HookAction / HookResult │
+                          │    / HookCtx / HookPoints                    │
+                          └─────────────────────────────────────────────┘
                                             ▲ impl
                           ┌─────────────────┴───────────────────────────┐
                           │ crates/parrot-daemon/src/hooks/             │
@@ -58,7 +60,7 @@ Parrot 的差异化优势是"Rust 原生、启动快、trait-based DI、core zer
                                             ▲ used by
                           ┌─────────────────┴───────────────────────────┐
                           │ crates/parrot-daemon/src/runtime.rs         │
-                          │  (build HookRegistry, inject into manager) │
+                          │  (build HookRegistry, inject into manager)  │
                           └─────────────────────────────────────────────┘
 ```
 
@@ -78,7 +80,7 @@ use uuid::Uuid;
 
 bitflags::bitflags! {
     /// 标记一个 Hook 实现关心哪些扩展点。
-    /// Registry 在某个点 dispatch 时跳过未声明此点的 handler，避免无效 await。
+    /// Registry 在 run 时跳过未声明此点的 handler，避免无效 await。
     #[derive(Debug, Clone, Copy, Default)]
     pub struct HookPoints: u8 {
         const AGENT_START            = 0b0000_0001;
@@ -99,20 +101,20 @@ pub trait Hook: Send + Sync {
     fn supported(&self) -> HookPoints;
 
     /// 所有扩展点都走这个单方法，参数是 enum
-    async fn dispatch(
+    async fn handle(
         &self,
         event: HookEvent<'_>,
         ctx: &HookCtx<'_>,
-    ) -> Result<HookResult, AgentError>;
+    ) -> Result<HookAction, AgentError>;
 }
 ```
 
-### 5.2 `HookEvent` 与 `HookResult`
+### 5.2 `HookEvent` 与 `HookAction` / `HookResult`
 
-跟现有 `AgentEvent` / `MessageDeltaPayload` 同风格：`#[serde(tag = "type")] snake_case`。每个变体字段就是该点能"看见+改写"的数据。
+跟现有 `AgentEvent` / `MessageDeltaPayload` 同风格：`#[serde(tag = "type")]` snake_case。每个变体字段就是该点能"看见+改写"的数据。
 
 ```rust
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HookEvent<'a> {
     AgentStart { session_id: Uuid, model: &'a str, provider: &'a str },
@@ -143,9 +145,18 @@ pub enum HookEvent<'a> {
     },
 }
 
+impl<'a> HookEvent<'a> {
+    /// 事件类型名，对应 `HookFired.event_kind`
+    pub fn kind(&self) -> &'static str { ... }
+    /// 返回该事件所属 hook point，registry 用它过滤 handler
+    pub fn point(&self) -> HookPoints { ... }
+    pub fn session_id(&self) -> Uuid { ... }
+}
+
+/// 单个 hook 返回的动作。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HookResult {
+pub enum HookAction {
     /// fire-and-forget / waterfall 中无修改时的中性结果
     NoOp,
     /// turn_start 专用：累加进 context（不影响 assistant/user 消息，仅作 system-style 注入）
@@ -157,16 +168,29 @@ pub enum HookResult {
     ReplaceResult { content: String, is_error: bool },
 }
 
+/// Registry 跑完该点所有 handler 后聚合出的最终决策，engine 据此继续/阻断/改写。
+#[derive(Debug, Clone, PartialEq)]
+pub enum HookResult {
+    /// 没有 hook 干预，engine 按原流程继续。
+    Continue,
+    /// 有 hook 阻断（bail-on-first），engine 跳过该 turn/tool。
+    Block { hook_id: String, reason: String },
+    /// turn_start 有 hook 注入 messages，engine 在 user_msg 前 extend context。
+    Inject { messages: Vec<ChatMessage> },
+    /// tool_result 有 hook 替换输出（last-wins）。
+    Replace { hook_id: String, content: String, is_error: bool },
+}
+
 /// 给 hook 实现的上下文，含 daemon 注入的非业务数据
 pub struct HookCtx<'a> {
     pub session_id: Uuid,
     pub working_dir: &'a std::path::Path,
-    /// hook 自身超时，daemon 在调用前已包了 tokio::time::timeout，这里仅供 hook 实现参考
+    /// hook 自身超时，registry 在调用前已包了 tokio::time::timeout，这里仅供 hook 实现参考
     pub timeout: std::time::Duration,
 }
 ```
 
-`HookResult` 公开序列化字段直接进 `HookFired` wire 事件的 `summary`，方便客户端 UI 渲染。
+`HookAction` 公开序列化字段直接进 `HookFired` wire 事件的 `summary`，方便客户端 UI 渲染。`HookResult` 是 registry 内部聚合后返回给 engine 的决策类型，不进 wire。
 
 ### 5.3 `HookRegistry`
 
@@ -180,24 +204,31 @@ impl HookRegistry {
     pub fn new(timeout: std::time::Duration) -> Self { ... }
     pub fn register(&mut self, hook: Arc<dyn Hook>) { ... }
 
-    /// 6 个 helper，按 §6 的策略实现，错误/超时按 §8 处理。
-    /// 每个 helper 内部 already filter handlers by HookPoints mask。
-    pub async fn on_agent_start(&self, ...) { /* fire-and-forget */ }
-    pub async fn on_agent_end(&self, ...)   { /* fire-and-forget */ }
-    pub async fn on_turn_start(&self, ...) -> TurnStartDecision { /* waterfall + bail on Block */ }
-    pub async fn on_tool_call(&self, ...) -> ToolCallDecision   { /* bail */ }
-    pub async fn on_tool_execution_start(&self, ...)            { /* fire-and-forget */ }
-    pub async fn on_tool_result(&self, ...) -> ToolResultDecision { /* waterfall */ }
+    /// 单入口 dispatch：按 event.point() 过滤 handler，按 §6 的策略执行，
+    /// 错误/超时按 §8 处理，并通过 `emit` 回调为每个 hook 结果发 `HookFired`。
+    /// 返回聚合后的 `HookResult` 供 engine 继续/阻断/改写。
+    pub async fn run(
+        &self,
+        event: HookEvent<'_>,
+        working_dir: &std::path::Path,
+        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
+    ) -> HookResult;
 }
 ```
 
-`TurnStartDecision` / `ToolCallDecision` / `ToolResultDecision` 是 engine 用的简化 enum（不是 wire 类型），表达"经过 hook 链后的最终决策"。
+`run` 内部根据 `event.point()` 选择策略：
+- `AGENT_START` / `AGENT_END` / `TOOL_EXECUTION_START`：fire-and-forget（遍历所有 handler，结果忽略）。
+- `TURN_START`：waterfall（`InjectMessages` 累加，`Block` 立即 bail）。
+- `TOOL_CALL`：bail（首个 `Block` 立即返回）。
+- `TOOL_RESULT`：waterfall（`ReplaceResult` 滚动 last-wins）。
+
+`HookResult` 是 engine 用的聚合 enum（不是 wire 类型），表达"经过 hook 链后的最终决策"。
 
 ## 6. 六个扩展点
 
 按 engine.rs 现有生命周期边界接入：
 
-| # | Hook Point | 接入位置 (engine.rs) | 策略 | Allowed result | 短路行为 |
+| # | Hook Point | 接入位置 (engine.rs) | 策略 | Allowed `HookAction` | 短路行为 |
 |---|---|---|---|---|---|
 | 1 | `agent_start` | `run()`：emit `AgentEvent::AgentStart` 之后、主循环之前 | fire-and-forget | `NoOp` | — |
 | 2 | `agent_end` | `AgentEndGuard::fire_and_drop`：emit `AgentEvent::AgentEnd` 之前 | fire-and-forget | `NoOp` | — |
@@ -212,8 +243,10 @@ impl HookRegistry {
 
 ## 7. 三种执行策略
 
+所有策略通过 `HookRegistry::run(event, working_dir, emit)` 统一调度，`run` 内部根据 `event.point()` 选择策略。
+
 - **fire-and-forget** (`agent_start`, `agent_end`, `tool_execution_start`)
-  - 纯通知，hook 返回 result 被忽略（但因 §8 的可观测性，仍会触发 `HookFired` wire 事件）
+  - 纯通知，hook 返回 `HookAction` 被忽略（但因 §8 的可观测性，仍会触发 `HookFired` wire 事件）
   - 适用于埋点、UI 更新、`tracing::info!`、外部 metric push（不过这些 IO 是 hook 自己的事）
   - 多 handler 全部执行，无短路
 
@@ -228,20 +261,19 @@ impl HookRegistry {
 - **bail** (`tool_call`，以及 `turn_start` 内的 `Block` result 嵌入)
   - 任一 handler 返回 `Block{reason}` → 立即结束此链
   - 后续未跑的 handler 不执行（避免被 block 后又有副作用）
-  - registry 收集所有已收到的 reason 合并展示（log warn 多个 reason）
 
 ## 8. 执行与失败语义
 
 ### 8.1 超时
 
-- 每个 dispatch 调用包一层 `tokio::time::timeout(timeout, hook.dispatch(...))`
+- 每个 hook 调用包一层 `tokio::time::timeout(timeout, hook.handle(...))`（内部 `call_with_timeout`）
 - `timeout` 来自 `HooksConfig.timeout`，默认 5s
 - **超时**：tracing::warn、fail-open（视作 `NoOp`）、不再参与 chain、仍 emit `HookFired{result_kind: "timeout"}`
 - 同一 hook 在 bail 点超时：fail-open 使其不产生 `Block`，但允许短路上游已有的 `Block`（已有的 Block 不会因下游超时被擦除）
 
 ### 8.2 Error
 
-- hook `dispatch` 返回 `Err(AgentError)`：log::warn、emit `HookFired{result_kind: "error", summary: Some(err.to_string())}`、视作 NoOp
+- hook `handle` 返回 `Err(AgentError)`：log::warn、emit `HookFired{result_kind: "error", summary: Some(err.to_string())}`、视作 NoOp
 - 不中断 agent 主流程（仅观察/告知客户端），不允许 hook 通过返回 Err 来强行中止 turn；想中止必须显式返回 `Block`
 - bail 点：下游已 Block 不会被擦除，但当前出错 handler 的 NoOp 处理会继续 chain
 
@@ -252,7 +284,11 @@ impl HookRegistry {
 
 ### 8.4 空注册表快速跳过
 
-`HookRegistry::on_<point>()` 实现第一步都判 `if self.handlers.iter().all(|h| !h.supported().contains(point)) { return default; }`，零注册或无关心此点的 handler 不产生 async work、不 emit `HookFired`。
+`HookRegistry::run()` 第一步判 `self.interested(event.point()).is_empty()`，零注册或无关心此点的 handler 不产生 async work、不 emit `HookFired`，直接返回 `HookResult::Continue`。
+
+### 8.5 `HookFired` 发射
+
+`run()` 内部通过 `emit` 回调为**每个** hook 结果发射 `HookFired`，包括 `block`（bail 点）、`inject_messages`、`replace_result`、`noop`、`timeout`、`error`。engine 不再手动调用 `emit_hook_fired`，只需在 `run()` 之前准备好 `make_emit` 闭包。
 
 ## 9. Wire protocol & 持久化
 
@@ -339,10 +375,10 @@ fn default_timeout() -> u64 { 5 }
 
 | 位置 | 新增内容 |
 |---|---|
-| `crates/parrot-core/src/hooks.rs` | `Hook` trait / `HookRegistry` / `HookEvent` / `HookResult` / `HookCtx` / `HookPoints` bitflags / result enums |
-| `crates/parrot-core/src/lib.rs` | `pub mod hooks; pub use hooks::{Hook, HookRegistry, ...};` |
-| `crates/parrot-core/src/engine.rs` | `ReActEngine` 加 `hooks: Arc<HookRegistry>` 字段 + `with_hooks` builder；`run/handle_turn/run_one_tool` 插 6 个 dispatch 点；新增 `TurnStopReason::BlockedHook(String)` 到 parrot-protocol |
-| `crates/parrot-core/src/session.rs` | `SessionManager` 加 `hooks: Arc<HookRegistry>` + `with_hooks` + 在 `spawn_session`/`create_resumed_session` 传给 engine |
+| `crates/parrot-core/src/hooks.rs` | `Hook` trait / `HookRegistry` / `HookEvent` / `HookAction` / `HookResult` / `HookCtx` / `HookPoints` bitflags |
+| `crates/parrot-core/src/lib.rs` | `pub mod hooks; pub use hooks::{Hook, HookRegistry, HookEvent, HookAction, HookResult, HookCtx, HookPoints};` |
+| `crates/parrot-core/src/engine.rs` | `ReActEngine` 加 `hooks: Arc<HookRegistry>` 字段 + `with_hooks` builder；`run/handle_turn/run_one_tool` 插 6 个 `run()` 调用点；`make_emit` 闭包通过 `try_send` 发 `HookFired`；新增 `TurnStopReason::BlockedHook(String)` 到 parrot-protocol |
+| `crates/parrot-core/src/session.rs` | `SessionManager` 加 `hooks: Option<Arc<HookRegistry>>` + `with_hooks` + 在 `spawn_session`/`create_resumed_session` 传给 engine |
 | `crates/parrot-protocol/src/agent_event.rs` | `AgentEvent::HookFired` + `TurnStopReason::BlockedHook(String)` |
 | `crates/parrot-protocol/tests/roundtrip.rs` | `HookFired` / `BlockedHook` roundtrip case |
 | `crates/parrot-config/src/config.rs` | `HooksConfig` + `AppConfig.hooks` + default |
@@ -356,31 +392,51 @@ fn default_timeout() -> u64 { 5 }
 
 ## 13. engine 改动细节（关键摘录）
 
-只列 hook dispatch 插入点，不改控制流：
+只列 hook dispatch 插入点，不改控制流。engine 内准备一个 `make_emit` 闭包（`try_send` + `session_id`），然后所有 hook 点统一调用 `self.hooks.run(event, &self.working_dir, &mut emit)`：
 
 ```rust
-// run() AgentStart 之后
+// run() 顶部：AgentStart 之后
 let _ = event_log.append(agent_start.clone());
-self.hooks.on_agent_start(&ctx, &agent_start).await;
+let mut emit = make_emit(session_id, &event_tx);
+self.hooks
+    .run(
+        HookEvent::AgentStart {
+            session_id,
+            model: &self.config.model,
+            provider: &provider_id,
+        },
+        &self.working_dir,
+        &mut emit,
+    )
+    .await;
 // ... 主循环 ...
 
 // Chat 收到后
 match cmd {
     Some(SessionCmd::Chat { message }) => {
-        let turn_decision = self.hooks.on_turn_start(&ctx, session_id, &message).await;
-        match turn_decision {
-            TurnStartDecision::Blocked(reason) => {
+        let turn_id = Uuid::new_v4();
+        let turn_start_outcome = self
+            .hooks
+            .run(
+                HookEvent::TurnStart { session_id, turn_id, user_message: &message },
+                &self.working_dir,
+                &mut emit,
+            )
+            .await;
+        match turn_start_outcome {
+            HookResult::Block { reason, .. } => {
                 // 不 emit TurnStart，直接 emit TurnEnd{BlockedHook}，跳过 handle_turn
                 let _ = event_tx.send(AgentEvent::TurnEnd {
-                    session_id, turn_id,
+                    session_id,
+                    turn_id,
                     stop_reason: TurnStopReason::BlockedHook(reason),
                     usage: Usage::default(),
                 }).await.ok();
+                let _ = event_log.append(...);
                 continue;
             }
-            TurnStartDecision::Continue { injected_messages } => {
-                context.extend(injected_messages);
-            }
+            HookResult::Inject { messages } => context.extend(messages),
+            _ => {}
         }
         // emit TurnStart (原代码)
         // handle_turn (原代码)
@@ -389,45 +445,113 @@ match cmd {
 }
 
 // run_one_tool() ToolStart 之后、confirm 之前
-let tool_decision = self.hooks.on_tool_call(&ctx, tool_call_id, tool_name, args).await;
-if let ToolCallDecision::Blocked(reason) = tool_decision {
+let tool_call_outcome = {
+    let mut emit = make_emit(session_id, event_tx);
+    self.hooks
+        .run(
+            HookEvent::ToolCall {
+                session_id,
+                turn_id,
+                parent_message_id,
+                tool_call_id: &tc.id,
+                tool_name: &tc.name,
+                arguments: &args,
+            },
+            &self.working_dir,
+            &mut emit,
+        )
+        .await
+};
+if let HookResult::Block { reason, .. } = tool_call_outcome {
     // 复用 run_one_tool 末尾的 reject 路径：push Tool msg + emit ToolEnd + return Ok
     // 等价于 confirm reject，但用 reason 而非 "user rejected"
     return reject_tool(/* reason */);
 }
-// confirm (原代码)
+
 // confirm 通过后
-self.hooks.on_tool_execution_start(&ctx, tool_call_id, tool_name, args).await;
-let result = match race_with_abort(cmd_rx, self.execute_tool(...)).await { /* 原代码 */ };
-let mod_result = self.hooks.on_tool_result(&ctx, tool_call_id, tool_name, &result).await.apply(result);
-// emit ToolEnd(mod_result)
+let result = if matches!(decision, ConfirmDecision::Approve) {
+    {
+        let mut emit = make_emit(session_id, event_tx);
+        self.hooks
+            .run(
+                HookEvent::ToolExecutionStart {
+                    session_id,
+                    turn_id,
+                    tool_call_id: &tc.id,
+                    tool_name: &tc.name,
+                    arguments: &args,
+                },
+                &self.working_dir,
+                &mut emit,
+            )
+            .await;
+    }
+    match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args.clone(), &tool_ctx)).await {
+        // ... 原代码 ...
+    }
+} else {
+    // ... 原代码 ...
+};
+
+let result = {
+    let mut emit = make_emit(session_id, event_tx);
+    match self
+        .hooks
+        .run(
+            HookEvent::ToolResult {
+                session_id,
+                turn_id,
+                tool_call_id: &tc.id,
+                tool_name: &tc.name,
+                input: &args,
+                result: &result,
+            },
+            &self.working_dir,
+            &mut emit,
+        )
+        .await
+    {
+        HookResult::Replace { content, is_error, .. } => {
+            parrot_protocol::types::ToolOutput { content, is_error }
+        }
+        _ => result,
+    }
+};
+// emit ToolEnd(result)
 ```
 
 `agent_end` 在 `AgentEndGuard::fire_and_drop` 里：
 
 ```rust
-async fn fire_and_drop(mut self, _tx, event_log, ctx) {
-    self.hooks.on_agent_end(&ctx, self.session_id).await;
+async fn fire_and_drop(mut self, _tx: &mpsc::Sender<AgentEvent>, event_log: &mut EventLog) {
+    let mut emit = make_emit(self.session_id, &self.event_tx);
+    self.hooks
+        .run(
+            HookEvent::AgentEnd { session_id: self.session_id },
+            &self.working_dir,
+            &mut emit,
+        )
+        .await;
     // 原落盘 AgentEnd + 发 wire 的逻辑
 }
 ```
 
-注意 `AgentEndGuard` 目前不持有 `hooks`，需把 `Arc<HookRegistry>` clone 进 guard（drop 时不需要，只在显式 `fire_and_drop` 调 hook；guard 的 `Drop` 路径仍 try_send 不 await hook，符合现有"Drop 不能 await"约束）。
+`AgentEndGuard` 持有 `hooks: Arc<HookRegistry>` 和 `working_dir: PathBuf`；guard 的 `Drop` 路径不 await hook，只 try_send `AgentEnd`。
 
 ## 14. 测试
 
 ### 14.1 单元（crates/parrot-core/tests/hooks_test.rs，独立集成测试）
 
-造 `RecordingHook`（用 `Mutex<Vec<RecordedEvent>>` 捕获调用顺序 + 可注入返回 result）覆盖：
+造 `RecordingHook`（用 `Mutex<Vec<RecordedEvent>>` 捕获调用顺序 + 可注入返回 `HookAction`）覆盖：
 
-- `tool_call` hook 返回 `Block`：`RecordingHook::on_tool_call` 记录；调用方断言工具真正 `execute_tool` 未被调；context 里 `Tool{content="blocked: ..."}` 进去；`ToolEnd.result.is_error == true`；wire 收到 `HookFired{result_kind: "block"}`
-- `tool_result` 多 handler（两个 `RecordingHook` 都返回 `ReplaceResult`）：链式 last-wins，最后 ToolEnd 是第二个的内容；前者 `HookEvent::ToolResult.result` 是原始、后者是前者 replaced 后的值
-- `turn_start` 返回 `InjectMessages`：context 在 `TurnStart` 之后多了注入消息；handle_turn 被调
-- `turn_start` 返回 `Block(reason)`：handle_turn 不被调，TurnEnd{BlockedHook}
-- `agent_start` / `agent_end` / `tool_execution_start` fire-and-forget：handler 被调但 result 忽略
-- timeout 模拟：rotein hook dispatch future sleep 10s（配置 100ms）→ result 视作 NoOp，HookFired{result_kind="timeout"} 仍发，agent 继续
-- error 模拟：hook 返回 `Err(AgentError::...)` → 同上 NoOp + HookFired{result_kind="error"}
-- 空注册表：所有 dispatch helper 走快路径不产生 HookFired
+- `tool_call` hook 返回 `Block`：调用 `reg.run(HookEvent::ToolCall{...})`；断言下游 handler 未执行；`run` 返回 `HookResult::Block{hook_id, reason}`；`HookFired{result_kind: "block"}` 被 emit
+- `tool_result` 多 handler（两个 `RecordingHook` 都返回 `ReplaceResult`）：链式 last-wins，`run` 返回 `HookResult::Replace{hook_id: "b", ...}`；前者 `HookEvent::ToolResult.result` 是原始、后者是前者 replaced 后的值
+- `turn_start` 返回 `InjectMessages`：`reg.run(HookEvent::TurnStart{...})` 返回 `HookResult::Inject{messages}`，messages 累加
+- `turn_start` 返回 `Block(reason)`：`run` 返回 `HookResult::Block{...}`，后续 handler 不执行
+- `agent_start` / `agent_end` / `tool_execution_start` fire-and-forget：`run` 返回 `HookResult::Continue`，handler 被调但 result 忽略，仍 emit `HookFired{result_kind: "noop"}`
+- timeout 模拟：hook `handle` future sleep 10s（配置 50ms）→ result 视作 NoOp，`run` 返回 `HookResult::Continue`，HookFired{result_kind="timeout"} 仍发
+- error 模拟：hook 返回 `Err(AgentError::...)` → `run` 返回 `HookResult::Continue`，HookFired{result_kind="error"} 仍发，summary 保留错误原文
+- 空注册表：`run` 对任何 point 都直接返回 `HookResult::Continue`，不 emit HookFired
 
 ### 14.2 协议（crates/parrot-protocol/tests/roundtrip.rs）
 
