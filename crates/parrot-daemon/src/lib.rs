@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod hooks;
 pub mod runtime;
 pub mod session_store;
 
