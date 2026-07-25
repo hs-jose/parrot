@@ -1,6 +1,7 @@
 use crate::context::ContextManager;
 use crate::error::AgentError;
 use crate::event_log::EventLog;
+use crate::hooks::{HookRegistry, ToolCallDecision, ToolResultDecision, TurnStartDecision};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
 use crate::tool::{ToolContext, ToolRegistry};
@@ -40,6 +41,7 @@ pub struct ReActEngine {
     /// The seq the EventLog was at after the resume replay. Used to keep
     /// `current_seq` continuous when appending new events post-resume.
     resume_seq_offset: u64,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl ReActEngine {
@@ -75,6 +77,7 @@ impl ReActEngine {
             resumed_from_seq: None,
             pending_integrity_warning: None,
             resume_seq_offset: 0,
+            hooks: None,
         }
     }
 
@@ -100,6 +103,37 @@ impl ReActEngine {
     pub fn with_pending_integrity_warning(mut self, issue: IntegrityIssue) -> Self {
         self.pending_integrity_warning = Some(issue);
         self
+    }
+
+    pub fn with_hooks(mut self, registry: Arc<HookRegistry>) -> Self {
+        self.hooks = Some(registry);
+        self
+    }
+
+    async fn emit_hook_fired(
+        &self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        hook_id: &str,
+        event_kind: &str,
+        result_kind: &str,
+        summary: Option<String>,
+    ) {
+        let _ = event_tx
+            .send(AgentEvent::HookFired {
+                session_id: self.session_id,
+                hook_id: hook_id.to_string(),
+                event_kind: event_kind.to_string(),
+                result_kind: result_kind.to_string(),
+                summary,
+            })
+            .await
+            .ok();
+    }
+
+    fn hooks(&self) -> Arc<HookRegistry> {
+        self.hooks
+            .clone()
+            .unwrap_or_else(|| Arc::new(HookRegistry::empty()))
     }
 
     pub async fn run(
@@ -142,6 +176,14 @@ impl ReActEngine {
             tracing::warn!(error = ?e, "failed to persist AgentStart");
         }
 
+        self.hooks()
+            .on_agent_start(
+                session_id,
+                &self.config.model,
+                &self.resolve_provider_id().await,
+            )
+            .await;
+
         // 若 resume 时检测到事件日志损坏，发一次 ReplayIntegrityWarning 即清空，
         // 落盘后下次 resume 不会再重复报。
         if let Some(issue) = self.pending_integrity_warning.take() {
@@ -170,12 +212,41 @@ impl ReActEngine {
             fired: false,
             total_usage: Arc::clone(&total_usage),
             reason: Arc::clone(&end_reason),
+            hooks: self.hooks(),
         };
 
         loop {
             match cmd_rx.recv().await {
                 Some(SessionCmd::Chat { message }) => {
                     let turn_id = Uuid::new_v4();
+                    let turn_start_outcome = self
+                        .hooks()
+                        .on_turn_start(session_id, turn_id, &message)
+                        .await;
+                    match turn_start_outcome {
+                        TurnStartDecision::Blocked { hook_id, reason } => {
+                            self.emit_hook_fired(
+                                &event_tx,
+                                &hook_id,
+                                "turn_start",
+                                "block",
+                                Some(reason.clone()),
+                            )
+                            .await;
+                            let turn_end = AgentEvent::TurnEnd {
+                                session_id,
+                                turn_id,
+                                stop_reason: TurnStopReason::BlockedHook(reason.clone()),
+                                usage: Usage::default(),
+                            };
+                            let _ = event_tx.send(turn_end.clone()).await.ok();
+                            let _ = event_log.append(turn_end);
+                            continue;
+                        }
+                        TurnStartDecision::Continue { injected_messages } => {
+                            context.extend(injected_messages);
+                        }
+                    }
                     let _ = event_tx
                         .send(AgentEvent::TurnStart {
                             session_id,
@@ -511,6 +582,48 @@ impl ReActEngine {
         let _ = event_tx.send(tool_start.clone()).await.ok();
         let _ = event_log.append(tool_start);
 
+        let tool_call_outcome = self
+            .hooks()
+            .on_tool_call(
+                session_id,
+                turn_id,
+                parent_message_id,
+                &tc.id,
+                &tc.name,
+                &args,
+            )
+            .await;
+        if let ToolCallDecision::Blocked { hook_id, reason } = tool_call_outcome {
+            self.emit_hook_fired(
+                event_tx,
+                &hook_id,
+                "tool_call",
+                "block",
+                Some(reason.clone()),
+            )
+            .await;
+            let result = parrot_protocol::types::ToolOutput {
+                content: format!("blocked: {reason}"),
+                is_error: true,
+            };
+            let tool_end = AgentEvent::ToolEnd {
+                session_id,
+                turn_id,
+                tool_call_id: tc.id.clone(),
+                result: result.clone(),
+            };
+            let _ = event_tx.send(tool_end.clone()).await.ok();
+            let _ = event_log.append(tool_end);
+            context.push(ChatMessage {
+                role: ChatRole::Tool,
+                content: result.content,
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls: None,
+            });
+            return Ok(());
+        }
+
         let tool_ctx = ToolContext {
             working_dir: self.working_dir.clone(),
             max_file_size_bytes: 10 * 1024 * 1024,
@@ -533,7 +646,12 @@ impl ReActEngine {
         };
 
         let result = if matches!(decision, ConfirmDecision::Approve) {
-            match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args, &tool_ctx)).await {
+            self.hooks()
+                .on_tool_execution_start(session_id, turn_id, &tc.id, &tc.name, &args)
+                .await;
+            match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args.clone(), &tool_ctx))
+                .await
+            {
                 Abortable::Completed(r) => {
                     r.unwrap_or_else(|e| parrot_protocol::types::ToolOutput {
                         content: format!("Error: {}", e),
@@ -563,6 +681,29 @@ impl ReActEngine {
             parrot_protocol::types::ToolOutput {
                 content: reason.to_string(),
                 is_error: true,
+            }
+        };
+
+        let result = match self
+            .hooks()
+            .on_tool_result(session_id, turn_id, &tc.id, &tc.name, &args, &result)
+            .await
+        {
+            ToolResultDecision::Continue => result,
+            ToolResultDecision::Replace {
+                hook_id,
+                content,
+                is_error,
+            } => {
+                self.emit_hook_fired(
+                    event_tx,
+                    &hook_id,
+                    "tool_result",
+                    "replace_result",
+                    Some(format!("{} bytes", content.len())),
+                )
+                .await;
+                parrot_protocol::types::ToolOutput { content, is_error }
             }
         };
 
@@ -752,6 +893,7 @@ struct AgentEndGuard {
     fired: bool,
     total_usage: Arc<Mutex<Usage>>,
     reason: Arc<Mutex<AgentEndReason>>,
+    hooks: Arc<HookRegistry>,
 }
 
 impl AgentEndGuard {
@@ -763,6 +905,7 @@ impl AgentEndGuard {
         }
         let usage = self.total_usage.lock().unwrap().clone();
         let reason = self.reason.lock().unwrap().clone();
+        self.hooks.on_agent_end(self.session_id).await;
         let event = AgentEvent::AgentEnd {
             session_id: self.session_id,
             reason,
