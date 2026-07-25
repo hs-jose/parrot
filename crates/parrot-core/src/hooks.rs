@@ -16,6 +16,7 @@ bitflags::bitflags! {
         const TOOL_CALL              = 0b0000_1000;
         const TOOL_EXECUTION_START   = 0b0001_0000;
         const TOOL_RESULT            = 0b0010_0000;
+        const CONTEXT_READY          = 0b0100_0000;
     }
 }
 
@@ -58,6 +59,11 @@ pub enum HookEvent<'a> {
         input: &'a serde_json::Value,
         result: &'a ToolOutput,
     },
+    ContextReady {
+        session_id: Uuid,
+        turn_id: Uuid,
+        context: &'a [ChatMessage],
+    },
 }
 
 impl<'a> HookEvent<'a> {
@@ -69,6 +75,7 @@ impl<'a> HookEvent<'a> {
             HookEvent::ToolCall { .. } => "tool_call",
             HookEvent::ToolExecutionStart { .. } => "tool_execution_start",
             HookEvent::ToolResult { .. } => "tool_result",
+            HookEvent::ContextReady { .. } => "context_ready",
         }
     }
 
@@ -80,6 +87,7 @@ impl<'a> HookEvent<'a> {
             HookEvent::ToolCall { .. } => HookPoints::TOOL_CALL,
             HookEvent::ToolExecutionStart { .. } => HookPoints::TOOL_EXECUTION_START,
             HookEvent::ToolResult { .. } => HookPoints::TOOL_RESULT,
+            HookEvent::ContextReady { .. } => HookPoints::CONTEXT_READY,
         }
     }
 
@@ -90,7 +98,8 @@ impl<'a> HookEvent<'a> {
             | HookEvent::TurnStart { session_id, .. }
             | HookEvent::ToolCall { session_id, .. }
             | HookEvent::ToolExecutionStart { session_id, .. }
-            | HookEvent::ToolResult { session_id, .. } => *session_id,
+            | HookEvent::ToolResult { session_id, .. }
+            | HookEvent::ContextReady { session_id, .. } => *session_id,
         }
     }
 }
@@ -103,6 +112,7 @@ pub enum HookAction {
     InjectMessages { messages: Vec<ChatMessage> },
     Block { reason: String },
     ReplaceResult { content: String, is_error: bool },
+    ReplaceContext { messages: Vec<ChatMessage> },
 }
 
 /// Aggregated result returned by [`HookRegistry::run`] after running all
@@ -121,6 +131,8 @@ pub enum HookResult {
         content: String,
         is_error: bool,
     },
+    /// A ContextReady hook replaced the context messages (last-write-wins).
+    ReplaceContext { hook_id: String, messages: Vec<ChatMessage> },
 }
 
 /// Internal: a hook call timed out or returned `Err`.
@@ -222,6 +234,7 @@ impl HookRegistry {
 
         let mut inject_acc: Vec<ChatMessage> = Vec::new();
         let mut replace_last: Option<(String, String, bool)> = None; // (hook_id, content, is_error)
+        let mut replace_ctx_last: Option<(String, Vec<ChatMessage>)> = None; // (hook_id, messages)
 
         for hook in hooks {
             let kind = event.kind();
@@ -252,6 +265,15 @@ impl HookRegistry {
                     );
                     replace_last = Some((hook.id().to_string(), content.clone(), *is_error));
                 }
+                Ok(HookAction::ReplaceContext { messages }) => {
+                    emit(
+                        hook.id(),
+                        kind,
+                        "replace_context",
+                        Some(format!("{} messages", messages.len())),
+                    );
+                    replace_ctx_last = Some((hook.id().to_string(), messages.clone()));
+                }
                 Ok(HookAction::NoOp) => emit(hook.id(), kind, "noop", None),
                 Err(HookFailure::Timeout) => emit(hook.id(), kind, "timeout", None),
                 Err(HookFailure::Error(detail)) => {
@@ -266,6 +288,9 @@ impl HookRegistry {
                 content,
                 is_error,
             };
+        }
+        if let Some((hook_id, messages)) = replace_ctx_last {
+            return HookResult::ReplaceContext { hook_id, messages };
         }
         if !inject_acc.is_empty() {
             return HookResult::Inject {

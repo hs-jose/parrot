@@ -179,6 +179,7 @@ impl Hook for RecordingHook {
             HookEvent::ToolCall { .. } => "tool_call",
             HookEvent::ToolExecutionStart { .. } => "tool_execution_start",
             HookEvent::ToolResult { .. } => "tool_result",
+            HookEvent::ContextReady { .. } => "context_ready",
         };
         self.calls.lock().unwrap().push(name);
         if let Some(log) = &self.order_log {
