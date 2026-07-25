@@ -1265,6 +1265,7 @@ dependencies = [
  "parrot-config",
  "parrot-core",
  "parrot-daemon",
+ "parrot-hooks",
  "parrot-protocol",
  "parrot-transport",
  "ratatui",
@@ -1328,6 +1329,23 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "parrot-hooks"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parrot-config",
+ "parrot-core",
+ "parrot-protocol",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]

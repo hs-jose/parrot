@@ -15,4 +15,5 @@ tracing        = { workspace = true }
 [dev-dependencies]
 uuid       = { workspace = true }
 tokio      = { workspace = true }
+serde_json = { workspace = true }
 parrot-protocol = { path = "../parrot-protocol" }
