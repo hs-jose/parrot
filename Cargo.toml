@@ -12,6 +12,7 @@ members = [
     "crates/parrot-core",
     "crates/parrot-providers",
     "crates/parrot-tools",
+    "crates/parrot-hooks",
     "crates/parrot-daemon",
 ]
 
@@ -71,6 +72,7 @@ parrot-core      = { path = "crates/parrot-core" }
 parrot-config    = { path = "crates/parrot-config" }
 parrot-protocol  = { path = "crates/parrot-protocol" }
 parrot-transport = { path = "crates/parrot-transport" }
+parrot-hooks     = { path = "crates/parrot-hooks" }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 async-trait      = { workspace = true }
