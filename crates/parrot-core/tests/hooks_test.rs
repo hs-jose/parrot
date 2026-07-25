@@ -1,4 +1,5 @@
 use parrot_core::hooks::*;
+use parrot_core::types::{ChatMessage, ChatRole};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -310,7 +311,6 @@ async fn tool_result_waterfall_last_wins() {
 
 #[tokio::test]
 async fn turn_start_inject_messages_accumulate() {
-    use parrot_core::types::{ChatMessage, ChatRole};
     let mut reg = HookRegistry::new(Duration::from_secs(5));
     reg.register(Arc::new(RecordingHook::new(
         "a",
@@ -499,4 +499,212 @@ async fn fire_and_forget_emits_noop_on_completed() {
     assert_eq!(sink[0].1, "agent_start");
     assert_eq!(sink[0].2, "noop");
     assert!(sink[0].3.is_none());
+}
+
+fn context_ready_event<'a>(sid: Uuid, tid: Uuid, context: &'a [ChatMessage]) -> HookEvent<'a> {
+    HookEvent::ContextReady {
+        session_id: sid,
+        turn_id: tid,
+        context,
+    }
+}
+
+#[tokio::test]
+async fn context_ready_inject_accumulates() {
+    let mut reg = HookRegistry::new(Duration::from_secs(5));
+    reg.register(Arc::new(RecordingHook::new(
+        "injector",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::InjectMessages {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "summary".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+        }],
+    )));
+    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emit = make_emit(Arc::clone(&sink));
+    let ctx = vec![ChatMessage {
+        role: ChatRole::System,
+        content: "sys".into(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: None,
+    }];
+    let result = reg
+        .run(
+            context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
+            path(),
+            &mut emit,
+        )
+        .await;
+    match result {
+        HookResult::Inject { messages } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, "summary");
+        }
+        _ => panic!("expected Inject, got {:?}", result),
+    }
+}
+
+#[tokio::test]
+async fn context_ready_replace_last_wins() {
+    let mut reg = HookRegistry::new(Duration::from_secs(5));
+    reg.register(Arc::new(RecordingHook::new(
+        "h1",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::ReplaceContext {
+            messages: vec![ChatMessage {
+                role: ChatRole::System,
+                content: "first".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+        }],
+    )));
+    reg.register(Arc::new(RecordingHook::new(
+        "h2",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::ReplaceContext {
+            messages: vec![ChatMessage {
+                role: ChatRole::System,
+                content: "second".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+        }],
+    )));
+    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emit = make_emit(Arc::clone(&sink));
+    let ctx = vec![];
+    let result = reg
+        .run(
+            context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
+            path(),
+            &mut emit,
+        )
+        .await;
+    match result {
+        HookResult::ReplaceContext { hook_id, messages } => {
+            assert_eq!(hook_id, "h2");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, "second");
+        }
+        _ => panic!("expected ReplaceContext, got {:?}", result),
+    }
+}
+
+#[tokio::test]
+async fn context_ready_replace_drops_concurrent_inject() {
+    let mut reg = HookRegistry::new(Duration::from_secs(5));
+    reg.register(Arc::new(RecordingHook::new(
+        "injector",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::InjectMessages {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "a".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+        }],
+    )));
+    reg.register(Arc::new(RecordingHook::new(
+        "replacer",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::ReplaceContext {
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: "b1".into(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "b2".into(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+            ],
+        }],
+    )));
+    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emit = make_emit(Arc::clone(&sink));
+    let ctx = vec![];
+    let result = reg
+        .run(
+            context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
+            path(),
+            &mut emit,
+        )
+        .await;
+    match result {
+        HookResult::ReplaceContext { hook_id, messages } => {
+            assert_eq!(hook_id, "replacer");
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].content, "b1");
+            assert_eq!(messages[1].content, "b2");
+        }
+        HookResult::Inject { .. } => panic!("ReplaceContext should win over Inject"),
+        _ => panic!("expected ReplaceContext, got {:?}", result),
+    }
+}
+
+#[tokio::test]
+async fn context_ready_block_bails() {
+    let mut reg = HookRegistry::new(Duration::from_secs(5));
+    reg.register(Arc::new(RecordingHook::new(
+        "blocker",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::Block {
+            reason: "context too large".into(),
+        }],
+    )));
+    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emit = make_emit(Arc::clone(&sink));
+    let ctx = vec![];
+    let result = reg
+        .run(
+            context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
+            path(),
+            &mut emit,
+        )
+        .await;
+    assert_eq!(
+        result,
+        HookResult::Block {
+            hook_id: "blocker".into(),
+            reason: "context too large".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn context_ready_noop_returns_continue() {
+    let mut reg = HookRegistry::new(Duration::from_secs(5));
+    reg.register(Arc::new(RecordingHook::new(
+        "noop",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::NoOp],
+    )));
+    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emit = make_emit(Arc::clone(&sink));
+    let ctx = vec![];
+    let result = reg
+        .run(
+            context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
+            path(),
+            &mut emit,
+        )
+        .await;
+    assert_eq!(result, HookResult::Continue);
 }
