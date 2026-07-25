@@ -364,6 +364,10 @@ fn default_timeout() -> u64 { 5 }
 
 放在 `crates/parrot-daemon/src/hooks/`：
 
+> **注：已迁移**——内置 hook 实现已移至独立 `crates/parrot-hooks/` crate，daemon 的 `src/hooks/` 模块已删除。
+> `build_registry` 现由 `parrot_hooks::build_registry` 提供。`shell_denylist` hook 已接管原
+> `SandboxConfig.denylist` / `ShellExecTool.denylist` 的职责，工具层 denylist 字段已移除。
+
 - `dangerous_command_blocker.rs`：`tool_call` hook，对工具名 `shell_exec`/`bash`/`shell` 的 `arguments.command` 做正则黑名单匹配（教学示例 pattern：`rm\s+-rf\s+/`、`/\b(sh|bash|zsh)\s+-c.*\|\s*(sh|bash|zsh)\b/` 即 reverse shell 形态、`chmod\s+777\s+/`、`:\(\)\{\s*:\|:&\s*\};:` 即 fork bomb）。命中返回 `Block{reason: "dangerous command: <pattern>"}`。与现有 `ToolsConfig.sandbox.denylist` 互补（hook 是二级 cmd-pattern 防御层，工具层 denylist 是一级"工具内白名单"）。
 - `redact_secrets.rs`：`tool_result` hook，对工具名 `read`/`shell_exec` 的 `result.content` 做 secret pattern 替换为 `[REDACTED]`（pattern：AKIA/`ghp_...`/`sk-ant-...` 之类的 well-known key prefix）。返回 `ReplaceResult{content: redacted, is_error: false}`（不改 is_error）。展示 transform 能力。
 
@@ -382,10 +386,10 @@ fn default_timeout() -> u64 { 5 }
 | `crates/parrot-protocol/src/agent_event.rs` | `AgentEvent::HookFired` + `TurnStopReason::BlockedHook(String)` |
 | `crates/parrot-protocol/tests/roundtrip.rs` | `HookFired` / `BlockedHook` roundtrip case |
 | `crates/parrot-config/src/config.rs` | `HooksConfig` + `AppConfig.hooks` + default |
-| `crates/parrot-daemon/src/lib.rs` | `pub mod hooks;` |
-| `crates/parrot-daemon/src/hooks/mod.rs` | `build_registry(&HooksConfig) -> Arc<HookRegistry>` |
-| `crates/parrot-daemon/src/hooks/dangerous_command_blocker.rs` | impl Hook |
-| `crates/parrot-daemon/src/hooks/redact_secrets.rs` | impl Hook |
+| `crates/parrot-daemon/src/lib.rs` | `pub mod hooks;` **（已移除——改为依赖 `parrot-hooks` crate）** |
+| `crates/parrot-daemon/src/hooks/mod.rs` | `build_registry(&HooksConfig) -> Arc<HookRegistry>` **（已迁移至 `crates/parrot-hooks/src/lib.rs`）** |
+| `crates/parrot-daemon/src/hooks/dangerous_command_blocker.rs` | impl Hook **（已迁移至 `crates/parrot-hooks/src/dangerous_command_blocker.rs`）** |
+| `crates/parrot-daemon/src/hooks/redact_secrets.rs` | impl Hook **（已迁移至 `crates/parrot-hooks/src/redact_secrets.rs`）** |
 | `crates/parrot-daemon/src/runtime.rs` | 在 `run_with` 构造 `HookRegistry` 并注入 `SessionManager` |
 
 `bitflags` 和 `async_trait` parrot-core 已是依赖，直接复用。

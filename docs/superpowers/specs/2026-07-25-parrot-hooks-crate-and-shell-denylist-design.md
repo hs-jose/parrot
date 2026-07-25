@@ -1,5 +1,9 @@
 # Parrot Hooks Crate Refactor + `shell_denylist` Hook
 
+> **实现状态：已完成**（commits `50e1dc7`..`ca30fbb`）。`parrot-hooks` crate 已建立，
+> `shell_denylist` hook 已落地，`ShellExecTool.denylist` / `SandboxConfig.denylist` 已移除，
+> 默认 `enabled = ["shell_denylist", "dangerous_command_blocker"]`。
+
 > 地基重构：把 daemon 内置 hook 实现抽到独立 `parrot-hooks` crate，每个 hook 自带 typed config；
 > 第一个落地的新 hook `shell_denylist` 接管 `ShellExecTool` 的 denylist 职责，并把
 > `dangerous_command_blocker` 纳入默认 `enabled`。
