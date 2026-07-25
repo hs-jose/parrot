@@ -4,23 +4,11 @@ use parrot_core::tool::{Tool, ToolContext, ToolOutput};
 use serde_json::Value;
 use std::process::Stdio;
 
-pub struct ShellExecTool {
-    denylist: Vec<String>,
-}
+pub struct ShellExecTool;
 
 impl ShellExecTool {
-    pub fn new(_working_dir: std::path::PathBuf, denylist: Vec<String>) -> Self {
-        Self { denylist }
-    }
-
-    fn is_denied(&self, command: &str) -> bool {
-        let command_lower = command.to_lowercase();
-        for pattern in &self.denylist {
-            if command_lower.contains(&pattern.to_lowercase()) {
-                return true;
-            }
-        }
-        false
+    pub fn new(_working_dir: std::path::PathBuf) -> Self {
+        Self
     }
 }
 
@@ -59,14 +47,6 @@ impl Tool for ShellExecTool {
                 tool: "shell_exec".to_string(),
                 message: "Missing 'command' argument".to_string(),
             })?;
-
-        // Check denylist
-        if self.is_denied(command) {
-            return Ok(ToolOutput {
-                content: format!("Command denied by sandbox policy: {}", command),
-                is_error: true,
-            });
-        }
 
         let working_dir = arguments
             .get("working_dir")
