@@ -1,5 +1,4 @@
 use crate::auth::Auth;
-use crate::hooks::build_registry;
 use crate::session_store::SessionStore;
 use parrot_config::AppConfig;
 use parrot_core::confirm::ConfirmRouter;
@@ -8,6 +7,7 @@ use parrot_core::provider::ProviderRegistry;
 use parrot_core::session::{ConfirmConfig, SessionCmd, SessionManager};
 use parrot_core::tool::ToolRegistry;
 use parrot_core::types::GenerateConfig;
+use parrot_hooks::build_registry;
 use parrot_protocol::agent_event::{AgentEvent, PersistedAgentEvent};
 use parrot_protocol::types::{
     ModelInfo as ProtocolModelInfo, SessionMeta as ProtocolSessionMeta, ToolDefinitionWire,

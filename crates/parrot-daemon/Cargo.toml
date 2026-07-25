@@ -10,6 +10,7 @@ parrot-config    = { path = "../parrot-config" }
 parrot-transport = { path = "../parrot-transport" }
 parrot-providers = { path = "../parrot-providers" }
 parrot-tools     = { path = "../parrot-tools" }
+parrot-hooks     = { path = "../parrot-hooks" }
 async-trait     = { workspace = true }
 tokio            = { workspace = true }
 serde            = { workspace = true }
@@ -18,7 +19,6 @@ tracing          = { workspace = true }
 uuid             = { workspace = true }
 chrono           = { workspace = true }
 rand             = { workspace = true }
-regex            = { workspace = true }
 hex              = { workspace = true }
 
 [dev-dependencies]
