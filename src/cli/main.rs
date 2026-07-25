@@ -207,6 +207,9 @@ fn print_history(events: &[PersistedAgentEvent]) {
             AgentEvent::ReplayIntegrityWarning { issue, .. } => {
                 format!("ReplayIntegrityWarning({:?})", issue.kind)
             }
+            AgentEvent::HookFired { hook_id, .. } => {
+                format!("HookFired({})", hook_id)
+            }
         };
         println!("#{:-4} {} {}", e.seq, e.ts.format("%H:%M:%S"), kind);
     }
