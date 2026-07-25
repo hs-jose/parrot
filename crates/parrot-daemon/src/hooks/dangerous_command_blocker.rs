@@ -9,7 +9,7 @@ static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
 fn patterns() -> &'static [(Regex, &'static str)] {
     PATTERNS.get_or_init(|| {
         vec![
-            (Regex::new(r"rm\s+-rf\s+/(\s|$)").unwrap(), "rm -rf /"),
+            (Regex::new(r"rm\s+-rf\s+/").unwrap(), "rm -rf /"),
             (
                 Regex::new(r":\(\)\s*\{\s*:\|:&\s*\};\s*:").unwrap(),
                 "fork bomb",
@@ -122,5 +122,26 @@ mod tests {
         };
         let out = h.dispatch(ev, &ctx()).await.unwrap();
         assert!(matches!(out, HookResult::NoOp));
+    }
+
+    #[tokio::test]
+    async fn blocks_rm_rf_system_dir() {
+        let h = DangerousCommandBlocker;
+        for cmd in ["rm -rf /etc", "rm -rf /var", "rm -rf /usr/local"] {
+            let args = serde_json::json!({"command": cmd});
+            let ev = HookEvent::ToolCall {
+                session_id: Uuid::nil(),
+                turn_id: Uuid::nil(),
+                parent_message_id: Uuid::nil(),
+                tool_call_id: "x",
+                tool_name: "shell_exec",
+                arguments: &args,
+            };
+            let out = h.dispatch(ev, &ctx()).await.unwrap();
+            assert!(
+                matches!(out, HookResult::Block { .. }),
+                "{cmd} must be blocked"
+            );
+        }
     }
 }

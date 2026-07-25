@@ -68,10 +68,35 @@ pub enum HookResult {
     ReplaceResult { content: String, is_error: bool },
 }
 
+/// Outcome of a hook dispatch when it failed (timeout or returned `Err`).
+/// Used to drive the `error`/`timeout` `HookFired` emissions without
+/// collapsing the `AgentError` detail to a string literal.
+#[derive(Debug)]
+pub enum HookFailure {
+    Timeout,
+    Error(String),
+}
+
 pub struct HookCtx<'a> {
     pub session_id: Uuid,
     pub working_dir: &'a std::path::Path,
     pub timeout: Duration,
+}
+
+impl<'a> HookEvent<'a> {
+    /// Lowercase ascii kind name matching the wire `event_kind` field of
+    /// `AgentEvent::HookFired`. Single source of truth for both engine and
+    /// registry emit paths.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            HookEvent::AgentStart { .. } => "agent_start",
+            HookEvent::AgentEnd { .. } => "agent_end",
+            HookEvent::TurnStart { .. } => "turn_start",
+            HookEvent::ToolCall { .. } => "tool_call",
+            HookEvent::ToolExecutionStart { .. } => "tool_execution_start",
+            HookEvent::ToolResult { .. } => "tool_result",
+        }
+    }
 }
 
 #[async_trait]
@@ -112,6 +137,37 @@ pub struct HookRegistry {
     timeout: Duration,
 }
 
+/// Drive the non-Block `HookFired` emission from inside the registry's
+/// dispatch helpers. `Block` is intentionally NOT emitted here — the engine
+/// computes Block emission itself (it knows the surrounding context, e.g.
+/// the matching `TurnEnd{BlockedHook}` / `ToolEnd{blocked: ...}` follows).
+/// Caller passes `&outcome` so non-moved arms can read fields.
+fn fire_non_block(
+    emit: &mut impl FnMut(&str, &str, &str, Option<String>),
+    hook_id: &str,
+    event_kind: &str,
+    outcome: &Result<HookResult, HookFailure>,
+) {
+    match outcome {
+        Ok(HookResult::NoOp) => emit(hook_id, event_kind, "noop", None),
+        Ok(HookResult::InjectMessages { messages }) => emit(
+            hook_id,
+            event_kind,
+            "inject_messages",
+            Some(format!("{} messages", messages.len())),
+        ),
+        Ok(HookResult::ReplaceResult { content, is_error }) => emit(
+            hook_id,
+            event_kind,
+            "replace_result",
+            Some(format!("{} bytes, is_error={}", content.len(), is_error)),
+        ),
+        Ok(HookResult::Block { .. }) => {}
+        Err(HookFailure::Timeout) => emit(hook_id, event_kind, "timeout", None),
+        Err(HookFailure::Error(detail)) => emit(hook_id, event_kind, "error", Some(detail.clone())),
+    }
+}
+
 impl HookRegistry {
     pub fn new(timeout: Duration) -> Self {
         Self {
@@ -141,11 +197,11 @@ impl HookRegistry {
         hook: &Arc<dyn Hook>,
         event: HookEvent<'_>,
         ctx: &HookCtx<'_>,
-    ) -> Result<HookResult, &'static str> {
+    ) -> Result<HookResult, HookFailure> {
         match tokio::time::timeout(self.timeout, hook.dispatch(event, ctx)).await {
             Ok(Ok(o)) => Ok(o),
-            Ok(Err(_)) => Err("error"),
-            Err(_) => Err("timeout"),
+            Ok(Err(e)) => Err(HookFailure::Error(e.to_string())),
+            Err(_) => Err(HookFailure::Timeout),
         }
     }
 
@@ -157,7 +213,13 @@ impl HookRegistry {
             .collect()
     }
 
-    pub async fn on_agent_start(&self, session_id: Uuid, model: &str, provider: &str) {
+    pub async fn on_agent_start(
+        &self,
+        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
+        session_id: Uuid,
+        model: &str,
+        provider: &str,
+    ) {
         let hs = self.interested(HookPoints::AGENT_START);
         if hs.is_empty() {
             return;
@@ -169,11 +231,17 @@ impl HookRegistry {
                 model,
                 provider,
             };
-            let _ = self.bounded(&h, ev, &ctx).await;
+            let kind = ev.kind();
+            let outcome = self.bounded(&h, ev, &ctx).await;
+            fire_non_block(emit, h.id(), kind, &outcome);
         }
     }
 
-    pub async fn on_agent_end(&self, session_id: Uuid) {
+    pub async fn on_agent_end(
+        &self,
+        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
+        session_id: Uuid,
+    ) {
         let hs = self.interested(HookPoints::AGENT_END);
         if hs.is_empty() {
             return;
@@ -181,12 +249,15 @@ impl HookRegistry {
         let ctx = self.mk_ctx(session_id, std::path::Path::new("."));
         for h in hs {
             let ev = HookEvent::AgentEnd { session_id };
-            let _ = self.bounded(&h, ev, &ctx).await;
+            let kind = ev.kind();
+            let outcome = self.bounded(&h, ev, &ctx).await;
+            fire_non_block(emit, h.id(), kind, &outcome);
         }
     }
 
     pub async fn on_tool_execution_start(
         &self,
+        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
         session_id: Uuid,
         turn_id: Uuid,
         tool_call_id: &str,
@@ -206,12 +277,15 @@ impl HookRegistry {
                 tool_name,
                 arguments,
             };
-            let _ = self.bounded(&h, ev, &ctx).await;
+            let kind = ev.kind();
+            let outcome = self.bounded(&h, ev, &ctx).await;
+            fire_non_block(emit, h.id(), kind, &outcome);
         }
     }
 
     pub async fn on_turn_start(
         &self,
+        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
         session_id: Uuid,
         turn_id: Uuid,
         user_message: &str,
@@ -230,7 +304,10 @@ impl HookRegistry {
                 turn_id,
                 user_message,
             };
-            match self.bounded(&h, ev, &ctx).await {
+            let kind = ev.kind();
+            let outcome = self.bounded(&h, ev, &ctx).await;
+            fire_non_block(emit, h.id(), kind, &outcome);
+            match outcome {
                 Ok(HookResult::Block { reason }) => {
                     return TurnStartDecision::Blocked {
                         hook_id: h.id().to_string(),
@@ -246,8 +323,10 @@ impl HookRegistry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn on_tool_call(
         &self,
+        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
         session_id: Uuid,
         turn_id: Uuid,
         parent_message_id: Uuid,
@@ -269,7 +348,10 @@ impl HookRegistry {
                 tool_name,
                 arguments,
             };
-            if let Ok(HookResult::Block { reason }) = self.bounded(&h, ev, &ctx).await {
+            let kind = ev.kind();
+            let outcome = self.bounded(&h, ev, &ctx).await;
+            fire_non_block(emit, h.id(), kind, &outcome);
+            if let Ok(HookResult::Block { reason }) = outcome {
                 return ToolCallDecision::Blocked {
                     hook_id: h.id().to_string(),
                     reason,
@@ -279,8 +361,10 @@ impl HookRegistry {
         ToolCallDecision::Continue
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn on_tool_result(
         &self,
+        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
         session_id: Uuid,
         turn_id: Uuid,
         tool_call_id: &str,
@@ -305,9 +389,10 @@ impl HookRegistry {
                 input,
                 result: &current,
             };
-            if let Ok(HookResult::ReplaceResult { content, is_error }) =
-                self.bounded(&h, ev, &ctx).await
-            {
+            let kind = ev.kind();
+            let outcome = self.bounded(&h, ev, &ctx).await;
+            fire_non_block(emit, h.id(), kind, &outcome);
+            if let Ok(HookResult::ReplaceResult { content, is_error }) = outcome {
                 current = ToolOutput { content, is_error };
                 changed = true;
                 last_hook_id = h.id().to_string();
@@ -324,9 +409,6 @@ impl HookRegistry {
         }
     }
 }
-
-#[derive(Default)]
-pub struct NoHooks;
 
 impl HookRegistry {
     pub fn empty() -> Self {
