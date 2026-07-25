@@ -1,4 +1,5 @@
 use crate::auth::Auth;
+use crate::hooks::build_registry;
 use crate::session_store::SessionStore;
 use parrot_config::AppConfig;
 use parrot_core::confirm::ConfirmRouter;
@@ -89,6 +90,8 @@ pub async fn run_with_confirm_timeout(
         router: Some(Arc::clone(&confirm_router)),
     };
 
+    let hook_registry = build_registry(&config.hooks);
+
     let session_manager = Arc::new(RwLock::new(
         SessionManager::new(
             Arc::clone(&tool_registry),
@@ -97,7 +100,8 @@ pub async fn run_with_confirm_timeout(
             sessions_dir,
             working_dir,
         )
-        .with_confirm_config(confirm_config),
+        .with_confirm_config(confirm_config)
+        .with_hooks(hook_registry),
     ));
     // Wrap once in an Arc so each spawned handler can share the daemon's
     // current default config without per-connection cloning.
