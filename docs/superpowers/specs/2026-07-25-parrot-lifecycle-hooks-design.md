@@ -11,7 +11,7 @@ Parrot 已有清晰的三层生命周期事件（`AgentStart/TurnStart/MessageSt
 
 ### 调研要点
 
-- **Pi Agent（Rust, `Dicklesworthstone/pi_agent_rust`）**：`src/extension_events.rs` 定义 `ExtensionEvent` tagged enum（`startup/agent_start/agent_end/turn_start/turn_end/tool_call/tool_result/session_before_*/input`），序列化 JSON 派发到 JS 扩展（内嵌 QuickJS），反序列化得到类型化 outcome。`tests/ext_conformance/reports/lifecycle_hooks/lifecycle_hook_parity_matrix.json` 把 hook 模式归为 `fire_and_forget / transform / first_result / pre_tool / post_tool / cancellable`。
+- **Pi Agent（Rust, `Dicklesworthstone/pi_agent_rust`）**：`src/extension_events.rs` 定义 `ExtensionEvent` tagged enum（`startup/agent_start/agent_end/turn_start/turn_end/tool_call/tool_result/session_before_*/input`），序列化 JSON 派发到 JS 扩展（内嵌 QuickJS），反序列化得到类型化 result。`tests/ext_conformance/reports/lifecycle_hooks/lifecycle_hook_parity_matrix.json` 把 hook 模式归为 `fire_and_forget / transform / first_result / pre_tool / post_tool / cancellable`。
 - **OpenCode**：JS/TS 插件通过具名 hook 字符串挂载（`tool.execute.before/after`、`shell.env`、`experimental.session.compacting`、`session.*` / `message.*` / `file.*` 事件），通过 `output` 对象副作用改写参数。
 - 两者都把"hook 名"做成有模式的字符串，hook 实现以嵌入脚本为载体。Parrot 不走嵌入脚本这一步（首轮），详见 §3。
 
@@ -46,7 +46,7 @@ Parrot 的差异化优势是"Rust 原生、启动快、trait-based DI、core zer
                           │  │  - Vec<Arc<dyn Hook>> (注册顺序)     │   │
                           │  │  - on_<point>() helper（三策略）    │   │
                           │  └──────────────────────────────────────┘   │
-                          │  + Hook / HookEvent / HookOutcome / HookCtx │
+                          │  + Hook / HookEvent / HookResult / HookCtx │
                           └────────────────────────────────────────────┘
                                             ▲ impl
                           ┌─────────────────┴───────────────────────────┐
@@ -103,11 +103,11 @@ pub trait Hook: Send + Sync {
         &self,
         event: HookEvent<'_>,
         ctx: &HookCtx<'_>,
-    ) -> Result<HookOutcome, AgentError>;
+    ) -> Result<HookResult, AgentError>;
 }
 ```
 
-### 5.2 `HookEvent` 与 `HookOutcome`
+### 5.2 `HookEvent` 与 `HookResult`
 
 跟现有 `AgentEvent` / `MessageDeltaPayload` 同风格：`#[serde(tag = "type")] snake_case`。每个变体字段就是该点能"看见+改写"的数据。
 
@@ -145,7 +145,7 @@ pub enum HookEvent<'a> {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HookOutcome {
+pub enum HookResult {
     /// fire-and-forget / waterfall 中无修改时的中性结果
     NoOp,
     /// turn_start 专用：累加进 context（不影响 assistant/user 消息，仅作 system-style 注入）
@@ -166,7 +166,7 @@ pub struct HookCtx<'a> {
 }
 ```
 
-`HookOutcome` 公开序列化字段直接进 `HookFired` wire 事件的 `summary`，方便客户端 UI 渲染。
+`HookResult` 公开序列化字段直接进 `HookFired` wire 事件的 `summary`，方便客户端 UI 渲染。
 
 ### 5.3 `HookRegistry`
 
@@ -184,20 +184,20 @@ impl HookRegistry {
     /// 每个 helper 内部 already filter handlers by HookPoints mask。
     pub async fn on_agent_start(&self, ...) { /* fire-and-forget */ }
     pub async fn on_agent_end(&self, ...)   { /* fire-and-forget */ }
-    pub async fn on_turn_start(&self, ...) -> TurnStartOutcome { /* waterfall + bail on Block */ }
-    pub async fn on_tool_call(&self, ...) -> ToolCallOutcome   { /* bail */ }
+    pub async fn on_turn_start(&self, ...) -> TurnStartDecision { /* waterfall + bail on Block */ }
+    pub async fn on_tool_call(&self, ...) -> ToolCallDecision   { /* bail */ }
     pub async fn on_tool_execution_start(&self, ...)            { /* fire-and-forget */ }
-    pub async fn on_tool_result(&self, ...) -> ToolResultOutcome { /* waterfall */ }
+    pub async fn on_tool_result(&self, ...) -> ToolResultDecision { /* waterfall */ }
 }
 ```
 
-`TurnStartOutcome` / `ToolCallOutcome` / `ToolResultOutcome` 是 engine 用的简化 enum（不是 wire 类型），表达"经过 hook 链后的最终决策"。
+`TurnStartDecision` / `ToolCallDecision` / `ToolResultDecision` 是 engine 用的简化 enum（不是 wire 类型），表达"经过 hook 链后的最终决策"。
 
 ## 6. 六个扩展点
 
 按 engine.rs 现有生命周期边界接入：
 
-| # | Hook Point | 接入位置 (engine.rs) | 策略 | Allowed Outcome | 短路行为 |
+| # | Hook Point | 接入位置 (engine.rs) | 策略 | Allowed result | 短路行为 |
 |---|---|---|---|---|---|
 | 1 | `agent_start` | `run()`：emit `AgentEvent::AgentStart` 之后、主循环之前 | fire-and-forget | `NoOp` | — |
 | 2 | `agent_end` | `AgentEndGuard::fire_and_drop`：emit `AgentEvent::AgentEnd` 之前 | fire-and-forget | `NoOp` | — |
@@ -213,7 +213,7 @@ impl HookRegistry {
 ## 7. 三种执行策略
 
 - **fire-and-forget** (`agent_start`, `agent_end`, `tool_execution_start`)
-  - 纯通知，hook 返回 outcome 被忽略（但因 §8 的可观测性，仍会触发 `HookFired` wire 事件）
+  - 纯通知，hook 返回 result 被忽略（但因 §8 的可观测性，仍会触发 `HookFired` wire 事件）
   - 适用于埋点、UI 更新、`tracing::info!`、外部 metric push（不过这些 IO 是 hook 自己的事）
   - 多 handler 全部执行，无短路
 
@@ -225,7 +225,7 @@ impl HookRegistry {
   - `tool_result`：上一个 handler 的 `ReplaceResult` 后，下一个 handler 的 `HookEvent::ToolResult.result` 看到的是替换后的 result（registry 内部维护"滚动 result"，每 handler 后更新）
   - 不短路
 
-- **bail** (`tool_call`，以及 `turn_start` 内的 `Block` outcome 嵌入)
+- **bail** (`tool_call`，以及 `turn_start` 内的 `Block` result 嵌入)
   - 任一 handler 返回 `Block{reason}` → 立即结束此链
   - 后续未跑的 handler 不执行（避免被 block 后又有副作用）
   - registry 收集所有已收到的 reason 合并展示（log warn 多个 reason）
@@ -236,12 +236,12 @@ impl HookRegistry {
 
 - 每个 dispatch 调用包一层 `tokio::time::timeout(timeout, hook.dispatch(...))`
 - `timeout` 来自 `HooksConfig.timeout`，默认 5s
-- **超时**：tracing::warn、fail-open（视作 `NoOp`）、不再参与 chain、仍 emit `HookFired{outcome_kind: "timeout"}`
+- **超时**：tracing::warn、fail-open（视作 `NoOp`）、不再参与 chain、仍 emit `HookFired{result_kind: "timeout"}`
 - 同一 hook 在 bail 点超时：fail-open 使其不产生 `Block`，但允许短路上游已有的 `Block`（已有的 Block 不会因下游超时被擦除）
 
 ### 8.2 Error
 
-- hook `dispatch` 返回 `Err(AgentError)`：log::warn、emit `HookFired{outcome_kind: "error", summary: Some(err.to_string())}`、视作 NoOp
+- hook `dispatch` 返回 `Err(AgentError)`：log::warn、emit `HookFired{result_kind: "error", summary: Some(err.to_string())}`、视作 NoOp
 - 不中断 agent 主流程（仅观察/告知客户端），不允许 hook 通过返回 Err 来强行中止 turn；想中止必须显式返回 `Block`
 - bail 点：下游已 Block 不会被擦除，但当前出错 handler 的 NoOp 处理会继续 chain
 
@@ -266,7 +266,7 @@ pub enum AgentEvent {
         session_id: SessionId,
         hook_id: String,         // Hook::id()
         event_kind: String,      // "tool_call" / "turn_start" / ...
-        outcome_kind: String,    // "noop" / "block" / "inject_messages" / "replace_result" / "timeout" / "error"
+        result_kind: String,    // "noop" / "block" / "inject_messages" / "replace_result" / "timeout" / "error"
         #[serde(default)]
         summary: Option<String>,
     },
@@ -339,7 +339,7 @@ fn default_timeout() -> u64 { 5 }
 
 | 位置 | 新增内容 |
 |---|---|
-| `crates/parrot-core/src/hooks.rs` | `Hook` trait / `HookRegistry` / `HookEvent` / `HookOutcome` / `HookCtx` / `HookPoints` bitflags / outcome enums |
+| `crates/parrot-core/src/hooks.rs` | `Hook` trait / `HookRegistry` / `HookEvent` / `HookResult` / `HookCtx` / `HookPoints` bitflags / result enums |
 | `crates/parrot-core/src/lib.rs` | `pub mod hooks; pub use hooks::{Hook, HookRegistry, ...};` |
 | `crates/parrot-core/src/engine.rs` | `ReActEngine` 加 `hooks: Arc<HookRegistry>` 字段 + `with_hooks` builder；`run/handle_turn/run_one_tool` 插 6 个 dispatch 点；新增 `TurnStopReason::BlockedHook(String)` 到 parrot-protocol |
 | `crates/parrot-core/src/session.rs` | `SessionManager` 加 `hooks: Arc<HookRegistry>` + `with_hooks` + 在 `spawn_session`/`create_resumed_session` 传给 engine |
@@ -367,9 +367,9 @@ self.hooks.on_agent_start(&ctx, &agent_start).await;
 // Chat 收到后
 match cmd {
     Some(SessionCmd::Chat { message }) => {
-        let turn_outcome = self.hooks.on_turn_start(&ctx, session_id, &message).await;
-        match turn_outcome {
-            TurnStartOutcome::Blocked(reason) => {
+        let turn_decision = self.hooks.on_turn_start(&ctx, session_id, &message).await;
+        match turn_decision {
+            TurnStartDecision::Blocked(reason) => {
                 // 不 emit TurnStart，直接 emit TurnEnd{BlockedHook}，跳过 handle_turn
                 let _ = event_tx.send(AgentEvent::TurnEnd {
                     session_id, turn_id,
@@ -378,7 +378,7 @@ match cmd {
                 }).await.ok();
                 continue;
             }
-            TurnStartOutcome::Continue { injected_messages } => {
+            TurnStartDecision::Continue { injected_messages } => {
                 context.extend(injected_messages);
             }
         }
@@ -389,8 +389,8 @@ match cmd {
 }
 
 // run_one_tool() ToolStart 之后、confirm 之前
-let tool_outcome = self.hooks.on_tool_call(&ctx, tool_call_id, tool_name, args).await;
-if let ToolCallOutcome::Blocked(reason) = tool_outcome {
+let tool_decision = self.hooks.on_tool_call(&ctx, tool_call_id, tool_name, args).await;
+if let ToolCallDecision::Blocked(reason) = tool_decision {
     // 复用 run_one_tool 末尾的 reject 路径：push Tool msg + emit ToolEnd + return Ok
     // 等价于 confirm reject，但用 reason 而非 "user rejected"
     return reject_tool(/* reason */);
@@ -418,15 +418,15 @@ async fn fire_and_drop(mut self, _tx, event_log, ctx) {
 
 ### 14.1 单元（crates/parrot-core/tests/hooks_test.rs，独立集成测试）
 
-造 `RecordingHook`（用 `Mutex<Vec<RecordedEvent>>` 捕获调用顺序 + 可注入返回 outcome）覆盖：
+造 `RecordingHook`（用 `Mutex<Vec<RecordedEvent>>` 捕获调用顺序 + 可注入返回 result）覆盖：
 
-- `tool_call` hook 返回 `Block`：`RecordingHook::on_tool_call` 记录；调用方断言工具真正 `execute_tool` 未被调；context 里 `Tool{content="blocked: ..."}` 进去；`ToolEnd.result.is_error == true`；wire 收到 `HookFired{outcome_kind: "block"}`
+- `tool_call` hook 返回 `Block`：`RecordingHook::on_tool_call` 记录；调用方断言工具真正 `execute_tool` 未被调；context 里 `Tool{content="blocked: ..."}` 进去；`ToolEnd.result.is_error == true`；wire 收到 `HookFired{result_kind: "block"}`
 - `tool_result` 多 handler（两个 `RecordingHook` 都返回 `ReplaceResult`）：链式 last-wins，最后 ToolEnd 是第二个的内容；前者 `HookEvent::ToolResult.result` 是原始、后者是前者 replaced 后的值
 - `turn_start` 返回 `InjectMessages`：context 在 `TurnStart` 之后多了注入消息；handle_turn 被调
 - `turn_start` 返回 `Block(reason)`：handle_turn 不被调，TurnEnd{BlockedHook}
-- `agent_start` / `agent_end` / `tool_execution_start` fire-and-forget：handler 被调但 outcome 忽略
-- timeout 模拟：rotein hook dispatch future sleep 10s（配置 100ms）→ outcome 视作 NoOp，HookFired{outcome_kind="timeout"} 仍发，agent 继续
-- error 模拟：hook 返回 `Err(AgentError::...)` → 同上 NoOp + HookFired{outcome_kind="error"}
+- `agent_start` / `agent_end` / `tool_execution_start` fire-and-forget：handler 被调但 result 忽略
+- timeout 模拟：rotein hook dispatch future sleep 10s（配置 100ms）→ result 视作 NoOp，HookFired{result_kind="timeout"} 仍发，agent 继续
+- error 模拟：hook 返回 `Err(AgentError::...)` → 同上 NoOp + HookFired{result_kind="error"}
 - 空注册表：所有 dispatch helper 走快路径不产生 HookFired
 
 ### 14.2 协议（crates/parrot-protocol/tests/roundtrip.rs）
@@ -461,7 +461,7 @@ async fn fire_and_drop(mut self, _tx, event_log, ctx) {
 
 ## 17. 风险与权衡
 
-- ** trait + enum dispatch 的代价**：每个 hook impl 必须 `match event { ... }` 处理所有变体（不关心的用 `_ => NoOp`）。换来注册简单（一个 `Vec<Arc<dyn Hook>>`）+ outcome 类型统一。可接受，且 `supported()` 让不关心的 handler 直接跳过 await。
+- ** trait + enum dispatch 的代价**：每个 hook impl 必须 `match event { ... }` 处理所有变体（不关心的用 `_ => NoOp`）。换来注册简单（一个 `Vec<Arc<dyn Hook>>`）+ result 类型统一。可接受，且 `supported()` 让不关心的 handler 直接跳过 await。
 - **Resume 不可重放 hook 副作用**：本设计靠"hook 改动的最终结果已落盘"保证一致性。若未来加入"hook 修改了 user_message 本身"这种 hook（不在本轮），需重新审视。
-- **Hook 慢调阻塞**：贴默认 5s + fail-open。配置过严的 timeout 可能导致 hook 被悄悄忽略，靠 `HookFired{outcome_kind:"timeout"}` 客户端可视化追踪。
+- **Hook 慢调阻塞**：贴默认 5s + fail-open。配置过严的 timeout 可能导致 hook 被悄悄忽略，靠 `HookFired{result_kind:"timeout"}` 客户端可视化追踪。
 - **`turn_start` 的 InjectMessages 简化决定**：不向下传递累加结果，避免 water 后连发"累加倍增"问题。代价是下游 hook 看不到上家的注入。这是合理简化（hook 一般不应观察 hook 之间副作用）。
