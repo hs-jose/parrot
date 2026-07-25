@@ -43,6 +43,7 @@ struct RecordingHook {
     points: HookPoints,
     outcomes: Mutex<Vec<HookResult>>,
     calls: Mutex<Vec<&'static str>>,
+    order_log: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl RecordingHook {
@@ -52,6 +53,21 @@ impl RecordingHook {
             points,
             outcomes: Mutex::new(outcomes),
             calls: Mutex::new(Vec::new()),
+            order_log: None,
+        }
+    }
+    fn with_order_log(
+        id: &'static str,
+        points: HookPoints,
+        outcomes: Vec<HookResult>,
+        order_log: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            id,
+            points,
+            outcomes: Mutex::new(outcomes),
+            calls: Mutex::new(Vec::new()),
+            order_log: Some(order_log),
         }
     }
     fn pop(&self) -> HookResult {
@@ -88,25 +104,33 @@ impl Hook for RecordingHook {
             HookEvent::ToolResult { .. } => "tool_result",
         };
         self.calls.lock().unwrap().push(name);
+        if let Some(log) = &self.order_log {
+            log.lock().unwrap().push(self.id.to_string());
+        }
         Ok(self.pop())
     }
 }
 
 #[tokio::test]
 async fn tool_call_bail_on_first_block() {
+    let order_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut reg = HookRegistry::new(Duration::from_secs(5));
-    reg.register(Arc::new(RecordingHook::new(
+    reg.register(Arc::new(RecordingHook::with_order_log(
         "a",
         HookPoints::TOOL_CALL,
         vec![HookResult::Block {
             reason: "nope".into(),
         }],
+        Arc::clone(&order_log),
     )));
-    reg.register(Arc::new(RecordingHook::new(
+    let b = Arc::new(RecordingHook::with_order_log(
         "b",
         HookPoints::TOOL_CALL,
         vec![HookResult::NoOp],
-    )));
+        Arc::clone(&order_log),
+    ));
+    let b_weak = Arc::clone(&b);
+    reg.register(b);
     let out = reg
         .on_tool_call(
             Uuid::new_v4(),
@@ -124,26 +148,32 @@ async fn tool_call_bail_on_first_block() {
             reason: "nope".into()
         }
     );
+    // b never ran: bail short-circuited before reaching it.
+    assert!(b_weak.calls().is_empty());
+    assert_eq!(order_log.lock().unwrap().as_slice(), ["a"]);
 }
 
 #[tokio::test]
 async fn tool_result_waterfall_last_wins() {
+    let order_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut reg = HookRegistry::new(Duration::from_secs(5));
-    let h1 = Arc::new(RecordingHook::new(
+    let h1 = Arc::new(RecordingHook::with_order_log(
         "a",
         HookPoints::TOOL_RESULT,
         vec![HookResult::ReplaceResult {
             content: "first".into(),
             is_error: false,
         }],
+        Arc::clone(&order_log),
     ));
-    let h2 = Arc::new(RecordingHook::new(
+    let h2 = Arc::new(RecordingHook::with_order_log(
         "b",
         HookPoints::TOOL_RESULT,
         vec![HookResult::ReplaceResult {
             content: "second".into(),
             is_error: true,
         }],
+        Arc::clone(&order_log),
     ));
     let h1_weak = Arc::clone(&h1);
     let h2_weak = Arc::clone(&h2);
@@ -173,6 +203,7 @@ async fn tool_result_waterfall_last_wins() {
     // h1 must have been called before h2 (ordering trace)
     assert_eq!(h1_weak.calls(), vec!["tool_result"]);
     assert_eq!(h2_weak.calls(), vec!["tool_result"]);
+    assert_eq!(order_log.lock().unwrap().as_slice(), ["a", "b"]);
 }
 
 #[tokio::test]
