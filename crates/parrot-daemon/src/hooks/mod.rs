@@ -30,6 +30,7 @@ mod tests {
         let cfg = HooksConfig {
             enabled: vec!["nonexistent".into()],
             timeout_seconds: 5,
+            configs: std::collections::HashMap::new(),
         };
         let reg = build_registry(&cfg);
         // No panic, just empty handlers (warn logged)
@@ -42,6 +43,7 @@ mod tests {
         let cfg = HooksConfig {
             enabled: vec!["dangerous_command_blocker".into(), "redact_secrets".into()],
             timeout_seconds: 5,
+            configs: std::collections::HashMap::new(),
         };
         let _reg = build_registry(&cfg);
     }

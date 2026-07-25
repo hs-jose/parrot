@@ -1,5 +1,6 @@
 use crate::error::ConfigError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +66,11 @@ pub struct HooksConfig {
     pub enabled: Vec<String>,
     #[serde(default = "default_hook_timeout")]
     pub timeout_seconds: u64,
+    /// Per-hook config subtables. Populated from `[hooks.<id>]` TOML tables
+    /// via `#[serde(flatten)]`. Each hook owns its typed config struct and
+    /// deserializes its entry from this map.
+    #[serde(default, flatten)]
+    pub configs: HashMap<String, toml::Value>,
 }
 
 impl Default for HooksConfig {
@@ -72,6 +78,7 @@ impl Default for HooksConfig {
         Self {
             enabled: Vec::new(),
             timeout_seconds: default_hook_timeout(),
+            configs: HashMap::new(),
         }
     }
 }
@@ -228,5 +235,91 @@ keep_recent_turns = 6
         let c: AppConfig = toml::from_str(toml).unwrap();
         assert_eq!(c.hooks.enabled, vec!["dangerous_command_blocker"]);
         assert_eq!(c.hooks.timeout_seconds, 3);
+    }
+
+    #[test]
+    fn hooks_parse_per_hook_configs() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+denylist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[hooks]
+enabled = ["shell_denylist", "redact_secrets"]
+timeout_seconds = 5
+
+[hooks.shell_denylist]
+patterns = ["rm -rf /", "sudo", "chmod 777"]
+
+[hooks.redact_secrets]
+extra_patterns = ["CUSTOM-\\d+"]
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.hooks.enabled, vec!["shell_denylist", "redact_secrets"]);
+        assert!(c.hooks.configs.contains_key("shell_denylist"));
+        assert!(c.hooks.configs.contains_key("redact_secrets"));
+    }
+
+    #[test]
+    fn hooks_missing_configs_defaults_empty() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+denylist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[hooks]
+enabled = ["dangerous_command_blocker"]
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert!(
+            c.hooks.configs.is_empty(),
+            "configs should be empty when no [hooks.<id>] subtables present"
+        );
     }
 }
