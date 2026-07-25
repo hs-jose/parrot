@@ -130,7 +130,6 @@ impl ReActEngine {
             event_log = event_log.with_start_seq(self.resume_seq_offset);
         }
 
-        // AgentStart — emitted before any turn.
         let agent_start = AgentEvent::AgentStart {
             session_id,
             model: self.config.model.clone(),
@@ -185,7 +184,6 @@ impl ReActEngine {
                         })
                         .await
                         .ok();
-                    // Persist TurnStart (lifecycle events are persistent).
                     let _ = event_log.append(AgentEvent::TurnStart {
                         session_id,
                         turn_id,
@@ -249,11 +247,10 @@ impl ReActEngine {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Top-level ReAct loop: stream an LLM message, push it to context, then
-    /// execute any tool calls the model requested; repeat until EndTurn / no
-    /// tool calls / MaxIterations. Abort (raised by any sub-step) propagates
-    /// as `AgentError::Aborted` so the caller (`run`) can emit
-    /// `TurnEnd { Aborted }`.
+    /// ReAct 主循环：跑一轮 LLM，把 assistant 消息塞进 context；
+    /// 若有工具调用就依次跑，然后下一轮；直到 EndTurn / 无工具调用 /
+    /// 达到 MAX_REACT_ITERATIONS。任何子步骤抛 `Aborted` 都原样往外抛，
+    /// 由 `run` 转成 `TurnEnd{Aborted}`。
     #[allow(clippy::too_many_arguments)]
     async fn handle_turn(
         &self,
@@ -265,7 +262,6 @@ impl ReActEngine {
         event_log: &mut EventLog,
         cmd_rx: &mut mpsc::Receiver<SessionCmd>,
     ) -> Result<(TurnStopReason, Usage), AgentError> {
-        // Push user message to context.
         context.push(ChatMessage {
             role: ChatRole::User,
             content: user_msg.to_string(),
@@ -277,7 +273,7 @@ impl ReActEngine {
         let mut turn_usage = Usage::default();
         let tool_defs = self.tool_registry.list_definitions().await;
 
-        for iteration in 0..MAX_REACT_ITERATIONS {
+        for _ in 0..MAX_REACT_ITERATIONS {
             context_manager.prune(context);
 
             let msg = self
@@ -287,7 +283,6 @@ impl ReActEngine {
             turn_usage.input_tokens += msg.msg_usage.input_tokens;
             turn_usage.output_tokens += msg.msg_usage.output_tokens;
 
-            // Push assistant message to context.
             let core_tcs: Vec<CoreToolCallInfo> = msg
                 .tool_calls
                 .iter()
@@ -309,13 +304,11 @@ impl ReActEngine {
                 },
             });
 
-            // If no tool calls (or EndTurn), turn ends here.
             if msg.msg_stop == MessageStopReason::EndTurn || msg.tool_calls.is_empty() {
                 let _ = event_log.maybe_snapshot(context);
                 return Ok((TurnStopReason::EndTurn, turn_usage));
             }
 
-            // Execute each tool: ToolStart → [ToolConfirmRequired] → ToolEnd.
             for tc in &msg.tool_calls {
                 self.run_one_tool(
                     turn_id,
@@ -329,13 +322,9 @@ impl ReActEngine {
                 .await?;
             }
 
-            // Continue the ReAct loop for the next LLM call.
             let _ = event_log.maybe_snapshot(context);
-            // `iteration` is consumed — loop continues.
-            let _ = iteration;
         }
 
-        // Max iterations reached.
         Ok((TurnStopReason::MaxIterations, turn_usage))
     }
 
@@ -461,13 +450,9 @@ impl ReActEngine {
         }
 
         if aborted {
-            // No MessageEnd on abort — the stream was interrupted, so
-            // final_content would be incomplete. The client uses
-            // TurnEnd{Aborted} as the boundary.
             return Err(AgentError::Aborted);
         }
 
-        // Emit MessageEnd with final snapshot.
         let tool_calls_info: Vec<ToolCallInfo> = tool_calls
             .iter()
             .map(|tc| ToolCallInfo {
@@ -531,7 +516,6 @@ impl ReActEngine {
             max_file_size_bytes: 10 * 1024 * 1024,
         };
 
-        // Phase 1.5: confirmation flow.
         let needs_confirm = self
             .confirm_config
             .require_confirmation
@@ -771,8 +755,8 @@ struct AgentEndGuard {
 }
 
 impl AgentEndGuard {
-    /// Fire the `AgentEnd` event explicitly (used for normal shutdown paths
-    /// where we want to consume the guard without dropping it silently).
+    /// 显式触发 AgentEnd（正常退出路径调用，避免 Drop 不可控）。
+    /// 先落盘再发送：resume 时靠读 events.log 区分"会话已结束"和"daemon 崩溃"。
     async fn fire_and_drop(mut self, _tx: &mpsc::Sender<AgentEvent>, event_log: &mut EventLog) {
         if self.fired {
             return;
@@ -784,10 +768,6 @@ impl AgentEndGuard {
             reason,
             total_usage: usage,
         };
-        // Persist before sending: a session that ended cleanly must have
-        // AgentEnd in events.log so a later resume can tell "session was
-        // terminated" from "daemon crashed mid-run". Drop-path (panic /
-        // task-abort) can't safely do disk IO and won't reach here.
         if let Err(e) = event_log.append(event.clone()) {
             tracing::warn!(error = ?e, "failed to persist AgentEnd");
         }
