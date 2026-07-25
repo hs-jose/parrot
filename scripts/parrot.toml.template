@@ -22,12 +22,23 @@ allowlist = []
 denylist = ["rm -rf /", "sudo", "chmod 777"]
 require_confirmation = ["git push", "rm"]
 
-# Provider 配置示例：安装后会读到这里。`api_key` 支持 `${ENV_VAR}`
-# 占位符，从环境变量读取（推荐：避免把 key 留在磁盘上）。取消下面的
-# 注释并按需修改即可使用。
-[[providers]]
-id = "anthropic"
-api_key = "${ANTHROPIC_API_KEY}"
-default_model = "claude-sonnet-4-6"
+# Provider 配置：取消下面整块的注释并改成你要用的 provider。`api_key`
+# 支持 `${ENV_VAR}` 形式的占位符，从环境变量读取（推荐，避免 key 入盘）。
+# daemon 启动时若 `[[providers]]` 缺失或为空，会落到内置 fallback 模型
+# 上（往往不是你想用的），所以**首次使用前请至少配置一个 provider**。
+#
+# 示例：Anthropic
+# [[providers]]
+# id = "anthropic"
+# api_key = "${ANTHROPIC_API_KEY}"
+# default_model = "claude-sonnet-4-6"
 # base_url = "https://api.anthropic.com"
 # models = ["claude-sonnet-4-6"]
+#
+# 示例：DeepSeek（Anthropic 兼容协议）
+# [[providers]]
+# id = "deepseek"
+# api_key = "${DEEPSEEK_API_KEY}"
+# default_model = "deepseek-chat"
+# base_url = "https://api.deepseek.com/anthropic"
+# models = ["deepseek-chat", "deepseek-reasoner"]
