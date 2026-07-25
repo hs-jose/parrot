@@ -113,11 +113,9 @@ impl AppConfig {
 
     fn resolve_token_path(&mut self) -> Result<(), ConfigError> {
         if self.daemon.auth_token_file.is_empty() {
-            // 与 resolve_data_dir / 打包模板里的 {USER_DATA_DIR} 保持一致，
-            // 都用 `dirs::data_dir()`：Windows 上是 %LOCALAPPDATA%。
-            // 之前用 `dirs::config_dir()`（Windows 上是 Roaming）会让 dev
-            // 配置和打包配置的 token 文件落到两个不同目录，CLI 与手动启动
-            // 的 parrotd 各拿一份随机 token，握手时 "Authentication failed"。
+            // 跟 resolve_data_dir / 打包模板对齐到 `dirs::data_dir()`
+            // （Windows 上是 %LOCALAPPDATA%）。之前用 config_dir()(Roaming)
+            // 会让 dev 和打包安装的 token 文件落到两个不同目录，握手失败。
             if let Some(data_dir) = dirs::data_dir() {
                 self.daemon.auth_token_file = data_dir
                     .join("parrot")

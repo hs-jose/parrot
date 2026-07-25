@@ -125,9 +125,7 @@ impl ReActEngine {
         }
 
         let mut event_log = EventLog::new(self.data_dir.clone());
-        // Resume continuity: if we replayed `n` events, the EventLog's
-        // internal seq counter must start at `n` so new appends get seq
-        // `n`, `n+1`, ... matching the persisted log.
+        // resume 后续 seq 要从 replay 恢复点继续，保持与磁盘日志连续。
         if self.resume_seq_offset > 0 {
             event_log = event_log.with_start_seq(self.resume_seq_offset);
         }
@@ -145,9 +143,8 @@ impl ReActEngine {
             tracing::warn!(error = ?e, "failed to persist AgentStart");
         }
 
-        // Replay integrity warning (if any) — emitted once after AgentStart,
-        // before the first TurnStart. Persisted so a subsequent resume
-        // doesn't re-detect it.
+        // 若 resume 时检测到事件日志损坏，发一次 ReplayIntegrityWarning 即清空，
+        // 落盘后下次 resume 不会再重复报。
         if let Some(issue) = self.pending_integrity_warning.take() {
             let warning = AgentEvent::ReplayIntegrityWarning {
                 session_id,
@@ -162,15 +159,8 @@ impl ReActEngine {
 
         let context_manager = ContextManager::new(100_000, 10);
 
-        // RAII guard: ensures AgentEnd fires even on panic / task abort.
-        //
-        // Invariant: the `Arc<Mutex<Usage>>` / `Arc<Mutex<AgentEndReason>>` are
-        // shared with the guard so `run()` can accumulate usage across turns
-        // and the guard can read it on drop. `std::sync::Mutex` is safe here
-        // ONLY because every critical section clones the value out and drops
-        // the guard before any `.await`. DO NOT hold the lock across an
-        // await — that would deadlock under tokio's current-thread runtime
-        // and is undefined behavior under `Send` futures holding the guard.
+        // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
+        // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
         let total_usage: Arc<Mutex<Usage>> = Arc::new(Mutex::new(Usage::default()));
         let end_reason: Arc<Mutex<AgentEndReason>> =
             Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
@@ -349,13 +339,10 @@ impl ReActEngine {
         Ok((TurnStopReason::MaxIterations, turn_usage))
     }
 
-    /// Stream exactly one LLM message: resolves the provider, emits
-    /// `MessageStart`, drains the provider stream (forwarding `MessageDelta`
-    /// events) until `Finish`, then emits `MessageEnd` and returns the
-    /// accumulated content + tool calls. Aborts mid-stream by returning
-    /// `Err(AgentError::Aborted)` without emitting `MessageEnd` (the client
-    /// uses `TurnEnd { Aborted }` as the boundary, matching the original
-    /// single-loop behavior).
+    /// 流式跑一轮 LLM 调用：发 MessageStart，把 provider 的 delta 转发出去，
+    /// 到 Finish 后发 MessageEnd 并返回累积内容 + 工具调用。流式中途
+    /// Abort 直接返回 `Err(Aborted)`，**不发** MessageEnd（客户端用
+    /// TurnEnd{Aborted} 当边界）。
     #[allow(clippy::too_many_arguments)]
     async fn stream_llm_message(
         &self,
@@ -511,12 +498,9 @@ impl ReActEngine {
         })
     }
 
-    /// Run a single tool: emit `ToolStart`, optionally await user
-    /// confirmation, execute the tool (cancelable by `Abort`), emit
-    /// `ToolEnd`, and push the `Tool` message into `context`. On `Abort`
-    /// (during confirmation wait or execution), emits an
-    /// "aborted before execution" `ToolEnd`, pushes the matching `Tool`
-    /// context entry, and returns `Err(AgentError::Aborted)`.
+    /// 跑一个工具：发 ToolStart → 可能等用户 confirm → 跑工具（Abort 可打断）
+    /// → 发 ToolEnd + 把 Tool 消息塞进 context。confirm 等待或工具执行中
+    /// 收到 Abort，统一走 `emit_aborted_tool_end` 后返回 `Err(Aborted)`。
     #[allow(clippy::too_many_arguments)]
     async fn run_one_tool(
         &self,
@@ -618,11 +602,9 @@ impl ReActEngine {
         Ok(())
     }
 
-    /// Wait for a user-approved `ConfirmDecision` for a tool call.
-    /// Emits `ToolConfirmRequired`, registers a one-shot with the router,
-    /// then races the (timeout-bounded) confirmation future against `Abort`.
-    /// On `Abort`, unregisters and emits an "aborted before execution"
-    /// `ToolEnd` + context entry, then returns `Err(AgentError::Aborted)`.
+    /// 等用户对工具调用给出 ConfirmDecision：注册 one-shot、发
+    /// ToolConfirmRequired，在 timeout 内和 Abort 赛跑。Abort 时不等了，
+    /// 撤注册后调用方（run_one_tool）发 aborted ToolEnd。
     #[allow(clippy::too_many_arguments)]
     async fn await_confirmation(
         &self,
@@ -707,9 +689,8 @@ struct PendingToolCall {
     arguments_json: Option<serde_json::Value>,
 }
 
-/// Result of a single streamed LLM message, consumed by `handle_turn` to
-/// push the assistant turn to `context` and (when tool calls are present)
-/// drive the next iteration of the ReAct loop.
+/// 一轮流式 LLM 调用的结果，handle_turn 拿它 push assistant 消息进
+/// context，并根据是否含工具调用决定要不要继续下一轮 ReAct。
 struct StreamedMessage {
     message_id: Uuid,
     accumulated_text: String,
@@ -718,19 +699,11 @@ struct StreamedMessage {
     msg_usage: Usage,
 }
 
-/// Race a future against an `Abort` command from `cmd_rx`. Preserves the
-/// original single-loop semantics bit-for-bit:
-/// - `Abort` → `Abortable::Aborted` (caller emits its own cleanup).
-/// - `Chat { .. }` while the operation is in flight → log a warning and
-///   **then await the future with no further abort checks** (i.e., once a
-///   stray `Chat` shows up during confirmation/tool-exec, `Abort` is no
-///   longer honored for that specific operation — matching the previous
-///   behavior where the offending branch awaited the inner future directly).
-/// - Future completion → `Abortable::Completed(value)`.
-///
-/// This replaces the two repeated `tokio::select!` blocks (confirm-wait and
-/// tool-exec) so callers stay short and the "Abort wins, Chat is noise"
-/// policy lives in exactly one place.
+/// 把 future 和 `cmd_rx` 上的 Abort 命令赛跑。三种结果：
+/// - Abort 先到 → `Aborted`（调用方自己清理）。
+/// - 操作中途来了条 Chat → warn 后照常 await 操作完成，**之后不再受理
+///   Abort**（沿用重构前的语义，避免一条噪音 Chat 改变取消语义）。
+/// - 操作先完成 → `Completed(value)`。
 enum Abortable<T> {
     Completed(T),
     Aborted,
@@ -747,9 +720,6 @@ where
             SessionCmd::Abort => Abortable::Aborted,
             SessionCmd::Chat { .. } => {
                 tracing::warn!("Chat command received during operation; ignoring");
-                // Finish the operation without honoring further aborts —
-                // matches the pre-refactor behavior where the offending arm
-                // awaited the inner future directly.
                 Abortable::Completed(fut.as_mut().await)
             }
         },
@@ -757,9 +727,8 @@ where
     }
 }
 
-/// Emit the "aborted before execution" `ToolEnd` + push the matching `Tool`
-/// message to `context`. Centralizes the abort-cleanup duplicated between
-/// the confirmation-wait and tool-execution paths in the original loop.
+/// 发"aborted before execution" ToolEnd 并把 Tool 消息塞进 context。
+/// confirm 等待与工具执行两条中断路径共用这份清理。
 #[allow(clippy::too_many_arguments)]
 async fn emit_aborted_tool_end(
     session_id: Uuid,

@@ -8,14 +8,13 @@ use tokio::time::{sleep, timeout};
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// 子进程守护：`parrot` 启动 `parrotd` 时持有此结构体，`parrot` 退出时
-/// `Drop` 终止子进程，避免遗留长期占用端口的 daemon。
+/// 子进程守护：Drop 时终止 parrotd，避免遗留孤儿进程占用端口。
 pub(crate) struct DaemonChild {
     inner: Arc<std::sync::Mutex<Option<std::process::Child>>>,
 }
 
 impl DaemonChild {
-    /// 终止子进程并 wait 收尸。幂等：可多次调用。
+    /// 终止子进程。幂等，可多次调用。
     pub fn kill(&self) {
         if let Some(child) = self.inner.lock().unwrap().as_mut() {
             let _ = child.kill();
@@ -31,17 +30,10 @@ impl Drop for DaemonChild {
     }
 }
 
-/// 启动一个 `parrotd` 子进程，监听本机一个空闲随机端口，直到它可接受
-/// TCP 连接为止。返回 `(ws://127.0.0.1:<port>, DaemonChild)`。
-///
-/// 子进程的 CWD 继承自当前进程，因此 `parrotd` 加载 `parrot.toml` 的行为
-/// 与 `parrot` 自身一致。子进程通过环境变量 `PARROTD_PORT` 接收应绑定的
-/// 端口（由 parrot 这边先占用 `127.0.0.1:0` 拿到一个空闲端口再释放，
-/// 立刻交给 parrotd；本地回环上竞争窗口极小）。
-///
-/// `parrot` 退出时 `DaemonChild` 经 Drop 终止子进程，因此根除了"长期
-/// 复用固定端口单例 daemon"导致的多项目串配置问题（参考 opencode 的
-/// 进程内 server + 退出即死的进程模型）。
+/// 起一个 parrotd 子进程绑本机随机空闲端口，轮询直到它能接受连接。
+/// 返回连接地址和 kill-on-drop 守卫。端口由 CLI 先 `bind 127.0.0.1:0`
+/// 拿到再通过 `PARROTD_PORT` env 传给子进程。CWD 继承自当前进程，所以
+/// parrotd 和 parrot 找到同一份 parrot.toml。
 pub(crate) async fn ensure_running(
     _config: &AppConfig,
 ) -> Result<(String, DaemonChild), Box<dyn std::error::Error>> {
@@ -132,7 +124,7 @@ pub fn daemon_binary_path() -> Option<PathBuf> {
     Some(exe.join(name))
 }
 
-/// Returns the path for daemon logs. 使用平台用户数据目录，避免项目根被污染。
+/// Daemon 日志路径，落在用户数据目录（Windows 是 %LOCALAPPDATA%）。
 pub fn daemon_log_path() -> PathBuf {
     dirs::data_dir()
         .map(|b| b.join("parrot"))
@@ -155,7 +147,6 @@ mod tests {
     fn daemon_log_path_landed_in_user_data_dir() {
         let log = daemon_log_path();
         assert_eq!(log.file_name().unwrap(), "daemon.log");
-        // 应位于用户数据目录下；特定路径因平台/用户而异。
         let s = log.to_string_lossy();
         assert!(s.contains("parrot"), "log path should include parrot: {s}");
     }
