@@ -45,7 +45,6 @@ pub struct ToolsConfig {
 pub struct SandboxConfig {
     pub working_dir: String,
     pub allowlist: Vec<String>,
-    pub denylist: Vec<String>,
     pub require_confirmation: Vec<String>,
 }
 
@@ -76,7 +75,10 @@ pub struct HooksConfig {
 impl Default for HooksConfig {
     fn default() -> Self {
         Self {
-            enabled: Vec::new(),
+            enabled: vec![
+                "shell_denylist".to_string(),
+                "dangerous_command_blocker".to_string(),
+            ],
             timeout_seconds: default_hook_timeout(),
             configs: HashMap::new(),
         }
@@ -173,7 +175,6 @@ impl AppConfig {
                 sandbox: SandboxConfig {
                     working_dir: ".".into(),
                     allowlist: vec![],
-                    denylist: vec!["rm -rf /".into(), "sudo".into(), "chmod 777".into()],
                     require_confirmation: vec!["git push".into(), "rm".into()],
                 },
             },
@@ -194,8 +195,30 @@ mod tests {
     #[test]
     fn hooks_default_is_empty() {
         let c = HooksConfig::default();
-        assert!(c.enabled.is_empty());
+        assert_eq!(
+            c.enabled,
+            vec!["shell_denylist", "dangerous_command_blocker"]
+        );
         assert_eq!(c.timeout_seconds, 5);
+    }
+
+    #[test]
+    fn sandbox_config_has_no_denylist() {
+        let c = AppConfig::default_config();
+        assert!(
+            serde_json::to_value(&c.tools.sandbox)
+                .unwrap()
+                .get("denylist")
+                .is_none(),
+            "SandboxConfig must not expose a denylist field"
+        );
+    }
+
+    #[test]
+    fn hooks_default_enabled_includes_shell_denylist_and_blocker() {
+        let c = HooksConfig::default();
+        assert!(c.enabled.contains(&"shell_denylist".to_string()));
+        assert!(c.enabled.contains(&"dangerous_command_blocker".to_string()));
     }
 
     #[test]
@@ -224,7 +247,6 @@ max_file_size_mb = 10
 [tools.sandbox]
 working_dir = "."
 allowlist = []
-denylist = []
 require_confirmation = []
 
 [session]
@@ -259,7 +281,6 @@ max_file_size_mb = 10
 [tools.sandbox]
 working_dir = "."
 allowlist = []
-denylist = []
 require_confirmation = []
 
 [session]
@@ -305,7 +326,6 @@ max_file_size_mb = 10
 [tools.sandbox]
 working_dir = "."
 allowlist = []
-denylist = []
 require_confirmation = []
 
 [session]
