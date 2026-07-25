@@ -342,4 +342,50 @@ enabled = ["dangerous_command_blocker"]
             "configs should be empty when no [hooks.<id>] subtables present"
         );
     }
+
+    #[test]
+    fn hooks_parse_redact_secrets_extra_patterns() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[hooks]
+enabled = ["redact_secrets"]
+
+[hooks.redact_secrets]
+extra_patterns = ["CUSTOM-\\d+", "MY-TOKEN-[a-z]+"]
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.hooks.enabled, vec!["redact_secrets"]);
+        assert!(c.hooks.configs.contains_key("redact_secrets"));
+        let rs_cfg = c.hooks.configs.get("redact_secrets").unwrap();
+        let extra = rs_cfg
+            .get("extra_patterns")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(extra.len(), 2);
+    }
 }
