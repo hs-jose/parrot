@@ -7,6 +7,8 @@ pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub providers: Vec<ProviderConfig>,
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
     #[serde(rename = "session")]
     pub session: SessionConfig,
 }
@@ -51,6 +53,27 @@ pub struct SessionConfig {
     pub data_dir: String,
     pub max_history_tokens: u32,
     pub keep_recent_turns: u32,
+}
+
+fn default_hook_timeout() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Vec::new(),
+            timeout_seconds: default_hook_timeout(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -152,6 +175,58 @@ impl AppConfig {
                 max_history_tokens: 100_000,
                 keep_recent_turns: 6,
             },
+            hooks: HooksConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hooks_default_is_empty() {
+        let c = HooksConfig::default();
+        assert!(c.enabled.is_empty());
+        assert_eq!(c.timeout_seconds, 5);
+    }
+
+    #[test]
+    fn hooks_parse_from_toml() {
+        let toml = r#"
+[hooks]
+enabled = ["dangerous_command_blocker"]
+timeout_seconds = 3
+
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+denylist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.hooks.enabled, vec!["dangerous_command_blocker"]);
+        assert_eq!(c.hooks.timeout_seconds, 3);
     }
 }
