@@ -478,3 +478,35 @@ fn turn_stop_reason_blocked_hook_roundtrip() {
     let decoded: TurnStopReason = serde_json::from_str(&json).unwrap();
     assert_eq!(reason, decoded);
 }
+
+#[test]
+fn hook_action_replace_context_roundtrip() {
+    use parrot_core::hooks::HookAction;
+    use parrot_core::types::{ChatMessage, ChatRole};
+
+    let action = HookAction::ReplaceContext {
+        messages: vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: "system prompt".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "hello".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+        ],
+    };
+    let json = serde_json::to_string(&action).unwrap();
+    assert!(
+        json.contains(r#""kind":"replace_context""#),
+        "expected replace_context tag in: {json}"
+    );
+    let decoded: HookAction = serde_json::from_str(&json).unwrap();
+    assert_eq!(action, decoded);
+}

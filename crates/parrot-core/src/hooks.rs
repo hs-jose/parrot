@@ -105,7 +105,7 @@ impl<'a> HookEvent<'a> {
 }
 
 /// Per-hook return value (what a single hook decides to do).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HookAction {
     NoOp,
@@ -132,7 +132,10 @@ pub enum HookResult {
         is_error: bool,
     },
     /// A ContextReady hook replaced the context messages (last-write-wins).
-    ReplaceContext { hook_id: String, messages: Vec<ChatMessage> },
+    ReplaceContext {
+        hook_id: String,
+        messages: Vec<ChatMessage>,
+    },
 }
 
 /// Internal: a hook call timed out or returned `Err`.
