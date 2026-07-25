@@ -1,7 +1,7 @@
 use crate::context::ContextManager;
 use crate::error::AgentError;
 use crate::event_log::EventLog;
-use crate::hooks::{HookRegistry, ToolCallDecision, ToolResultDecision, TurnStartDecision};
+use crate::hooks::{HookEvent, HookRegistry, HookResult};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
 use crate::tool::{ToolContext, ToolRegistry};
@@ -110,26 +110,6 @@ impl ReActEngine {
         self
     }
 
-    async fn emit_hook_fired(
-        &self,
-        event_tx: &mpsc::Sender<AgentEvent>,
-        hook_id: &str,
-        event_kind: &str,
-        result_kind: &str,
-        summary: Option<String>,
-    ) {
-        let _ = event_tx
-            .send(AgentEvent::HookFired {
-                session_id: self.session_id,
-                hook_id: hook_id.to_string(),
-                event_kind: event_kind.to_string(),
-                result_kind: result_kind.to_string(),
-                summary,
-            })
-            .await
-            .ok();
-    }
-
     pub async fn run(
         mut self,
         mut cmd_rx: mpsc::Receiver<SessionCmd>,
@@ -158,10 +138,11 @@ impl ReActEngine {
             event_log = event_log.with_start_seq(self.resume_seq_offset);
         }
 
+        let provider_id = self.resolve_provider_id().await;
         let agent_start = AgentEvent::AgentStart {
             session_id,
             model: self.config.model.clone(),
-            provider: self.resolve_provider_id().await,
+            provider: provider_id.clone(),
             system_prompt_hash: self.system_prompt_hash.clone(),
             resumed_from_seq: self.resumed_from_seq,
         };
@@ -172,11 +153,10 @@ impl ReActEngine {
 
         let mut emit = make_emit(session_id, &event_tx);
         self.hooks
-            .on_agent_start(
+            .run(
+                HookEvent::AgentStart { session_id, model: &self.config.model, provider: &provider_id },
+                &self.working_dir,
                 &mut emit,
-                session_id,
-                &self.config.model,
-                &self.resolve_provider_id().await,
             )
             .await;
 
@@ -209,6 +189,7 @@ impl ReActEngine {
             total_usage: Arc::clone(&total_usage),
             reason: Arc::clone(&end_reason),
             hooks: Arc::clone(&self.hooks),
+            working_dir: self.working_dir.clone(),
         };
 
         loop {
@@ -217,18 +198,14 @@ impl ReActEngine {
                     let turn_id = Uuid::new_v4();
                     let turn_start_outcome = self
                         .hooks
-                        .on_turn_start(&mut emit, session_id, turn_id, &message)
+                        .run(
+                            HookEvent::TurnStart { session_id, turn_id, user_message: &message },
+                            &self.working_dir,
+                            &mut emit,
+                        )
                         .await;
                     match turn_start_outcome {
-                        TurnStartDecision::Blocked { hook_id, reason } => {
-                            self.emit_hook_fired(
-                                &event_tx,
-                                &hook_id,
-                                "turn_start",
-                                "block",
-                                Some(reason.clone()),
-                            )
-                            .await;
+                        HookResult::Block { reason, .. } => {
                             let turn_end = AgentEvent::TurnEnd {
                                 session_id,
                                 turn_id,
@@ -239,9 +216,8 @@ impl ReActEngine {
                             let _ = event_log.append(turn_end);
                             continue;
                         }
-                        TurnStartDecision::Continue { injected_messages } => {
-                            context.extend(injected_messages);
-                        }
+                        HookResult::Inject { messages } => context.extend(messages),
+                        _ => {}
                     }
                     let _ = event_tx
                         .send(AgentEvent::TurnStart {
@@ -581,26 +557,21 @@ impl ReActEngine {
         let tool_call_outcome = {
             let mut emit = make_emit(session_id, event_tx);
             self.hooks
-                .on_tool_call(
+                .run(
+                    HookEvent::ToolCall {
+                        session_id,
+                        turn_id,
+                        parent_message_id,
+                        tool_call_id: &tc.id,
+                        tool_name: &tc.name,
+                        arguments: &args,
+                    },
+                    &self.working_dir,
                     &mut emit,
-                    session_id,
-                    turn_id,
-                    parent_message_id,
-                    &tc.id,
-                    &tc.name,
-                    &args,
                 )
                 .await
         };
-        if let ToolCallDecision::Blocked { hook_id, reason } = tool_call_outcome {
-            self.emit_hook_fired(
-                event_tx,
-                &hook_id,
-                "tool_call",
-                "block",
-                Some(reason.clone()),
-            )
-            .await;
+        if let HookResult::Block { reason, .. } = tool_call_outcome {
             let result = parrot_protocol::types::ToolOutput {
                 content: format!("blocked: {reason}"),
                 is_error: true,
@@ -648,8 +619,16 @@ impl ReActEngine {
             {
                 let mut emit = make_emit(session_id, event_tx);
                 self.hooks
-                    .on_tool_execution_start(
-                        &mut emit, session_id, turn_id, &tc.id, &tc.name, &args,
+                    .run(
+                        HookEvent::ToolExecutionStart {
+                            session_id,
+                            turn_id,
+                            tool_call_id: &tc.id,
+                            tool_name: &tc.name,
+                            arguments: &args,
+                        },
+                        &self.working_dir,
+                        &mut emit,
                     )
                     .await;
             }
@@ -691,18 +670,25 @@ impl ReActEngine {
         let tool_result_decision = {
             let mut emit = make_emit(session_id, event_tx);
             self.hooks
-                .on_tool_result(
-                    &mut emit, session_id, turn_id, &tc.id, &tc.name, &args, &result,
+                .run(
+                    HookEvent::ToolResult {
+                        session_id,
+                        turn_id,
+                        tool_call_id: &tc.id,
+                        tool_name: &tc.name,
+                        input: &args,
+                        result: &result,
+                    },
+                    &self.working_dir,
+                    &mut emit,
                 )
                 .await
         };
         let result = match tool_result_decision {
-            ToolResultDecision::Continue => result,
-            ToolResultDecision::Replace {
-                hook_id: _,
-                content,
-                is_error,
-            } => parrot_protocol::types::ToolOutput { content, is_error },
+            HookResult::Replace { content, is_error, .. } => {
+                parrot_protocol::types::ToolOutput { content, is_error }
+            }
+            _ => result,
         };
 
         let tool_end = AgentEvent::ToolEnd {
@@ -916,6 +902,7 @@ struct AgentEndGuard {
     total_usage: Arc<Mutex<Usage>>,
     reason: Arc<Mutex<AgentEndReason>>,
     hooks: Arc<HookRegistry>,
+    working_dir: std::path::PathBuf,
 }
 
 impl AgentEndGuard {
@@ -928,7 +915,13 @@ impl AgentEndGuard {
         let usage = self.total_usage.lock().unwrap().clone();
         let reason = self.reason.lock().unwrap().clone();
         let mut emit = make_emit(self.session_id, &self.event_tx);
-        self.hooks.on_agent_end(&mut emit, self.session_id).await;
+        self.hooks
+            .run(
+                HookEvent::AgentEnd { session_id: self.session_id },
+                &self.working_dir,
+                &mut emit,
+            )
+            .await;
         let event = AgentEvent::AgentEnd {
             session_id: self.session_id,
             reason,

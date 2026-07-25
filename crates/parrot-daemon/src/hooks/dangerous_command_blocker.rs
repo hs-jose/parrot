@@ -1,6 +1,5 @@
 use async_trait::async_trait;
-use parrot_core::hooks::{Hook, HookCtx, HookEvent, HookPoints, HookResult};
-use parrot_core::AgentError;
+use parrot_core::hooks::{Hook, HookAction, HookCtx, HookEvent, HookPoints};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -37,22 +36,17 @@ impl Hook for DangerousCommandBlocker {
     fn supported(&self) -> HookPoints {
         HookPoints::TOOL_CALL
     }
-    async fn dispatch(
+    async fn handle(
         &self,
         ev: HookEvent<'_>,
         _ctx: &HookCtx<'_>,
-    ) -> Result<HookResult, AgentError> {
-        if let HookEvent::ToolCall {
-            tool_name,
-            arguments,
-            ..
-        } = ev
-        {
+    ) -> Result<HookAction, parrot_core::AgentError> {
+        if let HookEvent::ToolCall { tool_name, arguments, .. } = ev {
             if matches!(tool_name, "shell_exec" | "bash" | "shell") {
                 if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
                     for (re, label) in patterns() {
                         if re.is_match(cmd) {
-                            return Ok(HookResult::Block {
+                            return Ok(HookAction::Block {
                                 reason: format!("dangerous command: {label}"),
                             });
                         }
@@ -60,7 +54,7 @@ impl Hook for DangerousCommandBlocker {
                 }
             }
         }
-        Ok(HookResult::NoOp)
+        Ok(HookAction::NoOp)
     }
 }
 
@@ -89,8 +83,8 @@ mod tests {
             tool_name: "shell_exec",
             arguments: &args,
         };
-        let out = h.dispatch(ev, &ctx()).await.unwrap();
-        assert!(matches!(out, HookResult::Block { .. }));
+        let out = h.handle(ev, &ctx()).await.unwrap();
+        assert!(matches!(out, HookAction::Block { .. }));
     }
 
     #[tokio::test]
@@ -105,8 +99,8 @@ mod tests {
             tool_name: "shell_exec",
             arguments: &args,
         };
-        let out = h.dispatch(ev, &ctx()).await.unwrap();
-        assert!(matches!(out, HookResult::NoOp));
+        let out = h.handle(ev, &ctx()).await.unwrap();
+        assert!(matches!(out, HookAction::NoOp));
     }
 
     #[tokio::test]
@@ -120,8 +114,8 @@ mod tests {
             tool_name: "read",
             arguments: &serde_json::Value::Null,
         };
-        let out = h.dispatch(ev, &ctx()).await.unwrap();
-        assert!(matches!(out, HookResult::NoOp));
+        let out = h.handle(ev, &ctx()).await.unwrap();
+        assert!(matches!(out, HookAction::NoOp));
     }
 
     #[tokio::test]
@@ -137,9 +131,9 @@ mod tests {
                 tool_name: "shell_exec",
                 arguments: &args,
             };
-            let out = h.dispatch(ev, &ctx()).await.unwrap();
+            let out = h.handle(ev, &ctx()).await.unwrap();
             assert!(
-                matches!(out, HookResult::Block { .. }),
+                matches!(out, HookAction::Block { .. }),
                 "{cmd} must be blocked"
             );
         }

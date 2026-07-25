@@ -1,6 +1,5 @@
 use async_trait::async_trait;
-use parrot_core::hooks::{Hook, HookCtx, HookEvent, HookPoints, HookResult};
-use parrot_core::AgentError;
+use parrot_core::hooks::{Hook, HookAction, HookCtx, HookEvent, HookPoints};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -27,19 +26,13 @@ impl Hook for RedactSecrets {
     fn supported(&self) -> HookPoints {
         HookPoints::TOOL_RESULT
     }
-    async fn dispatch(
+    async fn handle(
         &self,
         ev: HookEvent<'_>,
         _ctx: &HookCtx<'_>,
-    ) -> Result<HookResult, AgentError> {
-        if let HookEvent::ToolResult {
-            tool_name, result, ..
-        } = ev
-        {
-            if matches!(
-                tool_name,
-                "read" | "shell_exec" | "bash" | "shell" | "file_read"
-            ) {
+    ) -> Result<HookAction, parrot_core::AgentError> {
+        if let HookEvent::ToolResult { tool_name, result, .. } = ev {
+            if matches!(tool_name, "read" | "shell_exec" | "bash" | "shell" | "file_read") {
                 let mut content = result.content.clone();
                 let mut changed = false;
                 for re in patterns() {
@@ -50,14 +43,11 @@ impl Hook for RedactSecrets {
                     }
                 }
                 if changed {
-                    return Ok(HookResult::ReplaceResult {
-                        content,
-                        is_error: result.is_error,
-                    });
+                    return Ok(HookAction::ReplaceResult { content, is_error: result.is_error });
                 }
             }
         }
-        Ok(HookResult::NoOp)
+        Ok(HookAction::NoOp)
     }
 }
 
@@ -90,9 +80,9 @@ mod tests {
             input: &serde_json::Value::Null,
             result: &out,
         };
-        let res = h.dispatch(ev, &ctx()).await.unwrap();
+        let res = h.handle(ev, &ctx()).await.unwrap();
         match res {
-            HookResult::ReplaceResult { content, is_error } => {
+            HookAction::ReplaceResult { content, is_error } => {
                 assert!(content.contains("[REDACTED]"));
                 assert!(!content.contains("AKIAIOSFODNN7EXAMPLE"));
                 assert!(!is_error);
@@ -116,7 +106,7 @@ mod tests {
             input: &serde_json::Value::Null,
             result: &out,
         };
-        let res = h.dispatch(ev, &ctx()).await.unwrap();
-        assert!(matches!(res, HookResult::NoOp));
+        let res = h.handle(ev, &ctx()).await.unwrap();
+        assert!(matches!(res, HookAction::NoOp));
     }
 }
