@@ -1,5 +1,9 @@
 # Parrot `context_ready` Hook Point
 
+> **实现状态：已完成**（commits `ec75701`..`290cc10`）。`HookPoints::CONTEXT_READY`、
+> `HookEvent::ContextReady`、`HookAction::ReplaceContext`、`HookResult::ReplaceContext`
+> 均已落地，`handle_turn` 中的 hook site 已接入。
+
 > 新增第 7 个 hook point `context_ready`，给 hook 在 turn 开始后、第一次 LLM 调用前
 > 对话级修改/替换上下文的能力。同时新增一个 `HookAction::ReplaceContext` 让 hook
 > 整体替换 context。

@@ -89,6 +89,7 @@ bitflags::bitflags! {
         const TOOL_CALL              = 0b0000_1000;
         const TOOL_EXECUTION_START   = 0b0001_0000;
         const TOOL_RESULT            = 0b0010_0000;
+        const CONTEXT_READY          = 0b0100_0000;
     }
 }
 
@@ -143,6 +144,11 @@ pub enum HookEvent<'a> {
         input: &'a serde_json::Value,
         result: &'a ToolOutput,
     },
+    ContextReady {
+        session_id: Uuid,
+        turn_id: Uuid,
+        context: &'a [ChatMessage],
+    },
 }
 
 impl<'a> HookEvent<'a> {
@@ -166,6 +172,8 @@ pub enum HookAction {
     Block { reason: String },
     /// tool_result 专用：替换 ToolOutput.content，last-wins
     ReplaceResult { content: String, is_error: bool },
+    /// context_ready 专用：替换整个 context messages，last-wins
+    ReplaceContext { messages: Vec<ChatMessage> },
 }
 
 /// Registry 跑完该点所有 handler 后聚合出的最终决策，engine 据此继续/阻断/改写。
@@ -179,6 +187,8 @@ pub enum HookResult {
     Inject { messages: Vec<ChatMessage> },
     /// tool_result 有 hook 替换输出（last-wins）。
     Replace { hook_id: String, content: String, is_error: bool },
+    /// context_ready 有 hook 替换整个 context（last-wins）。
+    ReplaceContext { hook_id: String, messages: Vec<ChatMessage> },
 }
 
 /// 给 hook 实现的上下文，含 daemon 注入的非业务数据
@@ -221,10 +231,16 @@ impl HookRegistry {
 - `TURN_START`：waterfall（`InjectMessages` 累加，`Block` 立即 bail）。
 - `TOOL_CALL`：bail（首个 `Block` 立即返回）。
 - `TOOL_RESULT`：waterfall（`ReplaceResult` 滚动 last-wins）。
+- `CONTEXT_READY`：waterfall + bail-on-Block（`InjectMessages` 累加，`ReplaceContext` last-wins 且丢弃并发的 `Inject`，`Block` 立即 bail）。
 
 `HookResult` 是 engine 用的聚合 enum（不是 wire 类型），表达"经过 hook 链后的最终决策"。
 
-## 6. 六个扩展点
+## 6. 七个扩展点
+
+> **注：`context_ready`（第 7 点）在后续 spec 中添加**——见
+> `2026-07-25-parrot-context-ready-hook-design.md`。每 turn 一次，首次 prune 之后、
+> 首次 LLM 调用之前。支持 `InjectMessages` / `ReplaceContext` / `Block`。
+> 优先级：`Block >> ReplaceContext >> Inject >> Continue`。
 
 按 engine.rs 现有生命周期边界接入：
 
@@ -236,6 +252,7 @@ impl HookRegistry {
 | 4 | `tool_call` | `run_one_tool`：emit `ToolStart` 之后、`await_confirmation` 之前 | bail | `Block{reason}` / `NoOp` | 任一 handler 返回 Block 立即结束，向 context 里 push 一条 `Tool{content="blocked: <reason>", is_error=true}` 消息复用 `ConfirmDecision::Reject` 现有路径 |
 | 5 | `tool_execution_start` | 确认通过之后、`execute_tool()` 之前 | fire-and-forget | `NoOp` | — （埋点：UI 可显示"工具已批准开始执行"） |
 | 6 | `tool_result` | `execute_tool()` 返回 / `Block` 走 reject 路径之后、`emit ToolEnd` 之前 | waterfall | `ReplaceResult{content, is_error}` / `NoOp` | last-wins 替换；最终 ToolEnd.result 落盘的是替换后的内容 |
+| 7 | `context_ready` | `handle_turn()`：push user_msg 之后、首次 prune 之后、`for` 循环之前 | waterfall + bail-on-Block | `InjectMessages` / `ReplaceContext{messages}` / `Block{reason}` / `NoOp` | `Block` → 跳过整 turn；`ReplaceContext` → 替换整个 context（last-wins，丢弃并发的 `Inject`）；`Inject` → extend context |
 
 ### 与 `ConfirmConfig` 的关系
 
