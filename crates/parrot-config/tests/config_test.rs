@@ -32,7 +32,6 @@ max_file_size_mb = 20
 [tools.sandbox]
 working_dir = "/workspace"
 allowlist = ["ls", "cat"]
-denylist = ["rm -rf /"]
 require_confirmation = ["git push"]
 
 [session]
@@ -72,7 +71,6 @@ max_file_size_mb = 10
 [tools.sandbox]
 working_dir = "."
 allowlist = []
-denylist = []
 require_confirmation = []
 
 [session]
