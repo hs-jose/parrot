@@ -342,14 +342,6 @@ impl ReActEngine {
                 .await;
             match outcome {
                 HookResult::Block { reason, .. } => {
-                    let turn_end = AgentEvent::TurnEnd {
-                        session_id,
-                        turn_id,
-                        stop_reason: TurnStopReason::BlockedHook(reason.clone()),
-                        usage: Usage::default(),
-                    };
-                    let _ = event_tx.send(turn_end.clone()).await.ok();
-                    let _ = event_log.append(turn_end);
                     return Ok((TurnStopReason::BlockedHook(reason), Usage::default()));
                 }
                 HookResult::ReplaceContext { messages, .. } => {
