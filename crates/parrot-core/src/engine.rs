@@ -324,6 +324,46 @@ impl ReActEngine {
         let mut turn_usage = Usage::default();
         let tool_defs = self.tool_registry.list_definitions().await;
 
+        {
+            context_manager.prune(context);
+            let session_id = self.session_id;
+            let mut emit = make_emit(session_id, event_tx);
+            let outcome = self
+                .hooks
+                .run(
+                    HookEvent::ContextReady {
+                        session_id,
+                        turn_id,
+                        context,
+                    },
+                    &self.working_dir,
+                    &mut emit,
+                )
+                .await;
+            match outcome {
+                HookResult::Block { reason, .. } => {
+                    let turn_end = AgentEvent::TurnEnd {
+                        session_id,
+                        turn_id,
+                        stop_reason: TurnStopReason::BlockedHook(reason.clone()),
+                        usage: Usage::default(),
+                    };
+                    let _ = event_tx.send(turn_end.clone()).await.ok();
+                    let _ = event_log.append(turn_end);
+                    return Ok((TurnStopReason::BlockedHook(reason), Usage::default()));
+                }
+                HookResult::ReplaceContext { messages, .. } => {
+                    *context = messages;
+                    context_manager.prune(context);
+                }
+                HookResult::Inject { messages } => {
+                    context.extend(messages);
+                    context_manager.prune(context);
+                }
+                HookResult::Continue | HookResult::Replace { .. } => {}
+            }
+        }
+
         for _ in 0..MAX_REACT_ITERATIONS {
             context_manager.prune(context);
 

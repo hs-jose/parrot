@@ -708,3 +708,51 @@ async fn context_ready_noop_returns_continue() {
         .await;
     assert_eq!(result, HookResult::Continue);
 }
+
+#[tokio::test]
+async fn context_ready_fires_once_per_turn() {
+    let mut reg = HookRegistry::new(Duration::from_secs(5));
+    let hook = Arc::new(RecordingHook::new(
+        "ctx_hook",
+        HookPoints::CONTEXT_READY,
+        vec![HookAction::NoOp],
+    ));
+    let hook_weak = Arc::clone(&hook);
+    reg.register(hook);
+    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
+    let mut emit = make_emit(Arc::clone(&sink));
+    let sid = Uuid::new_v4();
+    let tid = Uuid::new_v4();
+
+    // TurnStart should NOT trigger the context_ready hook
+    reg.run(
+        HookEvent::TurnStart {
+            session_id: sid,
+            turn_id: tid,
+            user_message: "hi",
+        },
+        path(),
+        &mut emit,
+    )
+    .await;
+    assert!(
+        hook_weak.calls().is_empty(),
+        "CONTEXT_READY hook should not fire on TurnStart"
+    );
+
+    // ContextReady SHOULD trigger it
+    let ctx = vec![ChatMessage {
+        role: ChatRole::User,
+        content: "hi".into(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: None,
+    }];
+    reg.run(context_ready_event(sid, tid, &ctx), path(), &mut emit)
+        .await;
+    assert_eq!(
+        hook_weak.calls(),
+        vec!["context_ready"],
+        "CONTEXT_READY hook should fire on ContextReady event"
+    );
+}
