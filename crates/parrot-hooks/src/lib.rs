@@ -3,6 +3,7 @@
 // and tested independently of the daemon binary.
 
 pub mod dangerous_command_blocker;
+pub mod external;
 pub mod redact_secrets;
 pub mod shell_denylist;
 

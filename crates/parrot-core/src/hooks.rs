@@ -8,7 +8,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct HookPoints: u8 {
         const AGENT_START            = 0b0000_0001;
         const AGENT_END              = 0b0000_0010;
