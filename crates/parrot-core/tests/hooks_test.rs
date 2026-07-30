@@ -6,21 +6,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Records every `HookFired` emission pushed through the registry's emit
-/// callback as `(hook_id, event_kind, result_kind, summary)`.
-type Sink = Vec<(String, String, String, Option<String>)>;
-
-fn make_emit(sink: Arc<Mutex<Sink>>) -> impl FnMut(&str, &str, &str, Option<String>) + Send {
-    move |hook_id: &str, event_kind: &str, result_kind: &str, summary: Option<String>| {
-        sink.lock().unwrap().push((
-            hook_id.to_string(),
-            event_kind.to_string(),
-            result_kind.to_string(),
-            summary,
-        ));
-    }
-}
-
 fn path() -> &'static Path {
     Path::new(".")
 }
@@ -36,84 +21,77 @@ async fn empty_registry_returns_defaults_without_emit() {
         content: "x".into(),
         is_error: false,
     };
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
 
-    assert_eq!(
-        reg.run(
+    let (r, execs) = reg
+        .run(
             HookEvent::TurnStart {
                 session_id: sid,
                 turn_id: tid,
-                user_message: "hi"
+                user_message: "hi",
             },
             path(),
-            &mut emit
         )
-        .await,
-        HookResult::Continue
-    );
-    assert_eq!(
-        reg.run(
+        .await;
+    assert_eq!(r, HookResult::Continue);
+    assert!(execs.is_empty(), "empty registry must not emit HookFired");
+    let (r, execs) = reg
+        .run(
             HookEvent::ToolCall {
                 session_id: sid,
                 turn_id: tid,
                 parent_message_id: mid,
                 tool_call_id: "tc1",
                 tool_name: "echo",
-                arguments: &args
+                arguments: &args,
             },
             path(),
-            &mut emit
         )
-        .await,
-        HookResult::Continue
-    );
-    assert_eq!(
-        reg.run(
+        .await;
+    assert_eq!(r, HookResult::Continue);
+    assert!(execs.is_empty());
+    let (r, execs) = reg
+        .run(
             HookEvent::ToolResult {
                 session_id: sid,
                 turn_id: tid,
                 tool_call_id: "tc1",
                 tool_name: "echo",
                 input: &args,
-                result: &out
+                result: &out,
             },
             path(),
-            &mut emit
         )
-        .await,
-        HookResult::Continue
-    );
-    reg.run(
-        HookEvent::AgentStart {
-            session_id: sid,
-            model: "claude-x",
-            provider: "anthropic",
-        },
-        path(),
-        &mut emit,
-    )
-    .await;
-    reg.run(HookEvent::AgentEnd { session_id: sid }, path(), &mut emit)
         .await;
-    reg.run(
-        HookEvent::ToolExecutionStart {
-            session_id: sid,
-            turn_id: tid,
-            tool_call_id: "tc1",
-            tool_name: "echo",
-            arguments: &args,
-        },
-        path(),
-        &mut emit,
-    )
-    .await;
-
-    // Empty-registry fast path never invokes the emit callback.
-    assert!(
-        sink.lock().unwrap().is_empty(),
-        "empty registry must not emit HookFired"
-    );
+    assert_eq!(r, HookResult::Continue);
+    assert!(execs.is_empty());
+    let (_, execs) = reg
+        .run(
+            HookEvent::AgentStart {
+                session_id: sid,
+                model: "claude-x",
+                provider: "anthropic",
+            },
+            path(),
+        )
+        .await;
+    assert!(execs.is_empty());
+    let (_, execs) = reg
+        .run(HookEvent::AgentEnd { session_id: sid }, path())
+        .await;
+    assert!(execs.is_empty());
+    let (_, execs) = reg
+        .run(
+            HookEvent::ToolExecutionStart {
+                session_id: sid,
+                turn_id: tid,
+                tool_call_id: "tc1",
+                tool_name: "echo",
+                arguments: &args,
+            },
+            path(),
+        )
+        .await;
+    assert!(execs.is_empty());
 }
 
 struct RecordingHook {
@@ -210,9 +188,7 @@ async fn tool_call_bail_on_first_block() {
     ));
     let b_weak = Arc::clone(&b);
     reg.register(b);
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
-    let out = reg
+    let (out, execs) = reg
         .run(
             HookEvent::ToolCall {
                 session_id: Uuid::new_v4(),
@@ -223,7 +199,6 @@ async fn tool_call_bail_on_first_block() {
                 arguments: &serde_json::Value::Null,
             },
             path(),
-            &mut emit,
         )
         .await;
     assert_eq!(
@@ -233,15 +208,12 @@ async fn tool_call_bail_on_first_block() {
             reason: "nope".into()
         }
     );
-    // b never ran: bail short-circuited before reaching it.
     assert!(b_weak.calls().is_empty());
     assert_eq!(order_log.lock().unwrap().as_slice(), ["a"]);
-    // Block is now emitted inside run(), so sink has one entry.
-    let sink = sink.lock().unwrap();
-    assert_eq!(sink.len(), 1);
-    assert_eq!(sink[0].0, "a");
-    assert_eq!(sink[0].1, "tool_call");
-    assert_eq!(sink[0].2, "block");
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].hook_id, "a");
+    assert_eq!(execs[0].event_kind, "tool_call");
+    assert_eq!(execs[0].result_kind, "block");
 }
 
 #[tokio::test]
@@ -270,9 +242,7 @@ async fn tool_result_waterfall_last_wins() {
     let h2_weak = Arc::clone(&h2);
     reg.register(h1);
     reg.register(h2);
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
-    let out = reg
+    let (out, execs) = reg
         .run(
             HookEvent::ToolResult {
                 session_id: Uuid::new_v4(),
@@ -286,7 +256,6 @@ async fn tool_result_waterfall_last_wins() {
                 },
             },
             path(),
-            &mut emit,
         )
         .await;
     assert_eq!(
@@ -300,13 +269,12 @@ async fn tool_result_waterfall_last_wins() {
     assert_eq!(h1_weak.calls(), vec!["tool_result"]);
     assert_eq!(h2_weak.calls(), vec!["tool_result"]);
     assert_eq!(order_log.lock().unwrap().as_slice(), ["a", "b"]);
-    let sink = sink.lock().unwrap();
-    assert_eq!(sink.len(), 2);
-    assert_eq!(sink[0].0, "a");
-    assert_eq!(sink[0].1, "tool_result");
-    assert_eq!(sink[0].2, "replace_result");
-    assert_eq!(sink[1].0, "b");
-    assert_eq!(sink[1].2, "replace_result");
+    assert_eq!(execs.len(), 2);
+    assert_eq!(execs[0].hook_id, "a");
+    assert_eq!(execs[0].event_kind, "tool_result");
+    assert_eq!(execs[0].result_kind, "replace_result");
+    assert_eq!(execs[1].hook_id, "b");
+    assert_eq!(execs[1].result_kind, "replace_result");
 }
 
 #[tokio::test]
@@ -338,9 +306,7 @@ async fn turn_start_inject_messages_accumulate() {
             }],
         }],
     )));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
-    let out = reg
+    let (out, execs) = reg
         .run(
             HookEvent::TurnStart {
                 session_id: Uuid::new_v4(),
@@ -348,20 +314,18 @@ async fn turn_start_inject_messages_accumulate() {
                 user_message: "hi",
             },
             path(),
-            &mut emit,
         )
         .await;
     match out {
         HookResult::Inject { messages } => assert_eq!(messages.len(), 2),
         _ => panic!("expected Inject"),
     }
-    let sink = sink.lock().unwrap();
-    assert_eq!(sink.len(), 2);
-    assert_eq!(sink[0].0, "a");
-    assert_eq!(sink[0].1, "turn_start");
-    assert_eq!(sink[0].2, "inject_messages");
-    assert_eq!(sink[1].0, "b");
-    assert_eq!(sink[1].2, "inject_messages");
+    assert_eq!(execs.len(), 2);
+    assert_eq!(execs[0].hook_id, "a");
+    assert_eq!(execs[0].event_kind, "turn_start");
+    assert_eq!(execs[0].result_kind, "inject_messages");
+    assert_eq!(execs[1].hook_id, "b");
+    assert_eq!(execs[1].result_kind, "inject_messages");
 }
 
 #[tokio::test]
@@ -407,10 +371,8 @@ async fn timeout_and_error_are_fail_open_noop() {
     let mut reg = HookRegistry::new(Duration::from_millis(50));
     reg.register(Arc::new(Slow));
     reg.register(Arc::new(Boom));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
 
-    let out = reg
+    let (out, execs) = reg
         .run(
             HookEvent::ToolCall {
                 session_id: Uuid::new_v4(),
@@ -421,20 +383,16 @@ async fn timeout_and_error_are_fail_open_noop() {
                 arguments: &serde_json::Value::Null,
             },
             path(),
-            &mut emit,
         )
         .await;
     assert_eq!(out, HookResult::Continue);
-    {
-        let sink = sink.lock().unwrap();
-        assert_eq!(sink.len(), 1);
-        assert_eq!(sink[0].0, "slow");
-        assert_eq!(sink[0].1, "tool_call");
-        assert_eq!(sink[0].2, "timeout");
-        assert!(sink[0].3.is_none(), "timeout summary must be None");
-    }
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].hook_id, "slow");
+    assert_eq!(execs[0].event_kind, "tool_call");
+    assert_eq!(execs[0].result_kind, "timeout");
+    assert!(execs[0].summary.is_none(), "timeout summary must be None");
 
-    let out = reg
+    let (out, execs) = reg
         .run(
             HookEvent::TurnStart {
                 session_id: Uuid::new_v4(),
@@ -442,22 +400,21 @@ async fn timeout_and_error_are_fail_open_noop() {
                 user_message: "hi",
             },
             path(),
-            &mut emit,
         )
         .await;
     assert_eq!(out, HookResult::Continue);
-    {
-        let sink = sink.lock().unwrap();
-        assert_eq!(sink.len(), 2);
-        assert_eq!(sink[1].0, "boom");
-        assert_eq!(sink[1].1, "turn_start");
-        assert_eq!(sink[1].2, "error");
-        let summary = sink[1].3.as_ref().expect("error summary must be Some");
-        assert!(
-            summary.contains("boom"),
-            "error summary must preserve AgentError detail, got: {summary}"
-        );
-    }
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].hook_id, "boom");
+    assert_eq!(execs[0].event_kind, "turn_start");
+    assert_eq!(execs[0].result_kind, "error");
+    let summary = execs[0]
+        .summary
+        .as_ref()
+        .expect("error summary must be Some");
+    assert!(
+        summary.contains("boom"),
+        "error summary must preserve AgentError detail, got: {summary}"
+    );
 }
 
 #[tokio::test]
@@ -481,24 +438,21 @@ async fn fire_and_forget_emits_noop_on_completed() {
     }
     let mut reg = HookRegistry::new(Duration::from_secs(5));
     reg.register(Arc::new(NoopHook));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
-    reg.run(
-        HookEvent::AgentStart {
-            session_id: Uuid::new_v4(),
-            model: "m",
-            provider: "p",
-        },
-        path(),
-        &mut emit,
-    )
-    .await;
-    let sink = sink.lock().unwrap();
-    assert_eq!(sink.len(), 1);
-    assert_eq!(sink[0].0, "noop-1");
-    assert_eq!(sink[0].1, "agent_start");
-    assert_eq!(sink[0].2, "noop");
-    assert!(sink[0].3.is_none());
+    let (_, execs) = reg
+        .run(
+            HookEvent::AgentStart {
+                session_id: Uuid::new_v4(),
+                model: "m",
+                provider: "p",
+            },
+            path(),
+        )
+        .await;
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].hook_id, "noop-1");
+    assert_eq!(execs[0].event_kind, "agent_start");
+    assert_eq!(execs[0].result_kind, "noop");
+    assert!(execs[0].summary.is_none());
 }
 
 fn context_ready_event<'a>(sid: Uuid, tid: Uuid, context: &'a [ChatMessage]) -> HookEvent<'a> {
@@ -525,8 +479,6 @@ async fn context_ready_inject_accumulates() {
             }],
         }],
     )));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
     let ctx = vec![ChatMessage {
         role: ChatRole::System,
         content: "sys".into(),
@@ -534,11 +486,10 @@ async fn context_ready_inject_accumulates() {
         tool_name: None,
         tool_calls: None,
     }];
-    let result = reg
+    let (result, _execs) = reg
         .run(
             context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
             path(),
-            &mut emit,
         )
         .await;
     match result {
@@ -579,14 +530,11 @@ async fn context_ready_replace_last_wins() {
             }],
         }],
     )));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
     let ctx = vec![];
-    let result = reg
+    let (result, _execs) = reg
         .run(
             context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
             path(),
-            &mut emit,
         )
         .await;
     match result {
@@ -637,14 +585,11 @@ async fn context_ready_replace_drops_concurrent_inject() {
             ],
         }],
     )));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
     let ctx = vec![];
-    let result = reg
+    let (result, _execs) = reg
         .run(
             context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
             path(),
-            &mut emit,
         )
         .await;
     match result {
@@ -669,14 +614,11 @@ async fn context_ready_block_bails() {
             reason: "context too large".into(),
         }],
     )));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
     let ctx = vec![];
-    let result = reg
+    let (result, _execs) = reg
         .run(
             context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
             path(),
-            &mut emit,
         )
         .await;
     assert_eq!(
@@ -696,14 +638,11 @@ async fn context_ready_noop_returns_continue() {
         HookPoints::CONTEXT_READY,
         vec![HookAction::NoOp],
     )));
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
     let ctx = vec![];
-    let result = reg
+    let (result, _execs) = reg
         .run(
             context_ready_event(Uuid::new_v4(), Uuid::new_v4(), &ctx),
             path(),
-            &mut emit,
         )
         .await;
     assert_eq!(result, HookResult::Continue);
@@ -719,22 +658,20 @@ async fn context_ready_fires_once_per_turn() {
     ));
     let hook_weak = Arc::clone(&hook);
     reg.register(hook);
-    let sink: Arc<Mutex<Sink>> = Arc::new(Mutex::new(Vec::new()));
-    let mut emit = make_emit(Arc::clone(&sink));
     let sid = Uuid::new_v4();
     let tid = Uuid::new_v4();
 
     // TurnStart should NOT trigger the context_ready hook
-    reg.run(
-        HookEvent::TurnStart {
-            session_id: sid,
-            turn_id: tid,
-            user_message: "hi",
-        },
-        path(),
-        &mut emit,
-    )
-    .await;
+    let (_, _execs) = reg
+        .run(
+            HookEvent::TurnStart {
+                session_id: sid,
+                turn_id: tid,
+                user_message: "hi",
+            },
+            path(),
+        )
+        .await;
     assert!(
         hook_weak.calls().is_empty(),
         "CONTEXT_READY hook should not fire on TurnStart"
@@ -748,8 +685,7 @@ async fn context_ready_fires_once_per_turn() {
         tool_name: None,
         tool_calls: None,
     }];
-    reg.run(context_ready_event(sid, tid, &ctx), path(), &mut emit)
-        .await;
+    let (_, _execs) = reg.run(context_ready_event(sid, tid, &ctx), path()).await;
     assert_eq!(
         hook_weak.calls(),
         vec!["context_ready"],
