@@ -95,14 +95,116 @@ impl Hook for ExternalHook {
         event: HookEvent<'_>,
         ctx: &HookCtx<'_>,
     ) -> Result<HookAction, AgentError> {
-        // Filled in Task 6. Stub exercises helpers so they're not flagged
-        // dead-code before Task 6 wires them up. Returns NoOp.
-        let _timeout = self.resolve_timeout(ctx);
-        let _command = &self.command;
-        let env = build_envelope(&event, &self.config, &self.id, ctx.working_dir, 0);
-        let _envelope_str = serde_json::to_string(&env).ok();
-        let _last = last_non_empty_line(&[]);
-        Ok(parse_action(r#"{"action":"noop"}"#).unwrap_or(HookAction::NoOp))
+        use tokio::io::AsyncWriteExt;
+        use tokio::process::Command;
+
+        let timeout = self.resolve_timeout(ctx);
+        let timeout_ms = timeout.as_millis() as u64;
+        let envelope = build_envelope(&event, &self.config, &self.id, ctx.working_dir, timeout_ms);
+        let envelope_str =
+            serde_json::to_string(&envelope).map_err(|e| AgentError::ExternalHook {
+                hook_id: self.id.clone(),
+                detail: format!("envelope serialize: {e}"),
+            })?;
+
+        if self.command.is_empty() {
+            return Err(AgentError::ExternalHook {
+                hook_id: self.id.clone(),
+                detail: "empty command".into(),
+            });
+        }
+
+        // kill_on_drop(true) ensures child is SIGKILL'd+reaped when the
+        // timeout future is dropped (the timeout branch can't reach child
+        // because wait_with_output consumes by ownership).
+        let mut child = Command::new(&self.command[0])
+            .args(&self.command[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| AgentError::ExternalHook {
+                hook_id: self.id.clone(),
+                detail: format!("spawn: {e}"),
+            })?;
+
+        // writer task: feed JSON envelope into stdin then close. Best-effort
+        // (writer task errors are ignored). Closes stdin on drop, unblocking
+        // the child's stdin reads if any.
+        let stdin = child.stdin.take().expect("piped");
+        let envelope_bytes = format!("{}\n", envelope_str).into_bytes();
+        let writer_handle: tokio::task::JoinHandle<std::io::Result<()>> =
+            tokio::spawn(async move {
+                let mut stdin = stdin;
+                stdin.write_all(&envelope_bytes).await
+            });
+
+        // await output with timeout. wait_with_output consumes `child`;
+        // kill_on_drop(true) handles cleanup if the future is cancelled.
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = writer_handle.await;
+                self.log_stderr(Vec::new());
+                return Err(AgentError::ExternalHook {
+                    hook_id: self.id.clone(),
+                    detail: format!("wait: {e}"),
+                });
+            }
+            Err(_) => {
+                // Inner future (owning child) dropped here; child killed on drop.
+                let _ = writer_handle.await;
+                self.log_stderr(Vec::new());
+                return Err(AgentError::ExternalHook {
+                    hook_id: self.id.clone(),
+                    detail: "timeout".into(),
+                });
+            }
+        };
+
+        let _ = writer_handle.await;
+        self.log_stderr(output.stderr.clone());
+
+        if !output.status.success() {
+            return Err(AgentError::ExternalHook {
+                hook_id: self.id.clone(),
+                detail: format!("exit={}", output.status.code().unwrap_or(-1)),
+            });
+        }
+
+        let last_line = last_non_empty_line(&output.stdout);
+        parse_action(last_line).map_err(|detail| AgentError::ExternalHook {
+            hook_id: self.id.clone(),
+            detail,
+        })
+    }
+}
+
+impl ExternalHook {
+    /// Truncate child-process stderr to 4KB and forward via tracing::warn.
+    /// Empty stderr is silently dropped. Successful hook output isn't logged
+    /// here; stdout was already consumed by parse_action.
+    fn log_stderr(&self, stderr: Vec<u8>) {
+        let stderr = String::from_utf8_lossy(&stderr);
+        if stderr.is_empty() {
+            return;
+        }
+        let trimmed = if stderr.len() > 4096 {
+            format!(
+                "{}...(truncated {} bytes total)",
+                &stderr[..4096],
+                stderr.len()
+            )
+        } else {
+            stderr.to_string()
+        };
+        tracing::warn!(
+            target: "parrotd::ext_hook",
+            hook_id = %self.id,
+            stderr = %trimmed,
+            "external hook produced stderr"
+        );
     }
 }
 
