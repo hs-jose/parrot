@@ -53,6 +53,7 @@ mod tests {
             enabled: vec!["nonexistent".into()],
             timeout_seconds: 5,
             configs: HashMap::new(),
+            external: Vec::new(),
         };
         let reg = build_registry(&cfg);
         let _ = reg;
@@ -68,6 +69,7 @@ mod tests {
             ],
             timeout_seconds: 5,
             configs: HashMap::new(),
+            external: Vec::new(),
         };
         let _reg = build_registry(&cfg);
     }
@@ -90,6 +92,7 @@ mod tests {
             enabled: vec!["shell_denylist".into()],
             timeout_seconds: 5,
             configs,
+            external: Vec::new(),
         };
         let _reg = build_registry(&cfg);
     }

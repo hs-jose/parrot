@@ -65,11 +65,16 @@ pub struct HooksConfig {
     pub enabled: Vec<String>,
     #[serde(default = "default_hook_timeout")]
     pub timeout_seconds: u64,
-    /// Per-hook config subtables. Populated from `[hooks.<id>]` TOML tables
-    /// via `#[serde(flatten)]`. Each hook owns its typed config struct and
-    /// deserializes its entry from this map.
+    /// Per-hook config subtables for built-in hooks. Populated from
+    /// `[hooks.<id>]` TOML tables via `#[serde(flatten)]`. Each hook owns
+    /// its typed config struct and deserializes its entry from this map.
     #[serde(default, flatten)]
     pub configs: HashMap<String, toml::Value>,
+    /// External (fork-based) hook entries from `[[hooks.external]]`
+    /// subtables. Listed ⇒ enabled; orthogonal to `enabled` above which
+    /// only governs built-in hook ids.
+    #[serde(default)]
+    pub external: Vec<ExternalHookConfig>,
 }
 
 impl Default for HooksConfig {
@@ -81,8 +86,28 @@ impl Default for HooksConfig {
             ],
             timeout_seconds: default_hook_timeout(),
             configs: HashMap::new(),
+            external: Vec::new(),
         }
     }
+}
+
+/// One `[[hooks.external]]` entry. Daemon spawns `command` per event,
+/// feeds the serialized `HookEvent` (as JSON envelope) on stdin, and
+/// parses the last non-empty stdout line as a `HookAction` JSON.
+/// Failure to spawn / non-zero exit / non-JSON / unknown action ⇒ fail-open NoOp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalHookConfig {
+    pub id: String,
+    pub command: Vec<String>,
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default = "default_external_config")]
+    pub config: toml::Value,
+}
+
+fn default_external_config() -> toml::Value {
+    toml::Value::Table(toml::value::Table::new())
 }
 
 impl AppConfig {
