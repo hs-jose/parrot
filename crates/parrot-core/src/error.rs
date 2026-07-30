@@ -16,6 +16,8 @@ pub enum AgentError {
     Aborted,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("external hook {hook_id} failed: {detail}")]
+    ExternalHook { hook_id: String, detail: String },
 }
 
 #[derive(Debug, Error)]
