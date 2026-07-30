@@ -1,7 +1,7 @@
 use crate::context::ContextManager;
 use crate::error::AgentError;
 use crate::event_log::EventLog;
-use crate::hooks::{HookEvent, HookRegistry, HookResult};
+use crate::hooks::{HookEvent, HookExecution, HookRegistry, HookResult};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
 use crate::tool::{ToolContext, ToolRegistry};
@@ -151,8 +151,8 @@ impl ReActEngine {
             tracing::warn!(error = ?e, "failed to persist AgentStart");
         }
 
-        let mut emit = make_emit(session_id, &event_tx);
-        self.hooks
+        let (_result, execs) = self
+            .hooks
             .run(
                 HookEvent::AgentStart {
                     session_id,
@@ -160,9 +160,9 @@ impl ReActEngine {
                     provider: &provider_id,
                 },
                 &self.working_dir,
-                &mut emit,
             )
             .await;
+        emit_hook_executions(&execs, session_id, &event_tx);
 
         // 若 resume 时检测到事件日志损坏，发一次 ReplayIntegrityWarning 即清空，
         // 落盘后下次 resume 不会再重复报。
@@ -200,7 +200,7 @@ impl ReActEngine {
             match cmd_rx.recv().await {
                 Some(SessionCmd::Chat { message }) => {
                     let turn_id = Uuid::new_v4();
-                    let turn_start_outcome = self
+                    let (turn_start_outcome, execs) = self
                         .hooks
                         .run(
                             HookEvent::TurnStart {
@@ -209,9 +209,9 @@ impl ReActEngine {
                                 user_message: &message,
                             },
                             &self.working_dir,
-                            &mut emit,
                         )
                         .await;
+                    emit_hook_executions(&execs, session_id, &event_tx);
                     match turn_start_outcome {
                         HookResult::Block { reason, .. } => {
                             let turn_end = AgentEvent::TurnEnd {
@@ -327,8 +327,7 @@ impl ReActEngine {
         {
             context_manager.prune(context);
             let session_id = self.session_id;
-            let mut emit = make_emit(session_id, event_tx);
-            let outcome = self
+            let (outcome, execs) = self
                 .hooks
                 .run(
                     HookEvent::ContextReady {
@@ -337,9 +336,9 @@ impl ReActEngine {
                         context,
                     },
                     &self.working_dir,
-                    &mut emit,
                 )
                 .await;
+            emit_hook_executions(&execs, session_id, event_tx);
             match outcome {
                 HookResult::Block { reason, .. } => {
                     return Ok((TurnStopReason::BlockedHook(reason), Usage::default()));
@@ -594,23 +593,21 @@ impl ReActEngine {
         let _ = event_tx.send(tool_start.clone()).await.ok();
         let _ = event_log.append(tool_start);
 
-        let tool_call_outcome = {
-            let mut emit = make_emit(session_id, event_tx);
-            self.hooks
-                .run(
-                    HookEvent::ToolCall {
-                        session_id,
-                        turn_id,
-                        parent_message_id,
-                        tool_call_id: &tc.id,
-                        tool_name: &tc.name,
-                        arguments: &args,
-                    },
-                    &self.working_dir,
-                    &mut emit,
-                )
-                .await
-        };
+        let (tool_call_outcome, execs) = self
+            .hooks
+            .run(
+                HookEvent::ToolCall {
+                    session_id,
+                    turn_id,
+                    parent_message_id,
+                    tool_call_id: &tc.id,
+                    tool_name: &tc.name,
+                    arguments: &args,
+                },
+                &self.working_dir,
+            )
+            .await;
+        emit_hook_executions(&execs, session_id, event_tx);
         if let HookResult::Block { reason, .. } = tool_call_outcome {
             let result = parrot_protocol::types::ToolOutput {
                 content: format!("blocked: {reason}"),
@@ -656,22 +653,20 @@ impl ReActEngine {
         };
 
         let result = if matches!(decision, ConfirmDecision::Approve) {
-            {
-                let mut emit = make_emit(session_id, event_tx);
-                self.hooks
-                    .run(
-                        HookEvent::ToolExecutionStart {
-                            session_id,
-                            turn_id,
-                            tool_call_id: &tc.id,
-                            tool_name: &tc.name,
-                            arguments: &args,
-                        },
-                        &self.working_dir,
-                        &mut emit,
-                    )
-                    .await;
-            }
+            let (_, execs) = self
+                .hooks
+                .run(
+                    HookEvent::ToolExecutionStart {
+                        session_id,
+                        turn_id,
+                        tool_call_id: &tc.id,
+                        tool_name: &tc.name,
+                        arguments: &args,
+                    },
+                    &self.working_dir,
+                )
+                .await;
+            emit_hook_executions(&execs, session_id, event_tx);
             match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args.clone(), &tool_ctx))
                 .await
             {
@@ -707,23 +702,21 @@ impl ReActEngine {
             }
         };
 
-        let tool_result_decision = {
-            let mut emit = make_emit(session_id, event_tx);
-            self.hooks
-                .run(
-                    HookEvent::ToolResult {
-                        session_id,
-                        turn_id,
-                        tool_call_id: &tc.id,
-                        tool_name: &tc.name,
-                        input: &args,
-                        result: &result,
-                    },
-                    &self.working_dir,
-                    &mut emit,
-                )
-                .await
-        };
+        let (tool_result_decision, execs) = self
+            .hooks
+            .run(
+                HookEvent::ToolResult {
+                    session_id,
+                    turn_id,
+                    tool_call_id: &tc.id,
+                    tool_name: &tc.name,
+                    input: &args,
+                    result: &result,
+                },
+                &self.working_dir,
+            )
+            .await;
+        emit_hook_executions(&execs, session_id, event_tx);
         let result = match tool_result_decision {
             HookResult::Replace {
                 content, is_error, ..
@@ -876,26 +869,22 @@ where
     }
 }
 
-/// Build a non-async emit closure backed by `tokio::mpsc::Sender::try_send`.
-/// Drives fire-and-forget + noop + inject_messages + replace_result +
-/// timeout + error `HookFired` emissions from inside the registry dispatch
-/// helpers. The returned closure owns a cloned `Sender` and a copied
-/// `session_id` (`'static`), so it does NOT borrow `self` and is safe to use
-/// alongside other `&self` method calls. If the channel is full the event is
-/// dropped — the buffer is 64 and losing a `HookFired{noop}` is acceptable
-/// observability telemetry.
-fn make_emit(
+/// Forward per-hook telemetry records (`Vec<HookExecution>`) from
+/// `HookRegistry::run` to the wire as `AgentEvent::HookFired`. Non-blocking:
+/// `try_send` silently drops on full channel (buffer is 64; losing a
+/// `HookFired{noop}` is acceptable observability telemetry).
+fn emit_hook_executions(
+    executions: &[HookExecution],
     session_id: Uuid,
     event_tx: &mpsc::Sender<AgentEvent>,
-) -> impl FnMut(&str, &str, &str, Option<String>) + Send {
-    let tx = event_tx.clone();
-    move |hook_id: &str, event_kind: &str, result_kind: &str, summary: Option<String>| {
-        let _ = tx.try_send(AgentEvent::HookFired {
+) {
+    for ex in executions {
+        let _ = event_tx.try_send(AgentEvent::HookFired {
             session_id,
-            hook_id: hook_id.to_string(),
-            event_kind: event_kind.to_string(),
-            result_kind: result_kind.to_string(),
-            summary,
+            hook_id: ex.hook_id.clone(),
+            event_kind: ex.event_kind.clone(),
+            result_kind: ex.result_kind.clone(),
+            summary: ex.summary.clone(),
         });
     }
 }
@@ -954,16 +943,16 @@ impl AgentEndGuard {
         }
         let usage = self.total_usage.lock().unwrap().clone();
         let reason = self.reason.lock().unwrap().clone();
-        let mut emit = make_emit(self.session_id, &self.event_tx);
-        self.hooks
+        let (_, execs) = self
+            .hooks
             .run(
                 HookEvent::AgentEnd {
                     session_id: self.session_id,
                 },
                 &self.working_dir,
-                &mut emit,
             )
             .await;
+        emit_hook_executions(&execs, self.session_id, &self.event_tx);
         let event = AgentEvent::AgentEnd {
             session_id: self.session_id,
             reason,

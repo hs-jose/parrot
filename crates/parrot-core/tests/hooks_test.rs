@@ -162,7 +162,7 @@ impl RecordingHook {
 
 #[async_trait::async_trait]
 impl Hook for RecordingHook {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         self.id
     }
     fn supported(&self) -> HookPoints {
@@ -369,7 +369,7 @@ async fn timeout_and_error_are_fail_open_noop() {
     struct Slow;
     #[async_trait::async_trait]
     impl Hook for Slow {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "slow"
         }
         fn supported(&self) -> HookPoints {
@@ -387,7 +387,7 @@ async fn timeout_and_error_are_fail_open_noop() {
     struct Boom;
     #[async_trait::async_trait]
     impl Hook for Boom {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "boom"
         }
         fn supported(&self) -> HookPoints {
@@ -465,7 +465,7 @@ async fn fire_and_forget_emits_noop_on_completed() {
     struct NoopHook;
     #[async_trait::async_trait]
     impl Hook for NoopHook {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             "noop-1"
         }
         fn supported(&self) -> HookPoints {

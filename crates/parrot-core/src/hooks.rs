@@ -145,6 +145,50 @@ enum HookFailure {
     Error(String),
 }
 
+/// Per-hook telemetry produced by [`HookRegistry::run`]. Pure observability;
+/// control flow is driven by the returned [`HookResult`]. Field names mirror
+/// the wire shape of [`AgentEvent::HookFired`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookExecution {
+    pub hook_id: String,
+    pub event_kind: String,
+    pub result_kind: String,
+    pub summary: Option<String>,
+}
+
+impl HookExecution {
+    fn from_outcome(
+        hook_id: &str,
+        event_kind: &str,
+        outcome: &Result<HookAction, HookFailure>,
+    ) -> Self {
+        let (result_kind, summary) = match outcome {
+            Ok(HookAction::Block { reason }) => ("block", Some(reason.clone())),
+            Ok(HookAction::InjectMessages { messages }) => (
+                "inject_messages",
+                Some(format!("{} messages", messages.len())),
+            ),
+            Ok(HookAction::ReplaceResult { content, is_error }) => (
+                "replace_result",
+                Some(format!("{} bytes, is_error={}", content.len(), is_error)),
+            ),
+            Ok(HookAction::ReplaceContext { messages }) => (
+                "replace_context",
+                Some(format!("{} messages", messages.len())),
+            ),
+            Ok(HookAction::NoOp) => ("noop", None),
+            Err(HookFailure::Timeout) => ("timeout", None),
+            Err(HookFailure::Error(detail)) => ("error", Some(detail.clone())),
+        };
+        Self {
+            hook_id: hook_id.to_owned(),
+            event_kind: event_kind.to_owned(),
+            result_kind: result_kind.to_owned(),
+            summary,
+        }
+    }
+}
+
 pub struct HookCtx<'a> {
     pub session_id: Uuid,
     pub working_dir: &'a Path,
@@ -153,7 +197,7 @@ pub struct HookCtx<'a> {
 
 #[async_trait]
 pub trait Hook: Send + Sync {
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
     fn supported(&self) -> HookPoints;
     async fn handle(
         &self,
@@ -183,10 +227,6 @@ impl HookRegistry {
         self.handlers.push(hook);
     }
 
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
     fn interested(&self, point: HookPoints) -> Vec<Arc<dyn Hook>> {
         self.handlers
             .iter()
@@ -210,23 +250,25 @@ impl HookRegistry {
 
     /// Run all hooks interested in `event` in waterfall order.
     ///
-    /// Emits a `HookFired` for every outcome (including `Block`) via `emit`.
-    /// The caller does not need to emit anything extra.
+    /// Returns the aggregated decision (`HookResult`) plus a per-hook
+    /// telemetry vector (`Vec<HookExecution>`) the caller must turn into
+    /// `AgentEvent::HookFired` wire events at the boundary. Control flow is
+    /// driven solely by `HookResult`; `executions` is observability only.
     ///
     /// Waterfall semantics:
     /// - `Block` → bail immediately, return `HookResult::Block`.
     /// - `InjectMessages` → accumulate across all hooks.
     /// - `ReplaceResult` → last write wins.
-    /// - Timeout / Error → emitted as telemetry, hook is skipped.
+    /// - `ReplaceContext` → last write wins (drops concurrent `Inject`).
+    /// - Timeout / Error → recorded in `executions`, hook is skipped.
     pub async fn run(
         &self,
         event: HookEvent<'_>,
         working_dir: &Path,
-        emit: &mut (impl FnMut(&str, &str, &str, Option<String>) + Send),
-    ) -> HookResult {
+    ) -> (HookResult, Vec<HookExecution>) {
         let hooks = self.interested(event.point());
         if hooks.is_empty() {
-            return HookResult::Continue;
+            return (HookResult::Continue, Vec::new());
         }
 
         let ctx = HookCtx {
@@ -238,68 +280,57 @@ impl HookRegistry {
         let mut inject_acc: Vec<ChatMessage> = Vec::new();
         let mut replace_last: Option<(String, String, bool)> = None; // (hook_id, content, is_error)
         let mut replace_ctx_last: Option<(String, Vec<ChatMessage>)> = None; // (hook_id, messages)
+        let mut executions: Vec<HookExecution> = Vec::new();
 
         for hook in hooks {
             let kind = event.kind();
             let outcome = self.call_with_timeout(&hook, event, &ctx).await;
+            executions.push(HookExecution::from_outcome(hook.id(), kind, &outcome));
             match &outcome {
                 Ok(HookAction::Block { reason }) => {
-                    emit(hook.id(), kind, "block", Some(reason.clone()));
-                    return HookResult::Block {
-                        hook_id: hook.id().into(),
-                        reason: reason.clone(),
-                    };
+                    return (
+                        HookResult::Block {
+                            hook_id: hook.id().into(),
+                            reason: reason.clone(),
+                        },
+                        executions,
+                    );
                 }
                 Ok(HookAction::InjectMessages { messages }) => {
-                    emit(
-                        hook.id(),
-                        kind,
-                        "inject_messages",
-                        Some(format!("{} messages", messages.len())),
-                    );
                     inject_acc.extend(messages.clone());
                 }
                 Ok(HookAction::ReplaceResult { content, is_error }) => {
-                    emit(
-                        hook.id(),
-                        kind,
-                        "replace_result",
-                        Some(format!("{} bytes, is_error={}", content.len(), is_error)),
-                    );
                     replace_last = Some((hook.id().to_string(), content.clone(), *is_error));
                 }
                 Ok(HookAction::ReplaceContext { messages }) => {
-                    emit(
-                        hook.id(),
-                        kind,
-                        "replace_context",
-                        Some(format!("{} messages", messages.len())),
-                    );
                     replace_ctx_last = Some((hook.id().to_string(), messages.clone()));
                 }
-                Ok(HookAction::NoOp) => emit(hook.id(), kind, "noop", None),
-                Err(HookFailure::Timeout) => emit(hook.id(), kind, "timeout", None),
-                Err(HookFailure::Error(detail)) => {
-                    emit(hook.id(), kind, "error", Some(detail.clone()))
-                }
+                Ok(HookAction::NoOp) => {}
+                Err(HookFailure::Timeout) | Err(HookFailure::Error(_)) => {}
             }
         }
 
         if let Some((hook_id, content, is_error)) = replace_last {
-            return HookResult::Replace {
-                hook_id,
-                content,
-                is_error,
-            };
+            return (
+                HookResult::Replace {
+                    hook_id,
+                    content,
+                    is_error,
+                },
+                executions,
+            );
         }
         if let Some((hook_id, messages)) = replace_ctx_last {
-            return HookResult::ReplaceContext { hook_id, messages };
+            return (HookResult::ReplaceContext { hook_id, messages }, executions);
         }
         if !inject_acc.is_empty() {
-            return HookResult::Inject {
-                messages: inject_acc,
-            };
+            return (
+                HookResult::Inject {
+                    messages: inject_acc,
+                },
+                executions,
+            );
         }
-        HookResult::Continue
+        (HookResult::Continue, executions)
     }
 }
