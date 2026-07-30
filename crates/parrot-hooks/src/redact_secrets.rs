@@ -102,7 +102,7 @@ impl RedactSecrets {
 
 #[async_trait]
 impl Hook for RedactSecrets {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "redact_secrets"
     }
     fn supported(&self) -> HookPoints {

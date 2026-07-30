@@ -30,7 +30,7 @@ pub struct DangerousCommandBlocker;
 
 #[async_trait]
 impl Hook for DangerousCommandBlocker {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "dangerous_command_blocker"
     }
     fn supported(&self) -> HookPoints {
