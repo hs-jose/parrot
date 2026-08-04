@@ -17,3 +17,39 @@ tracing        = { workspace = true }
 [dev-dependencies]
 uuid       = { workspace = true }
 parrot-protocol = { path = "../parrot-protocol" }
+
+[[bin]]
+name = "mock_hook_block"
+path = "tests/fixtures/mock_hook_block.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "mock_hook_noop"
+path = "tests/fixtures/mock_hook_noop.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "mock_hook_silent"
+path = "tests/fixtures/mock_hook_silent.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "mock_hook_exit1"
+path = "tests/fixtures/mock_hook_exit1.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "mock_hook_sleep"
+path = "tests/fixtures/mock_hook_sleep.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "mock_hook_unknown"
+path = "tests/fixtures/mock_hook_unknown.rs"
+test = false
+doctest = false
