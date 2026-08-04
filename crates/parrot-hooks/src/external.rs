@@ -191,9 +191,15 @@ impl ExternalHook {
             return;
         }
         let trimmed = if stderr.len() > 4096 {
+            // Find the last char boundary <= 4096 to avoid panicking on
+            // multi-byte UTF-8 (e.g., Chinese/emoji in hook stderr).
+            let mut end = 4096;
+            while end > 0 && !stderr.is_char_boundary(end) {
+                end -= 1;
+            }
             format!(
                 "{}...(truncated {} bytes total)",
-                &stderr[..4096],
+                &stderr[..end],
                 stderr.len()
             )
         } else {
