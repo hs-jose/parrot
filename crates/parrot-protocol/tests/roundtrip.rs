@@ -428,3 +428,85 @@ fn tool_list_roundtrip() {
     let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(msg, decoded);
 }
+
+#[test]
+fn hook_fired_roundtrip() {
+    let sid = uuid::Uuid::new_v4();
+    let event = AgentEvent::HookFired {
+        session_id: sid,
+        hook_id: "dangerous_command_blocker".into(),
+        event_kind: "tool_call".into(),
+        result_kind: "block".into(),
+        summary: Some("dangerous command: rm -rf /".into()),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    assert!(
+        json.contains(r#""type":"HookFired""#),
+        "expected HookFired tag in: {json}"
+    );
+    let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(event, decoded);
+}
+
+#[test]
+fn hook_fired_no_summary_roundtrip() {
+    let sid = uuid::Uuid::new_v4();
+    let event = AgentEvent::HookFired {
+        session_id: sid,
+        hook_id: "redact_secrets".into(),
+        event_kind: "tool_result".into(),
+        result_kind: "replace_result".into(),
+        summary: None,
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(event, decoded);
+    assert!(
+        !json.contains(r#""summary""#),
+        "None summary must be skipped"
+    );
+}
+
+#[test]
+fn turn_stop_reason_blocked_hook_roundtrip() {
+    let reason = TurnStopReason::BlockedHook("policy".into());
+    let json = serde_json::to_string(&reason).unwrap();
+    assert!(
+        json.contains(r#""BlockedHook""#),
+        "expected BlockedHook tag in: {json}"
+    );
+    let decoded: TurnStopReason = serde_json::from_str(&json).unwrap();
+    assert_eq!(reason, decoded);
+}
+
+#[test]
+fn hook_action_replace_context_roundtrip() {
+    use parrot_core::hooks::HookAction;
+    use parrot_core::types::{ChatMessage, ChatRole};
+
+    let action = HookAction::ReplaceContext {
+        messages: vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: "system prompt".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "hello".into(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+        ],
+    };
+    let json = serde_json::to_string(&action).unwrap();
+    assert!(
+        json.contains(r#""kind":"replace_context""#),
+        "expected replace_context tag in: {json}"
+    );
+    let decoded: HookAction = serde_json::from_str(&json).unwrap();
+    assert_eq!(action, decoded);
+}

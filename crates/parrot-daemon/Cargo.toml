@@ -10,6 +10,8 @@ parrot-config    = { path = "../parrot-config" }
 parrot-transport = { path = "../parrot-transport" }
 parrot-providers = { path = "../parrot-providers" }
 parrot-tools     = { path = "../parrot-tools" }
+parrot-hooks     = { path = "../parrot-hooks" }
+async-trait     = { workspace = true }
 tokio            = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }

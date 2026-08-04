@@ -45,7 +45,6 @@ pub async fn register_all(registry: &ToolRegistry, config: &AppConfig) {
         registry
             .register(std::sync::Arc::new(shell_exec::ShellExecTool::new(
                 working_dir.clone(),
-                config.tools.sandbox.denylist.clone(),
             )))
             .await;
     }

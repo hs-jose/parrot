@@ -7,6 +7,7 @@ use parrot_core::provider::ProviderRegistry;
 use parrot_core::session::{ConfirmConfig, SessionCmd, SessionManager};
 use parrot_core::tool::ToolRegistry;
 use parrot_core::types::GenerateConfig;
+use parrot_hooks::build_registry;
 use parrot_protocol::agent_event::{AgentEvent, PersistedAgentEvent};
 use parrot_protocol::types::{
     ModelInfo as ProtocolModelInfo, SessionMeta as ProtocolSessionMeta, ToolDefinitionWire,
@@ -89,6 +90,8 @@ pub async fn run_with_confirm_timeout(
         router: Some(Arc::clone(&confirm_router)),
     };
 
+    let hook_registry = build_registry(&config.hooks);
+
     let session_manager = Arc::new(RwLock::new(
         SessionManager::new(
             Arc::clone(&tool_registry),
@@ -97,7 +100,8 @@ pub async fn run_with_confirm_timeout(
             sessions_dir,
             working_dir,
         )
-        .with_confirm_config(confirm_config),
+        .with_confirm_config(confirm_config)
+        .with_hooks(hook_registry),
     ));
     // Wrap once in an Arc so each spawned handler can share the daemon's
     // current default config without per-connection cloning.

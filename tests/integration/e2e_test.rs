@@ -835,6 +835,497 @@ async fn e2e_abort_mid_stream_cancels_react_turn() {
     daemon_handle.abort();
 }
 
+// ---------------------------------------------------------------------------
+// E2E: tool_call hook blocks a dangerous shell command
+// ---------------------------------------------------------------------------
+
+struct DangerousShellExecProvider {
+    call_count: AtomicU32,
+}
+
+impl DangerousShellExecProvider {
+    fn new() -> Self {
+        Self {
+            call_count: AtomicU32::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for DangerousShellExecProvider {
+    fn provider_id(&self) -> &str {
+        "mock"
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        Ok(vec![ModelInfo {
+            id: "mock-model".to_string(),
+            name: "Mock Model".to_string(),
+            provider: "mock".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 8192,
+        }])
+    }
+
+    async fn chat_stream(
+        &self,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatStream, ProviderError> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
+        tokio::spawn(async move {
+            match n {
+                0 => {
+                    tx.send(ProviderStreamEvent::ToolCallStart {
+                        id: "tc_danger".to_string(),
+                        name: "shell_exec".to_string(),
+                    })
+                    .await
+                    .ok();
+                    tx.send(ProviderStreamEvent::ToolCallDelta {
+                        id: "tc_danger".to_string(),
+                        args_delta: r#"{"command":"rm -rf /"}"#.to_string(),
+                    })
+                    .await
+                    .ok();
+                    tx.send(ProviderStreamEvent::ToolCallEnd {
+                        id: "tc_danger".to_string(),
+                        arguments: json!({"command": "rm -rf /"}),
+                    })
+                    .await
+                    .ok();
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::ToolUse,
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                        },
+                    })
+                    .await
+                    .ok();
+                }
+                _ => {
+                    tx.send(ProviderStreamEvent::TextDelta {
+                        delta: "done".to_string(),
+                    })
+                    .await
+                    .ok();
+                    tx.send(ProviderStreamEvent::Finish {
+                        stop_reason: ProviderStopReason::EndTurn,
+                        usage: Usage {
+                            input_tokens: 20,
+                            output_tokens: 10,
+                        },
+                    })
+                    .await
+                    .ok();
+                }
+            }
+        });
+        Ok(ChatStream { inner: rx })
+    }
+
+    async fn chat(
+        &self,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatMessage, ProviderError> {
+        unimplemented!("chat() not used in ReAct loop")
+    }
+}
+
+struct CountingShellExec {
+    call_count: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Tool for CountingShellExec {
+    fn name(&self) -> &str {
+        "shell_exec"
+    }
+    fn description(&self) -> &str {
+        "Executes a shell command."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+    async fn call(&self, _arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput {
+            content: "executed".to_string(),
+            is_error: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn e2e_hook_blocks_tool_call() {
+    let port = free_port();
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("data");
+    let token_path = tmp.path().join("token");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let auth = parrot_daemon::auth::Auth::new(&token_path)
+        .await
+        .expect("init auth");
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(!token.is_empty(), "auth token file should be populated");
+    let auth = Arc::new(auth);
+
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(
+            Arc::new(DangerousShellExecProvider::new()) as Arc<dyn LlmProvider>,
+            vec!["mock-model".to_string()],
+        )
+        .await;
+
+    let shell_call_count = Arc::new(AtomicU32::new(0));
+    let tool_registry = Arc::new(ToolRegistry::new());
+    tool_registry
+        .register(Arc::new(CountingShellExec {
+            call_count: Arc::clone(&shell_call_count),
+        }) as Arc<dyn Tool>)
+        .await;
+
+    let mut config = test_config(port, &data_dir, &token_path);
+    config.hooks.enabled = vec!["dangerous_command_blocker".to_string()];
+
+    let daemon_handle = tokio::spawn(async move {
+        parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
+            .await
+            .expect("daemon run_with");
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let url = format!("ws://127.0.0.1:{port}");
+    let client = parrot_transport::WsTransportClient::new();
+    let mut conn = client.connect(&url, &token).await.expect("client connect");
+
+    expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::HelloAck { .. } = m {
+                Some(())
+            } else {
+                None
+            }
+        },
+        "HelloAck",
+    )
+    .await;
+
+    conn.sender
+        .send(ClientMessage::CreateSession {
+            config: Some(SessionConfig {
+                model: None,
+                provider: None,
+                system_prompt: None,
+            }),
+        })
+        .await
+        .expect("send CreateSession");
+
+    let session_id = expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::SessionCreated { session_id } = m {
+                Some(*session_id)
+            } else {
+                None
+            }
+        },
+        "SessionCreated",
+    )
+    .await;
+
+    conn.sender
+        .send(ClientMessage::Chat {
+            session_id,
+            message: "please run rm -rf /".to_string(),
+        })
+        .await
+        .expect("send Chat");
+
+    let tool_name = expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::ToolStart {
+                session_id: sid,
+                tool_name,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some(tool_name.clone());
+                }
+            }
+            None
+        },
+        "ToolStart",
+    )
+    .await;
+    assert_eq!(tool_name, "shell_exec");
+
+    let (hook_id, event_kind, result_kind) = expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::HookFired {
+                session_id: sid,
+                hook_id,
+                event_kind,
+                result_kind,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some((hook_id.clone(), event_kind.clone(), result_kind.clone()));
+                }
+            }
+            None
+        },
+        "HookFired",
+    )
+    .await;
+    assert_eq!(hook_id, "dangerous_command_blocker");
+    assert_eq!(event_kind, "tool_call");
+    assert_eq!(result_kind, "block");
+
+    let (result_content, is_error) = expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::ToolEnd {
+                session_id: sid,
+                result,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some((result.content.clone(), result.is_error));
+                }
+            }
+            None
+        },
+        "ToolEnd",
+    )
+    .await;
+    assert!(is_error, "ToolEnd should be an error after block");
+    assert!(
+        result_content.starts_with("blocked:"),
+        "ToolEnd content should start with 'blocked:', got: {result_content}"
+    );
+
+    expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::TurnEnd {
+                session_id: sid,
+                stop_reason: TurnStopReason::EndTurn,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "TurnEnd(EndTurn)",
+    )
+    .await;
+
+    assert_eq!(
+        shell_call_count.load(Ordering::SeqCst),
+        0,
+        "CountingShellExec should NOT have been invoked (hook blocked before execute_tool)"
+    );
+
+    daemon_handle.abort();
+}
+
+#[tokio::test]
+async fn e2e_shell_denylist_blocks_rm_rf() {
+    let port = free_port();
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("data");
+    let token_path = tmp.path().join("token");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let auth = parrot_daemon::auth::Auth::new(&token_path)
+        .await
+        .expect("init auth");
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+    let auth = Arc::new(auth);
+
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(
+            Arc::new(DangerousShellExecProvider::new()) as Arc<dyn LlmProvider>,
+            vec!["mock-model".to_string()],
+        )
+        .await;
+
+    let shell_call_count = Arc::new(AtomicU32::new(0));
+    let tool_registry = Arc::new(ToolRegistry::new());
+    tool_registry
+        .register(Arc::new(CountingShellExec {
+            call_count: Arc::clone(&shell_call_count),
+        }) as Arc<dyn Tool>)
+        .await;
+
+    let mut config = test_config(port, &data_dir, &token_path);
+    config.hooks.enabled = vec!["shell_denylist".to_string()];
+
+    let daemon_handle = tokio::spawn(async move {
+        parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
+            .await
+            .expect("daemon run_with");
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let url = format!("ws://127.0.0.1:{port}");
+    let client = parrot_transport::WsTransportClient::new();
+    let mut conn = client.connect(&url, &token).await.expect("client connect");
+
+    expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::HelloAck { .. } = m {
+                Some(())
+            } else {
+                None
+            }
+        },
+        "HelloAck",
+    )
+    .await;
+
+    conn.sender
+        .send(ClientMessage::CreateSession {
+            config: Some(SessionConfig {
+                model: None,
+                provider: None,
+                system_prompt: None,
+            }),
+        })
+        .await
+        .expect("send CreateSession");
+
+    let session_id = expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::SessionCreated { session_id } = m {
+                Some(*session_id)
+            } else {
+                None
+            }
+        },
+        "SessionCreated",
+    )
+    .await;
+
+    conn.sender
+        .send(ClientMessage::Chat {
+            session_id,
+            message: "please run rm -rf /".to_string(),
+        })
+        .await
+        .expect("send Chat");
+
+    let (hook_id, event_kind, result_kind) = expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::HookFired {
+                session_id: sid,
+                hook_id,
+                event_kind,
+                result_kind,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some((hook_id.clone(), event_kind.clone(), result_kind.clone()));
+                }
+            }
+            None
+        },
+        "HookFired",
+    )
+    .await;
+    assert_eq!(hook_id, "shell_denylist");
+    assert_eq!(event_kind, "tool_call");
+    assert_eq!(result_kind, "block");
+
+    let (result_content, is_error) = expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::ToolEnd {
+                session_id: sid,
+                result,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some((result.content.clone(), result.is_error));
+                }
+            }
+            None
+        },
+        "ToolEnd",
+    )
+    .await;
+    assert!(is_error);
+    assert!(
+        result_content.starts_with("blocked:"),
+        "ToolEnd content should start with 'blocked:', got: {result_content}"
+    );
+
+    expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::TurnEnd {
+                session_id: sid,
+                stop_reason: TurnStopReason::EndTurn,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "TurnEnd(EndTurn)",
+    )
+    .await;
+
+    assert_eq!(
+        shell_call_count.load(Ordering::SeqCst),
+        0,
+        "CountingShellExec should NOT have been invoked (shell_denylist blocked before execute)"
+    );
+
+    daemon_handle.abort();
+}
+
 #[tokio::test]
 async fn e2e_agent_end_emitted_on_disconnect() {
     let provider = Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>;

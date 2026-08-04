@@ -9,3 +9,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+parrot-core = { path = "../parrot-core" }

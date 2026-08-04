@@ -286,6 +286,7 @@ impl App {
                     issue.kind, issue.dropped_event_count
                 )));
             }
+            AgentEvent::HookFired { .. } => {}
         }
     }
 

@@ -1,5 +1,6 @@
 use crate::error::ConfigError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7,6 +8,8 @@ pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub providers: Vec<ProviderConfig>,
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
     #[serde(rename = "session")]
     pub session: SessionConfig,
 }
@@ -42,7 +45,6 @@ pub struct ToolsConfig {
 pub struct SandboxConfig {
     pub working_dir: String,
     pub allowlist: Vec<String>,
-    pub denylist: Vec<String>,
     pub require_confirmation: Vec<String>,
 }
 
@@ -51,6 +53,61 @@ pub struct SessionConfig {
     pub data_dir: String,
     pub max_history_tokens: u32,
     pub keep_recent_turns: u32,
+}
+
+fn default_hook_timeout() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_seconds: u64,
+    /// Per-hook config subtables for built-in hooks. Populated from
+    /// `[hooks.<id>]` TOML tables via `#[serde(flatten)]`. Each hook owns
+    /// its typed config struct and deserializes its entry from this map.
+    #[serde(default, flatten)]
+    pub configs: HashMap<String, toml::Value>,
+    /// External (fork-based) hook entries from `[[hooks.external]]`
+    /// subtables. Listed ⇒ enabled; orthogonal to `enabled` above which
+    /// only governs built-in hook ids.
+    #[serde(default)]
+    pub external: Vec<ExternalHookConfig>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: vec![
+                "shell_denylist".to_string(),
+                "dangerous_command_blocker".to_string(),
+            ],
+            timeout_seconds: default_hook_timeout(),
+            configs: HashMap::new(),
+            external: Vec::new(),
+        }
+    }
+}
+
+/// One `[[hooks.external]]` entry. Daemon spawns `command` per event,
+/// feeds the serialized `HookEvent` (as JSON envelope) on stdin, and
+/// parses the last non-empty stdout line as a `HookAction` JSON.
+/// Failure to spawn / non-zero exit / non-JSON / unknown action ⇒ fail-open NoOp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalHookConfig {
+    pub id: String,
+    pub command: Vec<String>,
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default = "default_external_config")]
+    pub config: toml::Value,
+}
+
+fn default_external_config() -> toml::Value {
+    toml::Value::Table(toml::value::Table::new())
 }
 
 impl AppConfig {
@@ -113,11 +170,9 @@ impl AppConfig {
 
     fn resolve_token_path(&mut self) -> Result<(), ConfigError> {
         if self.daemon.auth_token_file.is_empty() {
-            // 与 resolve_data_dir / 打包模板里的 {USER_DATA_DIR} 保持一致，
-            // 都用 `dirs::data_dir()`：Windows 上是 %LOCALAPPDATA%。
-            // 之前用 `dirs::config_dir()`（Windows 上是 Roaming）会让 dev
-            // 配置和打包配置的 token 文件落到两个不同目录，CLI 与手动启动
-            // 的 parrotd 各拿一份随机 token，握手时 "Authentication failed"。
+            // 跟 resolve_data_dir / 打包模板对齐到 `dirs::data_dir()`
+            // （Windows 上是 %LOCALAPPDATA%）。之前用 config_dir()(Roaming)
+            // 会让 dev 和打包安装的 token 文件落到两个不同目录，握手失败。
             if let Some(data_dir) = dirs::data_dir() {
                 self.daemon.auth_token_file = data_dir
                     .join("parrot")
@@ -145,7 +200,6 @@ impl AppConfig {
                 sandbox: SandboxConfig {
                     working_dir: ".".into(),
                     allowlist: vec![],
-                    denylist: vec!["rm -rf /".into(), "sudo".into(), "chmod 777".into()],
                     require_confirmation: vec!["git push".into(), "rm".into()],
                 },
             },
@@ -154,6 +208,209 @@ impl AppConfig {
                 max_history_tokens: 100_000,
                 keep_recent_turns: 6,
             },
+            hooks: HooksConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hooks_default_is_empty() {
+        let c = HooksConfig::default();
+        assert_eq!(
+            c.enabled,
+            vec!["shell_denylist", "dangerous_command_blocker"]
+        );
+        assert_eq!(c.timeout_seconds, 5);
+    }
+
+    #[test]
+    fn sandbox_config_has_no_denylist() {
+        let c = AppConfig::default_config();
+        assert!(
+            serde_json::to_value(&c.tools.sandbox)
+                .unwrap()
+                .get("denylist")
+                .is_none(),
+            "SandboxConfig must not expose a denylist field"
+        );
+    }
+
+    #[test]
+    fn hooks_default_enabled_includes_shell_denylist_and_blocker() {
+        let c = HooksConfig::default();
+        assert!(c.enabled.contains(&"shell_denylist".to_string()));
+        assert!(c.enabled.contains(&"dangerous_command_blocker".to_string()));
+    }
+
+    #[test]
+    fn hooks_parse_from_toml() {
+        let toml = r#"
+[hooks]
+enabled = ["dangerous_command_blocker"]
+timeout_seconds = 3
+
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.hooks.enabled, vec!["dangerous_command_blocker"]);
+        assert_eq!(c.hooks.timeout_seconds, 3);
+    }
+
+    #[test]
+    fn hooks_parse_per_hook_configs() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[hooks]
+enabled = ["shell_denylist", "redact_secrets"]
+timeout_seconds = 5
+
+[hooks.shell_denylist]
+patterns = ["rm -rf /", "sudo", "chmod 777"]
+
+[hooks.redact_secrets]
+extra_patterns = ["CUSTOM-\\d+"]
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.hooks.enabled, vec!["shell_denylist", "redact_secrets"]);
+        assert!(c.hooks.configs.contains_key("shell_denylist"));
+        assert!(c.hooks.configs.contains_key("redact_secrets"));
+    }
+
+    #[test]
+    fn hooks_missing_configs_defaults_empty() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[hooks]
+enabled = ["dangerous_command_blocker"]
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert!(
+            c.hooks.configs.is_empty(),
+            "configs should be empty when no [hooks.<id>] subtables present"
+        );
+    }
+
+    #[test]
+    fn hooks_parse_redact_secrets_extra_patterns() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[hooks]
+enabled = ["redact_secrets"]
+
+[hooks.redact_secrets]
+extra_patterns = ["CUSTOM-\\d+", "MY-TOKEN-[a-z]+"]
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.hooks.enabled, vec!["redact_secrets"]);
+        assert!(c.hooks.configs.contains_key("redact_secrets"));
+        let rs_cfg = c.hooks.configs.get("redact_secrets").unwrap();
+        let extra = rs_cfg
+            .get("extra_patterns")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(extra.len(), 2);
     }
 }

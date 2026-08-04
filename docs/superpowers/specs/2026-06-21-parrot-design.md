@@ -13,10 +13,11 @@ Parrot 是一个 Rust 实现的 LLM agent，兼具**通用编程助手**（类�
 
 ### MVP 范围
 
-- **Phase 1**: CLI + daemon，Anthropic API 单一提供商，跑通 ReAct 全链路
+- **Phase 1**: CLI + daemon，Anthropic API 单一提供商，跑通 ReAct 全链路 ✅
 - **Phase 1.5**: TUI 客户端
   - **Phase 1.5a**: 协议扩展 + daemon 处理器 + CLI 子命令 ✅
   - **Phase 1.5b**: TUI 客户端 ✅
+- **Phase 1.6**: 单命令启动 + 本地分发 ✅ — `parrot` 自动 spawn `parrotd` 子进程；打包/安装脚本支持交叉编译
 - **Phase 2**: IM 接入（Discord 等），OpenAI + Ollama 适配器，MCP client
 - **Phase 3**: 混合路由、模型故障切换、规划子模式
 
@@ -46,11 +47,40 @@ Parrot 是一个 Rust 实现的 LLM agent，兼具**通用编程助手**（类�
 
 > 全绿基线：`cargo build --workspace` + `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo fmt --all -- --check`。
 
+### Phase 1.5 实施状态（2026-07）
+
+| 子项 | 状态 | 备注 |
+|------|------|------|
+| 协议扩展：ListSessions / GetHistory / ResumeSession / ListModels / ListTools | ✅ | `crates/parrot-protocol` |
+| daemon 处理器：SessionManager + EventLog 持久化 + snapshot | ✅ | `crates/parrot-daemon/src/runtime.rs` + `session_store.rs` |
+| CLI 子命令：`sessions list/show/resume/export`、`models`、`tools` | ✅ | `src/cli/main.rs` |
+| 会话 resume：replay event log → rebuild context | ✅ | `EventLog::replay()`；resume 修了 AgentEnd lifecycle / disowned MessageStart 等多个边界 bug |
+| TUI 客户端：ratatui + crossterm + tui-textarea | ✅ | `src/tui/`；3 层卡片布局，流式渲染，confirm 弹窗，多行输入 |
+
+### Phase 1.6 实施状态（2026-07）
+
+| 子项 | 状态 | 备注 |
+|------|------|------|
+| 单命令启动：`parrot` 自动 spawn `parrotd` | ✅ | `src/cli/daemon.rs`：绑随机端口（`127.0.0.1:0` 拿空闲端口，经 `PARROTD_PORT` env 传给子进程），`parrot` 退出时 `DaemonChild` Drop kill 子进程。**已废弃 v1 固定端口 + 复用单例方案** |
+| `--connect ws://...` 显式连接既有 daemon | ✅ | 跳过自动 spawn，attach 模式 |
+| 打包脚本 `package.ps1` / `package.sh` | ✅ | 支持 `-Target <triple>` 交叉编译，选 zip/tar.gz 归档 |
+| 安装脚本 `install.ps1` / `install.sh` | ✅ | 支持 `-Target`；`~/.parrot/config/parrot.toml` 已存在则不覆盖 |
+| 配置模板 `scripts/parrot.toml.template` | ✅ | `${ENV_VAR}` 占位符；provider 块以示例形式给出（Anthropic / DeepSeek 两例） |
+| token 路径统一 | ✅ | `resolve_token_path()` 改用 `dirs::data_dir()`（Windows `%LOCALAPPDATA%`），与打包模板对齐 |
+
 ---
 
 ## 2. 顶层架构
 
 **模式：Daemon + 瘦客户端（IPC via WebSocket）**
+
+> **2026-07 更新**：daemon 生命周期从 v1 的"固定端口单例 + 跨调用复用 + outlives CLI"
+> 改为 **per-invocation 子进程 + 随机端口 + CLI 退出即 kill**（参考 opencode TUI
+> 模式）。`parrot` 启动时若未指定 `--connect`，会先占 `127.0.0.1:0` 拿一个空闲
+> 端口，再以 `PARROTD_PORT` env 把端口传给新 spawn 的 `parrotd` 子进程，并持有
+> `DaemonChild` kill-on-drop 守卫。这样多个项目并行跑 `parrot` 互不串配置，根除
+> v1 单例 daemon 共享一份 `parrot.toml` 的 bug。显式 `--connect ws://...` 仍可
+> attach 到既有 daemon（手动起的 `parrotd` 或远程服务）。
 
 ```
 ┌──────────┐  ┌──────────┐  ┌──────────┐
@@ -58,6 +88,9 @@ Parrot 是一个 Rust 实现的 LLM agent，兼具**通用编程助手**（类�
 │ (thin)   │  │ (1.5)    │  │ (Phase 2)│
 └────┬─────┘  └────┬─────┘  └────┬─────┘
      │              │              │
+     │  --connect 缺省时：spawn   │
+     │  parrotd 子进程(随机端口)   │
+     │  持有 DaemonChild 守卫      │
      └──────┬───────┴──────┬───────┘
             │  WebSocket   │  (含本地 token 握手)
        ┌────┴──────────────┴────┐
@@ -81,8 +114,15 @@ Parrot 是一个 Rust 实现的 LLM agent，兼具**通用编程助手**（类�
 
 - **IPC 边界强制层分离** — agent 核心与交互层物理隔离，不会因内部重构影响客户端
 - **IM 天然适配** — IM bot 就是另一个 WS 客户端，零架构改动
-- **状态常驻** — daemon 管理 session 生命周期、工具注册、模型连接，客户端可随时断开重连
+- **会话持久化跨重启** — daemon 把 event log 落盘，CLI/TUI 退出后下次起 daemon
+  仍能 `sessions resume <id>`（resume 依赖磁盘上 events.log，不依赖 daemon 常驻进程）
 - **未来扩展** — 客户端可用任何语言实现（gRPC 备选，WS 更轻量）
+
+> 注：v1 设计文案里写"daemon 状态常驻…客户端可随时断开重连"。在 per-invocation
+> 模型下，客户端断 重连到**同一个 daemon 进程**不再成立（CLI 退出会带走子进程）；
+> 但 session 状态本身仍持久化在磁盘，重新 `parrot` 会起新 daemon 并 replay 历史，
+> 实际体验等价。若需要真正的"daemon 常驻跨 CLI 重连"，可手动起 `parrotd` 并用
+> `parrot --connect ws://...` attach。
 
 ---
 

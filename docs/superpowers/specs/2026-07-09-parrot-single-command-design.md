@@ -1,5 +1,12 @@
 # Parrot Single-Command Auto-Start & Local Distribution Design
 
+> **⚠ SUPERSEDED (部分).** 此 spec 描述的是 v1 方案:固定端口 9876 单例
+> daemon,CLI 探测复用,daemon 跨调用存活。该方案被 commit `57bca3e`
+> 取代 —— 改为 opencode 式 per-invocation 子进程,绑随机端口,CLI 退出即
+> kill,根除多项目并发串配置的问题。打包 / 安装脚本部分(spec §3-§5)
+> 仍大体适用,但已扩展为支持 `-Target <triple>` 交叉编译(commit `d0f5f53`)。
+> **当前实现以代码为准,本 spec 仅作历史参考。**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** `parrot` should be the only command a user needs: it automatically ensures `parrotd` is running before any operation that talks to the daemon, and the daemon stays alive after the CLI exits. Additionally, provide local distribution artifacts (directory, zip, install script) for the two binaries.

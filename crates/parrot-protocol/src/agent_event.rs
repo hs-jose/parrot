@@ -106,6 +106,15 @@ pub enum AgentEvent {
         session_id: SessionId,
         issue: IntegrityIssue,
     },
+
+    HookFired {
+        session_id: SessionId,
+        hook_id: String,
+        event_kind: String,
+        result_kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -151,6 +160,7 @@ pub enum TurnStopReason {
     MaxIterations,
     Aborted,
     Error(String),
+    BlockedHook(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -192,7 +202,10 @@ pub struct PersistedAgentEvent {
 
 impl AgentEvent {
     pub fn is_persistent(&self) -> bool {
-        !matches!(self, Self::MessageDelta { .. } | Self::ToolUpdate { .. })
+        !matches!(
+            self,
+            Self::MessageDelta { .. } | Self::ToolUpdate { .. } | Self::HookFired { .. }
+        )
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -208,7 +221,8 @@ impl AgentEvent {
             | Self::ToolUpdate { session_id, .. }
             | Self::ToolEnd { session_id, .. }
             | Self::ToolConfirmRequired { session_id, .. }
-            | Self::ReplayIntegrityWarning { session_id, .. } => *session_id,
+            | Self::ReplayIntegrityWarning { session_id, .. }
+            | Self::HookFired { session_id, .. } => *session_id,
         }
     }
 }

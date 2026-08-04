@@ -1,6 +1,7 @@
 use crate::context::ContextManager;
 use crate::error::AgentError;
 use crate::event_log::EventLog;
+use crate::hooks::{HookEvent, HookExecution, HookRegistry, HookResult};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
 use crate::tool::{ToolContext, ToolRegistry};
@@ -40,6 +41,7 @@ pub struct ReActEngine {
     /// The seq the EventLog was at after the resume replay. Used to keep
     /// `current_seq` continuous when appending new events post-resume.
     resume_seq_offset: u64,
+    hooks: Arc<HookRegistry>,
 }
 
 impl ReActEngine {
@@ -75,6 +77,7 @@ impl ReActEngine {
             resumed_from_seq: None,
             pending_integrity_warning: None,
             resume_seq_offset: 0,
+            hooks: Arc::new(HookRegistry::empty()),
         }
     }
 
@@ -102,6 +105,11 @@ impl ReActEngine {
         self
     }
 
+    pub fn with_hooks(mut self, registry: Arc<HookRegistry>) -> Self {
+        self.hooks = registry;
+        self
+    }
+
     pub async fn run(
         mut self,
         mut cmd_rx: mpsc::Receiver<SessionCmd>,
@@ -125,18 +133,16 @@ impl ReActEngine {
         }
 
         let mut event_log = EventLog::new(self.data_dir.clone());
-        // Resume continuity: if we replayed `n` events, the EventLog's
-        // internal seq counter must start at `n` so new appends get seq
-        // `n`, `n+1`, ... matching the persisted log.
+        // resume 后续 seq 要从 replay 恢复点继续，保持与磁盘日志连续。
         if self.resume_seq_offset > 0 {
             event_log = event_log.with_start_seq(self.resume_seq_offset);
         }
 
-        // AgentStart — emitted before any turn.
+        let provider_id = self.resolve_provider_id().await;
         let agent_start = AgentEvent::AgentStart {
             session_id,
             model: self.config.model.clone(),
-            provider: self.resolve_provider_id().await,
+            provider: provider_id.clone(),
             system_prompt_hash: self.system_prompt_hash.clone(),
             resumed_from_seq: self.resumed_from_seq,
         };
@@ -145,9 +151,21 @@ impl ReActEngine {
             tracing::warn!(error = ?e, "failed to persist AgentStart");
         }
 
-        // Replay integrity warning (if any) — emitted once after AgentStart,
-        // before the first TurnStart. Persisted so a subsequent resume
-        // doesn't re-detect it.
+        let (_result, execs) = self
+            .hooks
+            .run(
+                HookEvent::AgentStart {
+                    session_id,
+                    model: &self.config.model,
+                    provider: &provider_id,
+                },
+                &self.working_dir,
+            )
+            .await;
+        emit_hook_executions(&execs, session_id, &event_tx);
+
+        // 若 resume 时检测到事件日志损坏，发一次 ReplayIntegrityWarning 即清空，
+        // 落盘后下次 resume 不会再重复报。
         if let Some(issue) = self.pending_integrity_warning.take() {
             let warning = AgentEvent::ReplayIntegrityWarning {
                 session_id,
@@ -162,15 +180,8 @@ impl ReActEngine {
 
         let context_manager = ContextManager::new(100_000, 10);
 
-        // RAII guard: ensures AgentEnd fires even on panic / task abort.
-        //
-        // Invariant: the `Arc<Mutex<Usage>>` / `Arc<Mutex<AgentEndReason>>` are
-        // shared with the guard so `run()` can accumulate usage across turns
-        // and the guard can read it on drop. `std::sync::Mutex` is safe here
-        // ONLY because every critical section clones the value out and drops
-        // the guard before any `.await`. DO NOT hold the lock across an
-        // await — that would deadlock under tokio's current-thread runtime
-        // and is undefined behavior under `Send` futures holding the guard.
+        // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
+        // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
         let total_usage: Arc<Mutex<Usage>> = Arc::new(Mutex::new(Usage::default()));
         let end_reason: Arc<Mutex<AgentEndReason>> =
             Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
@@ -181,12 +192,41 @@ impl ReActEngine {
             fired: false,
             total_usage: Arc::clone(&total_usage),
             reason: Arc::clone(&end_reason),
+            hooks: Arc::clone(&self.hooks),
+            working_dir: self.working_dir.clone(),
         };
 
         loop {
             match cmd_rx.recv().await {
                 Some(SessionCmd::Chat { message }) => {
                     let turn_id = Uuid::new_v4();
+                    let (turn_start_outcome, execs) = self
+                        .hooks
+                        .run(
+                            HookEvent::TurnStart {
+                                session_id,
+                                turn_id,
+                                user_message: &message,
+                            },
+                            &self.working_dir,
+                        )
+                        .await;
+                    emit_hook_executions(&execs, session_id, &event_tx);
+                    match turn_start_outcome {
+                        HookResult::Block { reason, .. } => {
+                            let turn_end = AgentEvent::TurnEnd {
+                                session_id,
+                                turn_id,
+                                stop_reason: TurnStopReason::BlockedHook(reason.clone()),
+                                usage: Usage::default(),
+                            };
+                            let _ = event_tx.send(turn_end.clone()).await.ok();
+                            let _ = event_log.append(turn_end);
+                            continue;
+                        }
+                        HookResult::Inject { messages } => context.extend(messages),
+                        _ => {}
+                    }
                     let _ = event_tx
                         .send(AgentEvent::TurnStart {
                             session_id,
@@ -195,7 +235,6 @@ impl ReActEngine {
                         })
                         .await
                         .ok();
-                    // Persist TurnStart (lifecycle events are persistent).
                     let _ = event_log.append(AgentEvent::TurnStart {
                         session_id,
                         turn_id,
@@ -259,11 +298,10 @@ impl ReActEngine {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Top-level ReAct loop: stream an LLM message, push it to context, then
-    /// execute any tool calls the model requested; repeat until EndTurn / no
-    /// tool calls / MaxIterations. Abort (raised by any sub-step) propagates
-    /// as `AgentError::Aborted` so the caller (`run`) can emit
-    /// `TurnEnd { Aborted }`.
+    /// ReAct 主循环：跑一轮 LLM，把 assistant 消息塞进 context；
+    /// 若有工具调用就依次跑，然后下一轮；直到 EndTurn / 无工具调用 /
+    /// 达到 MAX_REACT_ITERATIONS。任何子步骤抛 `Aborted` 都原样往外抛，
+    /// 由 `run` 转成 `TurnEnd{Aborted}`。
     #[allow(clippy::too_many_arguments)]
     async fn handle_turn(
         &self,
@@ -275,7 +313,6 @@ impl ReActEngine {
         event_log: &mut EventLog,
         cmd_rx: &mut mpsc::Receiver<SessionCmd>,
     ) -> Result<(TurnStopReason, Usage), AgentError> {
-        // Push user message to context.
         context.push(ChatMessage {
             role: ChatRole::User,
             content: user_msg.to_string(),
@@ -287,7 +324,38 @@ impl ReActEngine {
         let mut turn_usage = Usage::default();
         let tool_defs = self.tool_registry.list_definitions().await;
 
-        for iteration in 0..MAX_REACT_ITERATIONS {
+        {
+            context_manager.prune(context);
+            let session_id = self.session_id;
+            let (outcome, execs) = self
+                .hooks
+                .run(
+                    HookEvent::ContextReady {
+                        session_id,
+                        turn_id,
+                        context,
+                    },
+                    &self.working_dir,
+                )
+                .await;
+            emit_hook_executions(&execs, session_id, event_tx);
+            match outcome {
+                HookResult::Block { reason, .. } => {
+                    return Ok((TurnStopReason::BlockedHook(reason), Usage::default()));
+                }
+                HookResult::ReplaceContext { messages, .. } => {
+                    *context = messages;
+                    context_manager.prune(context);
+                }
+                HookResult::Inject { messages } => {
+                    context.extend(messages);
+                    context_manager.prune(context);
+                }
+                HookResult::Continue | HookResult::Replace { .. } => {}
+            }
+        }
+
+        for _ in 0..MAX_REACT_ITERATIONS {
             context_manager.prune(context);
 
             let msg = self
@@ -297,7 +365,6 @@ impl ReActEngine {
             turn_usage.input_tokens += msg.msg_usage.input_tokens;
             turn_usage.output_tokens += msg.msg_usage.output_tokens;
 
-            // Push assistant message to context.
             let core_tcs: Vec<CoreToolCallInfo> = msg
                 .tool_calls
                 .iter()
@@ -319,13 +386,11 @@ impl ReActEngine {
                 },
             });
 
-            // If no tool calls (or EndTurn), turn ends here.
             if msg.msg_stop == MessageStopReason::EndTurn || msg.tool_calls.is_empty() {
                 let _ = event_log.maybe_snapshot(context);
                 return Ok((TurnStopReason::EndTurn, turn_usage));
             }
 
-            // Execute each tool: ToolStart → [ToolConfirmRequired] → ToolEnd.
             for tc in &msg.tool_calls {
                 self.run_one_tool(
                     turn_id,
@@ -339,23 +404,16 @@ impl ReActEngine {
                 .await?;
             }
 
-            // Continue the ReAct loop for the next LLM call.
             let _ = event_log.maybe_snapshot(context);
-            // `iteration` is consumed — loop continues.
-            let _ = iteration;
         }
 
-        // Max iterations reached.
         Ok((TurnStopReason::MaxIterations, turn_usage))
     }
 
-    /// Stream exactly one LLM message: resolves the provider, emits
-    /// `MessageStart`, drains the provider stream (forwarding `MessageDelta`
-    /// events) until `Finish`, then emits `MessageEnd` and returns the
-    /// accumulated content + tool calls. Aborts mid-stream by returning
-    /// `Err(AgentError::Aborted)` without emitting `MessageEnd` (the client
-    /// uses `TurnEnd { Aborted }` as the boundary, matching the original
-    /// single-loop behavior).
+    /// 流式跑一轮 LLM 调用：发 MessageStart，把 provider 的 delta 转发出去，
+    /// 到 Finish 后发 MessageEnd 并返回累积内容 + 工具调用。流式中途
+    /// Abort 直接返回 `Err(Aborted)`，**不发** MessageEnd（客户端用
+    /// TurnEnd{Aborted} 当边界）。
     #[allow(clippy::too_many_arguments)]
     async fn stream_llm_message(
         &self,
@@ -474,13 +532,9 @@ impl ReActEngine {
         }
 
         if aborted {
-            // No MessageEnd on abort — the stream was interrupted, so
-            // final_content would be incomplete. The client uses
-            // TurnEnd{Aborted} as the boundary.
             return Err(AgentError::Aborted);
         }
 
-        // Emit MessageEnd with final snapshot.
         let tool_calls_info: Vec<ToolCallInfo> = tool_calls
             .iter()
             .map(|tc| ToolCallInfo {
@@ -511,12 +565,9 @@ impl ReActEngine {
         })
     }
 
-    /// Run a single tool: emit `ToolStart`, optionally await user
-    /// confirmation, execute the tool (cancelable by `Abort`), emit
-    /// `ToolEnd`, and push the `Tool` message into `context`. On `Abort`
-    /// (during confirmation wait or execution), emits an
-    /// "aborted before execution" `ToolEnd`, pushes the matching `Tool`
-    /// context entry, and returns `Err(AgentError::Aborted)`.
+    /// 跑一个工具：发 ToolStart → 可能等用户 confirm → 跑工具（Abort 可打断）
+    /// → 发 ToolEnd + 把 Tool 消息塞进 context。confirm 等待或工具执行中
+    /// 收到 Abort，统一走 `emit_aborted_tool_end` 后返回 `Err(Aborted)`。
     #[allow(clippy::too_many_arguments)]
     async fn run_one_tool(
         &self,
@@ -542,12 +593,49 @@ impl ReActEngine {
         let _ = event_tx.send(tool_start.clone()).await.ok();
         let _ = event_log.append(tool_start);
 
+        let (tool_call_outcome, execs) = self
+            .hooks
+            .run(
+                HookEvent::ToolCall {
+                    session_id,
+                    turn_id,
+                    parent_message_id,
+                    tool_call_id: &tc.id,
+                    tool_name: &tc.name,
+                    arguments: &args,
+                },
+                &self.working_dir,
+            )
+            .await;
+        emit_hook_executions(&execs, session_id, event_tx);
+        if let HookResult::Block { reason, .. } = tool_call_outcome {
+            let result = parrot_protocol::types::ToolOutput {
+                content: format!("blocked: {reason}"),
+                is_error: true,
+            };
+            let tool_end = AgentEvent::ToolEnd {
+                session_id,
+                turn_id,
+                tool_call_id: tc.id.clone(),
+                result: result.clone(),
+            };
+            let _ = event_tx.send(tool_end.clone()).await.ok();
+            let _ = event_log.append(tool_end);
+            context.push(ChatMessage {
+                role: ChatRole::Tool,
+                content: result.content,
+                tool_call_id: Some(tc.id.clone()),
+                tool_name: Some(tc.name.clone()),
+                tool_calls: None,
+            });
+            return Ok(());
+        }
+
         let tool_ctx = ToolContext {
             working_dir: self.working_dir.clone(),
             max_file_size_bytes: 10 * 1024 * 1024,
         };
 
-        // Phase 1.5: confirmation flow.
         let needs_confirm = self
             .confirm_config
             .require_confirmation
@@ -565,7 +653,23 @@ impl ReActEngine {
         };
 
         let result = if matches!(decision, ConfirmDecision::Approve) {
-            match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args, &tool_ctx)).await {
+            let (_, execs) = self
+                .hooks
+                .run(
+                    HookEvent::ToolExecutionStart {
+                        session_id,
+                        turn_id,
+                        tool_call_id: &tc.id,
+                        tool_name: &tc.name,
+                        arguments: &args,
+                    },
+                    &self.working_dir,
+                )
+                .await;
+            emit_hook_executions(&execs, session_id, event_tx);
+            match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args.clone(), &tool_ctx))
+                .await
+            {
                 Abortable::Completed(r) => {
                     r.unwrap_or_else(|e| parrot_protocol::types::ToolOutput {
                         content: format!("Error: {}", e),
@@ -598,6 +702,28 @@ impl ReActEngine {
             }
         };
 
+        let (tool_result_decision, execs) = self
+            .hooks
+            .run(
+                HookEvent::ToolResult {
+                    session_id,
+                    turn_id,
+                    tool_call_id: &tc.id,
+                    tool_name: &tc.name,
+                    input: &args,
+                    result: &result,
+                },
+                &self.working_dir,
+            )
+            .await;
+        emit_hook_executions(&execs, session_id, event_tx);
+        let result = match tool_result_decision {
+            HookResult::Replace {
+                content, is_error, ..
+            } => parrot_protocol::types::ToolOutput { content, is_error },
+            _ => result,
+        };
+
         let tool_end = AgentEvent::ToolEnd {
             session_id,
             turn_id,
@@ -618,11 +744,9 @@ impl ReActEngine {
         Ok(())
     }
 
-    /// Wait for a user-approved `ConfirmDecision` for a tool call.
-    /// Emits `ToolConfirmRequired`, registers a one-shot with the router,
-    /// then races the (timeout-bounded) confirmation future against `Abort`.
-    /// On `Abort`, unregisters and emits an "aborted before execution"
-    /// `ToolEnd` + context entry, then returns `Err(AgentError::Aborted)`.
+    /// 等用户对工具调用给出 ConfirmDecision：注册 one-shot、发
+    /// ToolConfirmRequired，在 timeout 内和 Abort 赛跑。Abort 时不等了，
+    /// 撤注册后调用方（run_one_tool）发 aborted ToolEnd。
     #[allow(clippy::too_many_arguments)]
     async fn await_confirmation(
         &self,
@@ -707,9 +831,8 @@ struct PendingToolCall {
     arguments_json: Option<serde_json::Value>,
 }
 
-/// Result of a single streamed LLM message, consumed by `handle_turn` to
-/// push the assistant turn to `context` and (when tool calls are present)
-/// drive the next iteration of the ReAct loop.
+/// 一轮流式 LLM 调用的结果，handle_turn 拿它 push assistant 消息进
+/// context，并根据是否含工具调用决定要不要继续下一轮 ReAct。
 struct StreamedMessage {
     message_id: Uuid,
     accumulated_text: String,
@@ -718,19 +841,11 @@ struct StreamedMessage {
     msg_usage: Usage,
 }
 
-/// Race a future against an `Abort` command from `cmd_rx`. Preserves the
-/// original single-loop semantics bit-for-bit:
-/// - `Abort` → `Abortable::Aborted` (caller emits its own cleanup).
-/// - `Chat { .. }` while the operation is in flight → log a warning and
-///   **then await the future with no further abort checks** (i.e., once a
-///   stray `Chat` shows up during confirmation/tool-exec, `Abort` is no
-///   longer honored for that specific operation — matching the previous
-///   behavior where the offending branch awaited the inner future directly).
-/// - Future completion → `Abortable::Completed(value)`.
-///
-/// This replaces the two repeated `tokio::select!` blocks (confirm-wait and
-/// tool-exec) so callers stay short and the "Abort wins, Chat is noise"
-/// policy lives in exactly one place.
+/// 把 future 和 `cmd_rx` 上的 Abort 命令赛跑。三种结果：
+/// - Abort 先到 → `Aborted`（调用方自己清理）。
+/// - 操作中途来了条 Chat → warn 后照常 await 操作完成，**之后不再受理
+///   Abort**（沿用重构前的语义，避免一条噪音 Chat 改变取消语义）。
+/// - 操作先完成 → `Completed(value)`。
 enum Abortable<T> {
     Completed(T),
     Aborted,
@@ -747,9 +862,6 @@ where
             SessionCmd::Abort => Abortable::Aborted,
             SessionCmd::Chat { .. } => {
                 tracing::warn!("Chat command received during operation; ignoring");
-                // Finish the operation without honoring further aborts —
-                // matches the pre-refactor behavior where the offending arm
-                // awaited the inner future directly.
                 Abortable::Completed(fut.as_mut().await)
             }
         },
@@ -757,9 +869,28 @@ where
     }
 }
 
-/// Emit the "aborted before execution" `ToolEnd` + push the matching `Tool`
-/// message to `context`. Centralizes the abort-cleanup duplicated between
-/// the confirmation-wait and tool-execution paths in the original loop.
+/// Forward per-hook telemetry records (`Vec<HookExecution>`) from
+/// `HookRegistry::run` to the wire as `AgentEvent::HookFired`. Non-blocking:
+/// `try_send` silently drops on full channel (buffer is 64; losing a
+/// `HookFired{noop}` is acceptable observability telemetry).
+fn emit_hook_executions(
+    executions: &[HookExecution],
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) {
+    for ex in executions {
+        let _ = event_tx.try_send(AgentEvent::HookFired {
+            session_id,
+            hook_id: ex.hook_id.clone(),
+            event_kind: ex.event_kind.clone(),
+            result_kind: ex.result_kind.clone(),
+            summary: ex.summary.clone(),
+        });
+    }
+}
+
+/// 发"aborted before execution" ToolEnd 并把 Tool 消息塞进 context。
+/// confirm 等待与工具执行两条中断路径共用这份清理。
 #[allow(clippy::too_many_arguments)]
 async fn emit_aborted_tool_end(
     session_id: Uuid,
@@ -799,26 +930,34 @@ struct AgentEndGuard {
     fired: bool,
     total_usage: Arc<Mutex<Usage>>,
     reason: Arc<Mutex<AgentEndReason>>,
+    hooks: Arc<HookRegistry>,
+    working_dir: std::path::PathBuf,
 }
 
 impl AgentEndGuard {
-    /// Fire the `AgentEnd` event explicitly (used for normal shutdown paths
-    /// where we want to consume the guard without dropping it silently).
+    /// 显式触发 AgentEnd（正常退出路径调用，避免 Drop 不可控）。
+    /// 先落盘再发送：resume 时靠读 events.log 区分"会话已结束"和"daemon 崩溃"。
     async fn fire_and_drop(mut self, _tx: &mpsc::Sender<AgentEvent>, event_log: &mut EventLog) {
         if self.fired {
             return;
         }
         let usage = self.total_usage.lock().unwrap().clone();
         let reason = self.reason.lock().unwrap().clone();
+        let (_, execs) = self
+            .hooks
+            .run(
+                HookEvent::AgentEnd {
+                    session_id: self.session_id,
+                },
+                &self.working_dir,
+            )
+            .await;
+        emit_hook_executions(&execs, self.session_id, &self.event_tx);
         let event = AgentEvent::AgentEnd {
             session_id: self.session_id,
             reason,
             total_usage: usage,
         };
-        // Persist before sending: a session that ended cleanly must have
-        // AgentEnd in events.log so a later resume can tell "session was
-        // terminated" from "daemon crashed mid-run". Drop-path (panic /
-        // task-abort) can't safely do disk IO and won't reach here.
         if let Err(e) = event_log.append(event.clone()) {
             tracing::warn!(error = ?e, "failed to persist AgentEnd");
         }

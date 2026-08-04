@@ -1,5 +1,6 @@
 use crate::confirm::ConfirmRouter;
 use crate::engine::ReActEngine;
+use crate::hooks::HookRegistry;
 use crate::provider::ProviderRegistry;
 use crate::tool::ToolRegistry;
 use crate::types::{ChatMessage, GenerateConfig};
@@ -71,6 +72,7 @@ pub struct SessionManager {
     data_dir: std::path::PathBuf,
     working_dir: std::path::PathBuf,
     confirm_config: ConfirmConfig,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl SessionManager {
@@ -89,6 +91,7 @@ impl SessionManager {
             data_dir,
             working_dir,
             confirm_config: ConfirmConfig::default(),
+            hooks: None,
         }
     }
 
@@ -97,6 +100,11 @@ impl SessionManager {
     /// clone of this config.
     pub fn with_confirm_config(mut self, config: ConfirmConfig) -> Self {
         self.confirm_config = config;
+        self
+    }
+
+    pub fn with_hooks(mut self, registry: Arc<HookRegistry>) -> Self {
+        self.hooks = Some(registry);
         self
     }
 
@@ -187,6 +195,12 @@ impl SessionManager {
             engine = engine.with_pending_integrity_warning(issue);
         }
 
+        let engine = if let Some(h) = self.hooks.clone() {
+            engine.with_hooks(h)
+        } else {
+            engine
+        };
+
         let abort_handle = tokio::spawn(async move {
             engine.run(cmd_rx, event_tx).await;
         })
@@ -232,6 +246,11 @@ impl SessionManager {
         )
         .with_confirm_config(self.confirm_config.clone())
         .with_initial_context(initial_context);
+        let engine = if let Some(h) = self.hooks.clone() {
+            engine.with_hooks(h)
+        } else {
+            engine
+        };
 
         let abort_handle = tokio::spawn(async move {
             engine.run(cmd_rx, event_tx).await;
