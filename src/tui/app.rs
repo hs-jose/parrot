@@ -66,6 +66,8 @@ pub(crate) struct App {
     pub pending_confirmation: Option<PendingConfirmation>,
     pub ended: bool,
     pub scroll_offset: u16,
+    /// 对话区可视高度（上次 draw 时记录），用于半页滚动。
+    pub view_height: u16,
     cur_assistant_text: HashMap<Uuid, String>,
     cur_assistant_tools: HashMap<Uuid, Vec<ToolCallInfo>>,
     cur_assistant_completed: HashMap<Uuid, bool>,
@@ -91,6 +93,7 @@ impl App {
             pending_confirmation: None,
             ended: false,
             scroll_offset: 0,
+            view_height: 0,
             cur_assistant_text: HashMap::new(),
             cur_assistant_tools: HashMap::new(),
             cur_assistant_completed: HashMap::new(),
@@ -124,7 +127,6 @@ impl App {
     /// Called from `draw_entries`, which is the only place the real range is
     /// known. Prevents PgUp overshoot from requiring many PgDn presses to get
     /// back to the bottom.
-    #[allow(dead_code)]
     pub fn clamp_scroll(&mut self, max: u16) {
         self.scroll_offset = self.scroll_offset.min(max);
     }
@@ -135,6 +137,14 @@ impl App {
 
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = u16::MAX;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
     }
 
     pub fn confirm_decision(
@@ -698,5 +708,22 @@ mod tests {
         app.scroll_up(u16::MAX);
         app.clamp_scroll(40);
         assert_eq!(app.scroll_offset, 40);
+    }
+
+    #[test]
+    fn scroll_to_top_then_clamp_is_bounded() {
+        let mut app = App::new(sid());
+        app.scroll_to_top();
+        assert_eq!(app.scroll_offset, u16::MAX);
+        app.clamp_scroll(12);
+        assert_eq!(app.scroll_offset, 12);
+    }
+
+    #[test]
+    fn scroll_to_bottom_zeroes_offset() {
+        let mut app = App::new(sid());
+        app.scroll_up(100);
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_offset, 0);
     }
 }

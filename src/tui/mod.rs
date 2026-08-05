@@ -210,11 +210,27 @@ async fn handle_key(
                 Ok(None)
             }
             KeyCode::PageUp => {
-                app.scroll_up(10);
+                app.scroll_up((app.view_height / 2).max(1));
                 Ok(None)
             }
             KeyCode::PageDown => {
-                app.scroll_down(10);
+                app.scroll_down((app.view_height / 2).max(1));
+                Ok(None)
+            }
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.scroll_up((app.view_height / 2).max(1));
+                Ok(None)
+            }
+            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.scroll_down((app.view_height / 2).max(1));
+                Ok(None)
+            }
+            KeyCode::Home if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.scroll_to_top();
+                Ok(None)
+            }
+            KeyCode::End if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.scroll_to_bottom();
                 Ok(None)
             }
             KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => {

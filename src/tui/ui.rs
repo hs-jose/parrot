@@ -26,7 +26,7 @@ mod palette {
     pub const INPUT_BORDER: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
 }
 
-pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &App, input: &tui_textarea::TextArea<'_>) {
+pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &mut App, input: &tui_textarea::TextArea<'_>) {
     let area = f.area();
     // 输入区按内容行数动态增长，+2 为上下边框；上限不超过终端高度的 1/3，
     // 避免长输入把对话区挤没。
@@ -45,7 +45,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &App, input: &tui_textarea::
         ])
         .split(area);
     draw_title(f, chunks[0], app);
-    draw_entries(f, chunks[1], app);
+    draw_entries(f, chunks[1], &mut *app);
     draw_input(f, chunks[2], input);
     draw_status(f, chunks[3], app);
     if app.mode == Mode::ConfirmPending {
@@ -111,7 +111,7 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(bar, area);
 }
 
-fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     // 对话卡片：圆角边框 + 水平内边距，让内容不贴边。
     let block = Block::default()
         .borders(Borders::ALL)
@@ -197,6 +197,8 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         0
     };
     let max_scroll = total_visual_lines.saturating_sub(view_h);
+    app.view_height = inner.height;
+    app.clamp_scroll(max_scroll.min(u16::MAX as usize) as u16);
     let scroll = max_scroll.saturating_sub(app.scroll_offset as usize);
 
     f.render_widget(para.scroll((scroll as u16, 0)), inner);
@@ -455,7 +457,7 @@ mod tests {
             });
             app.entries.push(ChatEntry::Error("boom".into()));
             let input = tui_textarea::TextArea::default();
-            terminal.draw(|f| draw(f, &app, &input)).unwrap();
+            terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         }
     }
 
@@ -463,9 +465,9 @@ mod tests {
     #[test]
     fn draw_renders_rounded_borders_around_chat_and_input() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        let app = App::new(SessionId::new_v4());
+        let mut app = App::new(SessionId::new_v4());
         let input = tui_textarea::TextArea::default();
-        terminal.draw(|f| draw(f, &app, &input)).unwrap();
+        terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         let buf = terminal.backend().buffer();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(
@@ -476,5 +478,27 @@ mod tests {
             text.contains('╰'),
             "expected rounded bottom corner, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn draw_clamps_scroll_offset_to_actual_range() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = App::new(SessionId::new_v4());
+        for i in 0..50 {
+            app.entries.push(ChatEntry::User {
+                text: format!("line {i}"),
+                time: "x".into(),
+            });
+        }
+        app.scroll_to_top();
+        terminal
+            .draw(|f| draw(f, &mut app, &tui_textarea::TextArea::default()))
+            .unwrap();
+        assert!(
+            app.scroll_offset < u16::MAX,
+            "overshoot must be clamped, got {}",
+            app.scroll_offset
+        );
+        assert!(app.scroll_offset > 0);
     }
 }
