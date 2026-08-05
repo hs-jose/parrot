@@ -278,6 +278,7 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
                 Style::default().fg(palette::WARN_FG),
             )));
         }
+        ChatEntry::Shell { .. } | ChatEntry::Info(_) => {}
     }
 }
 

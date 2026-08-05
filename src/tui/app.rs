@@ -32,6 +32,15 @@ pub(crate) enum ChatEntry {
         arguments: Value,
         result: Option<ToolOutput>,
     },
+    #[allow(dead_code)]
+    Shell {
+        #[allow(dead_code)]
+        command: String,
+        output: Option<String>,
+        exit_code: Option<i32>,
+    },
+    #[allow(dead_code)]
+    Info(String),
     Error(String),
     Warning(String),
 }
@@ -106,6 +115,20 @@ impl App {
         self.turn_active && self.tools_in_flight > 0
     }
 
+    #[allow(dead_code)]
+    pub fn is_turn_active(&self) -> bool {
+        self.turn_active
+    }
+
+    /// Cap the distance-from-bottom scroll offset at the visible scroll range.
+    /// Called from `draw_entries`, which is the only place the real range is
+    /// known. Prevents PgUp overshoot from requiring many PgDn presses to get
+    /// back to the bottom.
+    #[allow(dead_code)]
+    pub fn clamp_scroll(&mut self, max: u16) {
+        self.scroll_offset = self.scroll_offset.min(max);
+    }
+
     pub fn scroll_up(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_add(n);
     }
@@ -134,6 +157,24 @@ impl App {
             }
             ServerMessage::Error { message, .. } => {
                 self.entries.push(ChatEntry::Error(message));
+            }
+            ServerMessage::ShellResult {
+                output, exit_code, ..
+            } => {
+                for e in self.entries.iter_mut().rev() {
+                    if let ChatEntry::Shell {
+                        output: o,
+                        exit_code: c,
+                        ..
+                    } = e
+                    {
+                        if o.is_none() {
+                            *o = Some(output);
+                            *c = Some(exit_code);
+                            break;
+                        }
+                    }
+                }
             }
             // TUI 默认不处理其他 ServerMessage（HelloAck 已在握手期完成；SessionList/History 等由列表页消费）
             _ => {}
@@ -598,5 +639,64 @@ mod tests {
             },
         });
         assert!(matches!(app.entries.last(), Some(ChatEntry::Warning(_))));
+    }
+
+    #[test]
+    fn shell_result_fills_pending_shell_entry() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.entries.push(ChatEntry::Shell {
+            command: "echo hi".into(),
+            output: None,
+            exit_code: None,
+        });
+        app.apply_server_message(ServerMessage::ShellResult {
+            session_id: sid_v,
+            output: "hi\n".into(),
+            exit_code: 0,
+        });
+        match &app.entries[0] {
+            ChatEntry::Shell {
+                output, exit_code, ..
+            } => {
+                assert_eq!(output.as_deref(), Some("hi\n"));
+                assert_eq!(*exit_code, Some(0));
+            }
+            other => panic!("expected Shell entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn shell_result_skips_entries_without_pending_output() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.entries.push(ChatEntry::Info("note".into()));
+        app.apply_server_message(ServerMessage::ShellResult {
+            session_id: sid_v,
+            output: "hi\n".into(),
+            exit_code: 0,
+        });
+        assert_eq!(app.entries.len(), 1);
+    }
+
+    #[test]
+    fn is_turn_active_reflects_turn_state() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        assert!(!app.is_turn_active());
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            user_message: "hi".into(),
+        });
+        assert!(app.is_turn_active());
+    }
+
+    #[test]
+    fn clamp_scroll_caps_offset() {
+        let mut app = App::new(sid());
+        app.scroll_up(u16::MAX);
+        app.clamp_scroll(40);
+        assert_eq!(app.scroll_offset, 40);
     }
 }
