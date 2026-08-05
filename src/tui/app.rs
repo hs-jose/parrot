@@ -32,14 +32,11 @@ pub(crate) enum ChatEntry {
         arguments: Value,
         result: Option<ToolOutput>,
     },
-    #[allow(dead_code)]
     Shell {
-        #[allow(dead_code)]
         command: String,
         output: Option<String>,
         exit_code: Option<i32>,
     },
-    #[allow(dead_code)]
     Info(String),
     Error(String),
     Warning(String),
@@ -118,7 +115,6 @@ impl App {
         self.turn_active && self.tools_in_flight > 0
     }
 
-    #[allow(dead_code)]
     pub fn is_turn_active(&self) -> bool {
         self.turn_active
     }

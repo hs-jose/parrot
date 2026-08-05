@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyEvent};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -8,7 +8,7 @@ pub(crate) enum UiEvent {
     #[allow(dead_code)]
     Resize(u16, u16),
     Paste(String),
-    /// Ctrl+C 或 poll/read 出错时发出，主循环据此退出。
+    /// poll/read 出错时发出，主循环据此退出。
     Quit,
 }
 
@@ -26,14 +26,8 @@ pub(crate) fn spawn_input_thread(tx: mpsc::Sender<UiEvent>) -> std::thread::Join
         }
         match event::read() {
             Ok(ev) => match ev {
-                Event::Key(k) => {
-                    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-                        let _ = tx.blocking_send(UiEvent::Quit);
-                        break;
-                    }
-                    if tx.blocking_send(UiEvent::Key(k)).is_err() {
-                        break;
-                    }
+                Event::Key(k) if tx.blocking_send(UiEvent::Key(k)).is_err() => {
+                    break;
                 }
                 Event::Resize(w, h) => match tx.blocking_send(UiEvent::Resize(w, h)) {
                     Ok(()) => {}

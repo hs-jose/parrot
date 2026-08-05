@@ -7,7 +7,7 @@ pub(crate) mod ui;
 mod replay_test;
 
 use std::io::Stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -96,6 +96,7 @@ async fn run_loop(
     ui_rx: &mut mpsc::Receiver<UiEvent>,
     dirty: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_esc: Option<Instant> = None;
     loop {
         if *dirty {
             terminal.draw(|f| ui::draw(f, app, input))?;
@@ -114,6 +115,17 @@ async fn run_loop(
                         *dirty = true;
                     }
                     UiEvent::Key(k) => {
+                        if k.code == KeyCode::Esc && app.mode == Mode::Normal {
+                            let now = Instant::now();
+                            let is_double = last_esc
+                                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(500));
+                            last_esc = Some(now);
+                            if is_double {
+                                break;
+                            }
+                        } else {
+                            last_esc = None;
+                        }
                         if let Some(should_quit) = handle_key(k, app, input, conn).await? {
                             if should_quit {
                                 break;
@@ -200,6 +212,9 @@ async fn handle_key(
                 let text = input.lines().join("\n");
                 if !text.trim().is_empty() {
                     *input = TextArea::default();
+                    if let Some(should_quit) = handle_command(app, conn, &text).await? {
+                        return Ok(Some(should_quit));
+                    }
                     conn.sender
                         .send(ClientMessage::Chat {
                             session_id: app.session_id,
@@ -241,12 +256,165 @@ async fn handle_key(
                 app.scroll_down(1);
                 Ok(None)
             }
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Ok(Some(true)),
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.is_turn_active() {
+                    conn.sender
+                        .send(ClientMessage::Abort {
+                            session_id: app.session_id,
+                        })
+                        .await?;
+                }
+                Ok(None)
+            }
             _ => {
                 // TextArea handles other keys (cursor/backspace/etc.)
                 input.input(tui_textarea::Input::from(k));
                 Ok(None)
             }
         },
+    }
+}
+
+/// 处理 `/` 斜杠命令与 `!` shell 命令。返回 `None` 表示不是命令
+/// （调用方应把文本当普通消息发送）；`Some(should_quit)` 表示已处理。
+async fn handle_command(
+    app: &mut app::App,
+    conn: &mut Connection,
+    text: &str,
+) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('/') {
+        let cmd = rest.trim();
+        match cmd {
+            "help" => {
+                app.entries.push(app::ChatEntry::Info(
+                    "可用命令: /help /usage /abort /exit\n!<命令> 在 daemon 执行 shell 命令".into(),
+                ));
+                Ok(Some(false))
+            }
+            "usage" => {
+                let u = &app.total_usage;
+                app.entries.push(app::ChatEntry::Info(format!(
+                    "Token 用量: {} in / {} out",
+                    u.input_tokens, u.output_tokens
+                )));
+                Ok(Some(false))
+            }
+            "abort" => {
+                if app.is_turn_active() {
+                    conn.sender
+                        .send(ClientMessage::Abort {
+                            session_id: app.session_id,
+                        })
+                        .await?;
+                } else {
+                    app.entries
+                        .push(app::ChatEntry::Info("当前没有进行中的轮次".into()));
+                }
+                Ok(Some(false))
+            }
+            "exit" => Ok(Some(true)),
+            _ => {
+                app.entries.push(app::ChatEntry::Info(format!(
+                    "未知命令 /{cmd}，输入 /help 查看可用命令"
+                )));
+                Ok(Some(false))
+            }
+        }
+    } else if let Some(cmd) = trimmed.strip_prefix('!') {
+        let command = cmd.trim().to_string();
+        if command.is_empty() {
+            app.entries
+                .push(app::ChatEntry::Info("用法: !<shell 命令>".into()));
+        } else {
+            app.entries.push(app::ChatEntry::Shell {
+                command: command.clone(),
+                output: None,
+                exit_code: None,
+            });
+            conn.sender
+                .send(ClientMessage::Shell {
+                    session_id: app.session_id,
+                    command,
+                })
+                .await?;
+        }
+        Ok(Some(false))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::Connection;
+    use tokio::sync::mpsc;
+
+    fn test_conn() -> (Connection, mpsc::Receiver<ClientMessage>) {
+        let (client_tx, server_rx) = mpsc::channel(16);
+        let (server_tx, client_rx) = mpsc::channel(16);
+        let _ = server_tx;
+        (
+            Connection {
+                sender: client_tx,
+                receiver: client_rx,
+            },
+            server_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_command_shell_sends_shell_message() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+
+        let quit = handle_command(&mut app, &mut conn, "!echo hi")
+            .await
+            .unwrap();
+        assert_eq!(quit, Some(false));
+        match app.entries.last() {
+            Some(app::ChatEntry::Shell {
+                command, output, ..
+            }) => {
+                assert_eq!(command, "echo hi");
+                assert!(output.is_none());
+            }
+            other => panic!("expected Shell entry, got {:?}", other),
+        }
+        let msg = server_rx.try_recv().unwrap();
+        match msg {
+            ClientMessage::Shell { command, .. } => assert_eq!(command, "echo hi"),
+            other => panic!("expected Shell, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_command_help_pushes_info_without_sending() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let quit = handle_command(&mut app, &mut conn, "/help").await.unwrap();
+        assert_eq!(quit, Some(false));
+        assert!(matches!(app.entries.last(), Some(app::ChatEntry::Info(_))));
+        assert!(server_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_command_exit_requests_quit() {
+        let (mut conn, _server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let quit = handle_command(&mut app, &mut conn, "/exit").await.unwrap();
+        assert_eq!(quit, Some(true));
+    }
+
+    #[tokio::test]
+    async fn handle_command_plain_text_returns_none() {
+        let (mut conn, _server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let result = handle_command(&mut app, &mut conn, "hello there")
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+        assert!(app.entries.is_empty());
     }
 }

@@ -280,7 +280,52 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
                 Style::default().fg(palette::WARN_FG),
             )));
         }
-        ChatEntry::Shell { .. } | ChatEntry::Info(_) => {}
+        ChatEntry::Shell {
+            command,
+            output,
+            exit_code,
+        } => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("▸ !{command}"),
+                    Style::default().fg(palette::TOOL_FG),
+                ),
+                match exit_code {
+                    Some(0) => Span::styled("  ✓", Style::default().fg(palette::OK_FG)),
+                    Some(_) => Span::styled("  ✗", Style::default().fg(palette::ERROR_FG)),
+                    None => Span::styled("  …", Style::default().fg(palette::DIM)),
+                },
+            ]));
+            if let Some(out) = output {
+                let style = Style::default().fg(if *exit_code == Some(0) {
+                    palette::BODY_FG
+                } else {
+                    palette::ERROR_FG
+                });
+                let all_lines: Vec<&str> = out.lines().collect();
+                let truncated = all_lines.len() > 40;
+                let shown: String = all_lines
+                    .iter()
+                    .take(40)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                push_body_styled(&shown, lines, style);
+                if truncated {
+                    lines.push(Line::from(Span::styled(
+                        "  …（已截断）",
+                        Style::default().fg(palette::DIM),
+                    )));
+                }
+            }
+        }
+        ChatEntry::Info(s) => {
+            lines.push(Line::from(Span::styled(
+                format!("  {s}"),
+                Style::default().fg(palette::DIM),
+            )));
+        }
     }
 }
 
