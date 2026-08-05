@@ -13,6 +13,7 @@ use parrot_protocol::types::{
     ModelInfo as ProtocolModelInfo, SessionMeta as ProtocolSessionMeta, ToolDefinitionWire,
 };
 use parrot_protocol::{ClientMessage, ServerMessage};
+use parrot_tools::shell_exec::run_shell_command;
 use parrot_transport::{accept_connection, TransportServer, WsTransportServer};
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,7 +76,8 @@ pub async fn run_with_confirm_timeout(
     let session_store = Arc::new(SessionStore::new(sessions_dir.clone()));
     session_store.ensure_dir()?;
 
-    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let working_dir =
+        Arc::new(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
 
     let token_path = std::path::PathBuf::from(&config.daemon.auth_token_file);
     info!(
@@ -98,7 +100,7 @@ pub async fn run_with_confirm_timeout(
             Arc::clone(&provider_registry),
             default_config.clone(),
             sessions_dir,
-            working_dir,
+            (*working_dir).clone(),
         )
         .with_confirm_config(confirm_config)
         .with_hooks(hook_registry),
@@ -119,6 +121,7 @@ pub async fn run_with_confirm_timeout(
                 let provider_registry = Arc::clone(&provider_registry);
                 let confirm_router = Arc::clone(&confirm_router);
                 let default_config = Arc::clone(&default_config);
+                let working_dir = Arc::clone(&working_dir);
 
                 tokio::spawn(async move {
                     handle_connection(
@@ -129,6 +132,7 @@ pub async fn run_with_confirm_timeout(
                         provider_registry,
                         confirm_router,
                         default_config,
+                        working_dir,
                     )
                     .await;
                 });
@@ -144,6 +148,7 @@ struct ConnectionContext {
     authenticated: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut client: parrot_transport::ClientConnection,
     auth: Arc<Auth>,
@@ -152,6 +157,7 @@ async fn handle_connection(
     provider_registry: Arc<ProviderRegistry>,
     confirm_router: Arc<ConfirmRouter>,
     default_config: Arc<GenerateConfig>,
+    working_dir: Arc<std::path::PathBuf>,
 ) {
     let client_id = client.id;
     info!("Handling connection from client {}", client_id);
@@ -317,6 +323,31 @@ async fn handle_connection(
                     }
                 }
             }
+            ClientMessage::Shell {
+                session_id,
+                command,
+            } => match run_shell_command(&command, &working_dir).await {
+                Ok(r) => {
+                    let _ = client
+                        .sender
+                        .send(ServerMessage::ShellResult {
+                            session_id,
+                            output: r.output,
+                            exit_code: r.exit_code,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = client
+                        .sender
+                        .send(ServerMessage::ShellResult {
+                            session_id,
+                            output: e,
+                            exit_code: -1,
+                        })
+                        .await;
+                }
+            },
             ClientMessage::ListModels => {
                 let models = collect_models(&provider_registry).await;
                 let _ = client
@@ -442,20 +473,6 @@ async fn handle_connection(
                         session_id, tool_id
                     );
                 }
-            }
-            ClientMessage::Shell {
-                session_id,
-                command,
-            } => {
-                warn!("Shell command from {session_id} not yet implemented: {command}");
-                let _ = client
-                    .sender
-                    .send(ServerMessage::ShellResult {
-                        session_id,
-                        output: String::new(),
-                        exit_code: -1,
-                    })
-                    .await;
             }
         }
     }

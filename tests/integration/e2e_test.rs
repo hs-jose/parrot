@@ -1390,3 +1390,38 @@ async fn e2e_agent_end_emitted_on_disconnect() {
 
     daemon_handle.abort();
 }
+
+#[tokio::test]
+async fn e2e_shell_runs_command_on_daemon_and_returns_result() {
+    let provider = Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>;
+    let (mut rx, tx, _token, daemon_handle) = spawn_daemon_with_provider(provider).await;
+
+    let session_id = uuid::Uuid::new_v4();
+    tx.send(ClientMessage::Shell {
+        session_id,
+        command: "echo parrot-shell-ok".to_string(),
+    })
+    .await
+    .expect("send Shell");
+
+    let (output, exit_code) = expect_server_message(
+        &mut rx,
+        |m| {
+            if let ServerMessage::ShellResult {
+                output, exit_code, ..
+            } = m
+            {
+                Some((output.clone(), *exit_code))
+            } else {
+                None
+            }
+        },
+        "ShellResult",
+    )
+    .await;
+
+    assert!(output.contains("parrot-shell-ok"), "got: {output}");
+    assert_eq!(exit_code, 0);
+
+    daemon_handle.abort();
+}

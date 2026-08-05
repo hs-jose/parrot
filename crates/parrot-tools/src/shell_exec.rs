@@ -114,3 +114,64 @@ impl Tool for ShellExecTool {
         })
     }
 }
+
+/// Result of a daemon-side shell execution for the `!cmd` TUI feature.
+pub struct CommandResult {
+    pub output: String,
+    pub exit_code: i32,
+}
+
+/// Execute `command` with `cmd /C` (Windows) or `sh -c` (Unix) in
+/// `working_dir`. Mirrors `ShellExecTool::call` output semantics (combined
+/// stdout/stderr, `--- STDERR ---` separator, "Command exited with code N"
+/// fallback). Errors are spawn failures, returned as `Err(String)`.
+pub async fn run_shell_command(
+    command: &str,
+    working_dir: &std::path::Path,
+) -> Result<CommandResult, String> {
+    #[cfg(target_family = "windows")]
+    let output = tokio::process::Command::new("cmd")
+        .args(["/C", command])
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute command: {}", e))?;
+
+    #[cfg(not(target_family = "windows"))]
+    let output = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute command: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let mut result = String::new();
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push_str("\n--- STDERR ---\n");
+        }
+        result.push_str(&stderr);
+    }
+    if result.is_empty() {
+        result = format!(
+            "Command exited with code {}",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+
+    Ok(CommandResult {
+        output: result,
+        exit_code: output.status.code().unwrap_or(-1),
+    })
+}
