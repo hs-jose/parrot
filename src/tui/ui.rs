@@ -302,18 +302,35 @@ fn compact_args(args: &Value) -> String {
     serde_json::to_string(args).unwrap_or_default()
 }
 
-/// 将正文按行展开，统一缩进两格 + 柔和正文色。
+/// 将正文按行展开，统一缩进两格 + 柔和正文色。连续空行压缩为一行，
+/// 行首/行尾的空行去掉，避免"空行刷屏"和与消息间空行叠加。
 fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
-    let body_style = Style::default().fg(palette::BODY_FG);
-    if text.is_empty() {
+    push_body_styled(text, lines, Style::default().fg(palette::BODY_FG));
+}
+
+fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
+    if text.trim().is_empty() {
         lines.push(Line::from(Span::raw("  ")));
         return;
     }
+    let mut pending_blank = false;
+    let mut emitted = false;
     for l in text.lines() {
+        if l.trim().is_empty() {
+            if emitted {
+                pending_blank = true;
+            }
+            continue;
+        }
+        if pending_blank {
+            lines.push(Line::from(Span::raw("  ")));
+            pending_blank = false;
+        }
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(l.to_string(), body_style),
+            Span::styled(l.to_string(), style),
         ]));
+        emitted = true;
     }
 }
 
@@ -500,5 +517,34 @@ mod tests {
             app.scroll_offset
         );
         assert!(app.scroll_offset > 0);
+    }
+
+    #[test]
+    fn push_body_collapses_consecutive_blank_lines() {
+        let mut lines = Vec::new();
+        push_body("line1\n\n\n\nline2", &mut lines);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "  line1".to_string(),
+                "  ".to_string(),
+                "  line2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn push_body_drops_leading_and_trailing_blank_lines() {
+        let mut lines = Vec::new();
+        push_body("\n\nline1\n\n\n", &mut lines);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rendered, vec!["  line1".to_string()]);
     }
 }
