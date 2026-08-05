@@ -30,6 +30,10 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
     }
 }
 
@@ -62,6 +66,16 @@ pub(crate) async fn run_tui(
     let _raw_guard = RawModeGuard;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // 键盘增强协议（CSI-u）：让 VS Code 终端 / Windows Terminal 可靠上报
+    // Ctrl+Enter / Shift+Enter 等组合键的修饰符（修复"Ctrl+Enter 误发送"）。
+    // 不支持的终端会返回错误，忽略即可（退回默认键处理）。
+    let _ = execute!(
+        stdout,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -85,6 +99,7 @@ pub(crate) async fn run_tui(
     let _ = disable_raw_mode();
     let mut stdout = std::io::stdout();
     let _ = execute!(stdout, LeaveAlternateScreen);
+    let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
     result
 }
 
