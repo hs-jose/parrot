@@ -510,3 +510,26 @@ fn hook_action_replace_context_roundtrip() {
     let decoded: HookAction = serde_json::from_str(&json).unwrap();
     assert_eq!(action, decoded);
 }
+
+#[test]
+fn client_shell_roundtrip() {
+    let msg = ClientMessage::Shell {
+        session_id: uuid::Uuid::new_v4(),
+        command: "echo hi".into(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn server_shell_result_roundtrip() {
+    let msg = ServerMessage::ShellResult {
+        session_id: uuid::Uuid::new_v4(),
+        output: "hi\n".into(),
+        exit_code: 0,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+}

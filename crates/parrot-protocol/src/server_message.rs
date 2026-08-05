@@ -29,6 +29,11 @@ pub enum ServerMessage {
         session_id: SessionId,
         events: Vec<PersistedAgentEvent>,
     },
+    ShellResult {
+        session_id: SessionId,
+        output: String,
+        exit_code: i32,
+    },
 
     AgentEvent {
         event: AgentEvent,

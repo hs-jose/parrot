@@ -41,4 +41,11 @@ pub enum ClientMessage {
         tool_id: String,
         decision: ConfirmDecision,
     },
+    /// Execute a shell command on the daemon (the `!cmd` feature). Runs
+    /// outside the engine and never enters the session context. Response:
+    /// `ServerMessage::ShellResult`.
+    Shell {
+        session_id: SessionId,
+        command: String,
+    },
 }

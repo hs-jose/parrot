@@ -443,6 +443,20 @@ async fn handle_connection(
                     );
                 }
             }
+            ClientMessage::Shell {
+                session_id,
+                command,
+            } => {
+                warn!("Shell command from {session_id} not yet implemented: {command}");
+                let _ = client
+                    .sender
+                    .send(ServerMessage::ShellResult {
+                        session_id,
+                        output: String::new(),
+                        exit_code: -1,
+                    })
+                    .await;
+            }
         }
     }
 
