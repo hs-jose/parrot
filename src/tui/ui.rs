@@ -383,7 +383,7 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
         .border_style(Style::default().fg(palette::INPUT_BORDER))
         .padding(Padding::horizontal(1))
         .title(Span::styled(
-            " Enter 发送 · Shift+Enter 换行 · PgUp/PgDn 翻页 · Ctrl+C 退出 ",
+            " Enter 发送 · Shift+Enter 换行 · PgUp/PgDn 翻页 · Ctrl+C 中断 · 双击 Esc 退出 ",
             Style::default().fg(palette::DIM),
         ));
     let inner = block.inner(area);
