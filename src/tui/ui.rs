@@ -26,7 +26,7 @@ mod palette {
     pub const INPUT_BORDER: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
 }
 
-pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &App, input: &tui_textarea::TextArea<'_>) {
+pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &mut App, input: &tui_textarea::TextArea<'_>) {
     let area = f.area();
     // 输入区按内容行数动态增长，+2 为上下边框；上限不超过终端高度的 1/3，
     // 避免长输入把对话区挤没。
@@ -45,7 +45,7 @@ pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &App, input: &tui_textarea::
         ])
         .split(area);
     draw_title(f, chunks[0], app);
-    draw_entries(f, chunks[1], app);
+    draw_entries(f, chunks[1], &mut *app);
     draw_input(f, chunks[2], input);
     draw_status(f, chunks[3], app);
     if app.mode == Mode::ConfirmPending {
@@ -111,7 +111,7 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(bar, area);
 }
 
-fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     // 对话卡片：圆角边框 + 水平内边距，让内容不贴边。
     let block = Block::default()
         .borders(Borders::ALL)
@@ -138,10 +138,12 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let blink = blink_cursor();
 
-    // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。
+    // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。复用
+    // push_body_styled 的空行压缩逻辑，避免 markdown 段落空行在流式阶段
+    // 刷屏；光标贴在最后一行行尾（正在输入的位置）。
     if let Some(text) = app.streaming_text() {
         lines.push(header_line("●", palette::AI_FG, None));
-        if text.is_empty() {
+        if text.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 blink,
                 Style::default()
@@ -149,23 +151,17 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             )));
         } else {
-            for (i, l) in text.lines().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(l.to_string(), Style::default().fg(palette::BODY_FG)),
-                        Span::styled(
-                            blink,
-                            Style::default()
-                                .fg(palette::AI_FG)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(l.to_string(), Style::default().fg(palette::BODY_FG)),
-                    ]));
+            let before = lines.len();
+            push_body_styled(text, &mut lines, Style::default().fg(palette::BODY_FG));
+            // push_body_styled 至少 push 一行（含全空文本），所以 last_mut 必 Some。
+            if lines.len() > before {
+                if let Some(last) = lines.last_mut() {
+                    last.spans.push(Span::styled(
+                        blink,
+                        Style::default()
+                            .fg(palette::AI_FG)
+                            .add_modifier(Modifier::BOLD),
+                    ));
                 }
             }
         }
@@ -197,6 +193,8 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         0
     };
     let max_scroll = total_visual_lines.saturating_sub(view_h);
+    app.view_height = inner.height;
+    app.clamp_scroll(max_scroll.min(u16::MAX as usize) as u16);
     let scroll = max_scroll.saturating_sub(app.scroll_offset as usize);
 
     f.render_widget(para.scroll((scroll as u16, 0)), inner);
@@ -278,6 +276,52 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
                 Style::default().fg(palette::WARN_FG),
             )));
         }
+        ChatEntry::Shell {
+            command,
+            output,
+            exit_code,
+        } => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("▸ !{command}"),
+                    Style::default().fg(palette::TOOL_FG),
+                ),
+                match exit_code {
+                    Some(0) => Span::styled("  ✓", Style::default().fg(palette::OK_FG)),
+                    Some(_) => Span::styled("  ✗", Style::default().fg(palette::ERROR_FG)),
+                    None => Span::styled("  …", Style::default().fg(palette::DIM)),
+                },
+            ]));
+            if let Some(out) = output {
+                let style = Style::default().fg(if *exit_code == Some(0) {
+                    palette::BODY_FG
+                } else {
+                    palette::ERROR_FG
+                });
+                let all_lines: Vec<&str> = out.lines().collect();
+                let truncated = all_lines.len() > 40;
+                let shown: String = all_lines
+                    .iter()
+                    .take(40)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                push_body_styled(&shown, lines, style);
+                if truncated {
+                    lines.push(Line::from(Span::styled(
+                        "  …（已截断）",
+                        Style::default().fg(palette::DIM),
+                    )));
+                }
+            }
+        }
+        ChatEntry::Info(s) => {
+            lines.push(Line::from(Span::styled(
+                format!("  {s}"),
+                Style::default().fg(palette::DIM),
+            )));
+        }
     }
 }
 
@@ -299,18 +343,35 @@ fn compact_args(args: &Value) -> String {
     serde_json::to_string(args).unwrap_or_default()
 }
 
-/// 将正文按行展开，统一缩进两格 + 柔和正文色。
+/// 将正文按行展开，统一缩进两格 + 柔和正文色。连续空行压缩为一行，
+/// 行首/行尾的空行去掉，避免"空行刷屏"和与消息间空行叠加。
 fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
-    let body_style = Style::default().fg(palette::BODY_FG);
-    if text.is_empty() {
+    push_body_styled(text, lines, Style::default().fg(palette::BODY_FG));
+}
+
+fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
+    if text.trim().is_empty() {
         lines.push(Line::from(Span::raw("  ")));
         return;
     }
+    let mut pending_blank = false;
+    let mut emitted = false;
     for l in text.lines() {
+        if l.trim().is_empty() {
+            if emitted {
+                pending_blank = true;
+            }
+            continue;
+        }
+        if pending_blank {
+            lines.push(Line::from(Span::raw("  ")));
+            pending_blank = false;
+        }
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(l.to_string(), body_style),
+            Span::styled(l.to_string(), style),
         ]));
+        emitted = true;
     }
 }
 
@@ -322,7 +383,7 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
         .border_style(Style::default().fg(palette::INPUT_BORDER))
         .padding(Padding::horizontal(1))
         .title(Span::styled(
-            " Enter 发送 · Shift+Enter 换行 · PgUp/PgDn 翻页 · Ctrl+C 退出 ",
+            " Enter 发送 · Shift+Enter 换行 · PgUp/PgDn 翻页 · Ctrl+C 中断 · 双击 Esc 退出 ",
             Style::default().fg(palette::DIM),
         ));
     let inner = block.inner(area);
@@ -454,7 +515,7 @@ mod tests {
             });
             app.entries.push(ChatEntry::Error("boom".into()));
             let input = tui_textarea::TextArea::default();
-            terminal.draw(|f| draw(f, &app, &input)).unwrap();
+            terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         }
     }
 
@@ -462,9 +523,9 @@ mod tests {
     #[test]
     fn draw_renders_rounded_borders_around_chat_and_input() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        let app = App::new(SessionId::new_v4());
+        let mut app = App::new(SessionId::new_v4());
         let input = tui_textarea::TextArea::default();
-        terminal.draw(|f| draw(f, &app, &input)).unwrap();
+        terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         let buf = terminal.backend().buffer();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(
@@ -475,5 +536,56 @@ mod tests {
             text.contains('╰'),
             "expected rounded bottom corner, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn draw_clamps_scroll_offset_to_actual_range() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = App::new(SessionId::new_v4());
+        for i in 0..50 {
+            app.entries.push(ChatEntry::User {
+                text: format!("line {i}"),
+                time: "x".into(),
+            });
+        }
+        app.scroll_to_top();
+        terminal
+            .draw(|f| draw(f, &mut app, &tui_textarea::TextArea::default()))
+            .unwrap();
+        assert!(
+            app.scroll_offset < u16::MAX,
+            "overshoot must be clamped, got {}",
+            app.scroll_offset
+        );
+        assert!(app.scroll_offset > 0);
+    }
+
+    #[test]
+    fn push_body_collapses_consecutive_blank_lines() {
+        let mut lines = Vec::new();
+        push_body("line1\n\n\n\nline2", &mut lines);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "  line1".to_string(),
+                "  ".to_string(),
+                "  line2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn push_body_drops_leading_and_trailing_blank_lines() {
+        let mut lines = Vec::new();
+        push_body("\n\nline1\n\n\n", &mut lines);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rendered, vec!["  line1".to_string()]);
     }
 }
