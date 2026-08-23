@@ -9,7 +9,7 @@ mod replay_test;
 use std::io::Stdout;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -130,14 +130,34 @@ async fn run_loop(
                         *dirty = true;
                     }
                     UiEvent::Key(k) => {
+                        // 双击 Esc（仅 Normal 模式，500ms 窗口）：模型输出中中断消息
+                        // (Abort)，空闲时退出 TUI。键盘增强协议 (CSI-u) 下一次物理按下
+                        // 会连发 Press + Release 两个事件，因此必须只对 Press 计数双击，
+                        // 并让 Esc 的 Release 静默忽略、不重置 last_esc——否则第二次
+                        // Press 永远等到的是已清空状态。
                         if k.code == KeyCode::Esc && app.mode == Mode::Normal {
-                            let now = Instant::now();
-                            let is_double = last_esc
-                                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(500));
-                            last_esc = Some(now);
-                            if is_double {
-                                break;
+                            if k.kind == KeyEventKind::Press {
+                                let now = Instant::now();
+                                let is_double = last_esc.is_some_and(|t| {
+                                    now.duration_since(t) < Duration::from_millis(500)
+                                });
+                                last_esc = None;
+                                if is_double {
+                                    if app.is_turn_active() {
+                                        conn.sender
+                                            .send(ClientMessage::Abort {
+                                                session_id: app.session_id,
+                                            })
+                                            .await?;
+                                        *dirty = true;
+                                        continue;
+                                    }
+                                    break;
+                                } else {
+                                    last_esc = Some(now);
+                                }
                             }
+                            // Esc 的 Release/Repeat：忽略，不动 last_esc。
                         } else {
                             last_esc = None;
                         }
