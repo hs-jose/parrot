@@ -27,6 +27,10 @@ use parrot_core::provider::ProviderStopReason;
 struct MockProvider {
     call_count: AtomicU32,
     captured_messages: tokio::sync::Mutex<Vec<parrot_core::types::ChatMessage>>,
+    /// Scripted first-call tool call; `None` ⇒ every call is plain text.
+    first_tool: Option<(String, Value)>,
+    /// Reported via `list_models`; caps the engine's context budget.
+    context_window: u32,
 }
 
 impl MockProvider {
@@ -34,7 +38,24 @@ impl MockProvider {
         Self {
             call_count: AtomicU32::new(0),
             captured_messages: tokio::sync::Mutex::new(Vec::new()),
+            first_tool: Some(("echo".to_string(), json!({"message": "hello"}))),
+            context_window: 200_000,
         }
+    }
+
+    fn text_only(mut self) -> Self {
+        self.first_tool = None;
+        self
+    }
+
+    fn with_first_tool(mut self, name: &str, args: Value) -> Self {
+        self.first_tool = Some((name.to_string(), args));
+        self
+    }
+
+    fn with_context_window(mut self, window: u32) -> Self {
+        self.context_window = window;
+        self
     }
 
     async fn captured_messages(&self) -> Vec<parrot_core::types::ChatMessage> {
@@ -55,7 +76,7 @@ impl LlmProvider for MockProvider {
             id: "mock-model".to_string(),
             name: "Mock Model".to_string(),
             provider: "mock".to_string(),
-            context_window: 200_000,
+            context_window: self.context_window,
             max_output_tokens: 8192,
         }])
     }
@@ -69,27 +90,28 @@ impl LlmProvider for MockProvider {
     ) -> Result<ChatStream, parrot_core::error::ProviderError> {
         *self.captured_messages.lock().await = messages.to_vec();
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let first_tool = self.first_tool.clone();
 
         let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
 
         tokio::spawn(async move {
-            match n {
-                0 => {
+            match (n, first_tool) {
+                (0, Some((name, args))) => {
                     tx.send(ProviderStreamEvent::ToolCallStart {
                         id: "tc_mock_1".to_string(),
-                        name: "echo".to_string(),
+                        name: name.clone(),
                     })
                     .await
                     .ok();
                     tx.send(ProviderStreamEvent::ToolCallDelta {
                         id: "tc_mock_1".to_string(),
-                        args_delta: r#"{"message":"hello"}"#.to_string(),
+                        args_delta: args.to_string(),
                     })
                     .await
                     .ok();
                     tx.send(ProviderStreamEvent::ToolCallEnd {
                         id: "tc_mock_1".to_string(),
-                        arguments: json!({"message": "hello"}),
+                        arguments: args,
                     })
                     .await
                     .ok();
@@ -411,4 +433,224 @@ async fn react_loop_emits_lifecycle_brackets() {
         found_pair,
         "second provider call must have an assistant tool_use followed by its matching tool_result"
     );
+}
+
+/// Tool whose output vastly exceeds the engine's cap.
+struct BigOutputTool;
+
+#[async_trait]
+impl Tool for BigOutputTool {
+    fn name(&self) -> &str {
+        "big"
+    }
+
+    fn description(&self) -> &str {
+        "Returns a huge output."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer" } },
+            "required": ["n"]
+        })
+    }
+
+    async fn call(&self, _arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+        Ok(ToolOutput {
+            content: "x".repeat(200_000),
+            is_error: false,
+        })
+    }
+}
+
+/// Run a two-turn text-only conversation and return the context captured
+/// on the LAST provider call (the mock overwrites captures per call).
+async fn run_two_turns_and_capture_last_context(
+    mock: Arc<MockProvider>,
+    engine: ReActEngine,
+) -> Vec<parrot_core::types::ChatMessage> {
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    for q in ["q1", "q2"] {
+        cmd_tx
+            .send(SessionCmd::Chat {
+                message: q.to_string(),
+            })
+            .await
+            .unwrap();
+        collect_until_turn_end(&mut event_rx).await;
+    }
+    drop(cmd_tx);
+    drain_until_agent_end(&mut event_rx).await;
+    let _ = engine_task.await;
+    mock.captured_messages().await
+}
+
+fn temp_dirs() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = TempDir::new().expect("create temp dir");
+    let working_dir = tmp.path().join("working");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    (tmp, working_dir, data_dir)
+}
+
+#[tokio::test]
+async fn oversized_tool_output_is_truncated_in_event_and_context() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    tool_registry.register(Arc::new(BigOutputTool)).await;
+
+    let mock = Arc::new(MockProvider::new().with_first_tool("big", json!({"n": 1})));
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("You are a test assistant.".to_string()),
+        data_dir,
+        working_dir,
+    );
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "run the big tool".to_string(),
+        })
+        .await
+        .unwrap();
+    let mut events = collect_until_turn_end(&mut event_rx).await;
+    drop(cmd_tx);
+    let trailing = drain_until_agent_end(&mut event_rx).await;
+    events.extend(trailing);
+    let _ = engine_task.await;
+
+    // ToolEnd (event log + client) is capped with a truncation marker.
+    let tool_end = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::ToolEnd { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("ToolEnd present");
+    assert!(
+        tool_end.content.len() <= parrot_core::engine::MAX_TOOL_OUTPUT_BYTES + 64,
+        "ToolEnd content must be capped, got {} bytes",
+        tool_end.content.len()
+    );
+    assert!(tool_end.content.contains("(truncated, total 200000 bytes)"));
+    assert!(!tool_end.is_error);
+
+    // The context on the second LLM call received the truncated version.
+    let captured = mock.captured_messages().await;
+    let tool_msg = captured
+        .iter()
+        .find(|m| m.role == parrot_core::types::ChatRole::Tool)
+        .expect("tool message present in second-call context");
+    assert!(tool_msg.content.contains("(truncated, total 200000 bytes)"));
+    assert!(tool_msg.content.len() <= parrot_core::engine::MAX_TOOL_OUTPUT_BYTES + 64);
+}
+
+#[tokio::test]
+async fn context_limits_from_builder_drive_pruning() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(MockProvider::new().text_only());
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("sys".to_string()),
+        data_dir,
+        working_dir,
+    )
+    .with_context_limits(1, 1);
+
+    let captured = run_two_turns_and_capture_last_context(mock, engine).await;
+
+    assert!(
+        captured.iter().any(|m| m.content == "q2"),
+        "latest turn must remain, got: {:?}",
+        captured
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        captured.iter().all(|m| m.content != "q1"),
+        "old turn must be pruned under a 1-token budget"
+    );
+}
+
+#[tokio::test]
+async fn model_context_window_caps_prune_budget() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(MockProvider::new().text_only().with_context_window(1));
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("sys".to_string()),
+        data_dir,
+        working_dir,
+    )
+    .with_context_limits(u32::MAX, 1);
+
+    let captured = run_two_turns_and_capture_last_context(mock, engine).await;
+
+    // Config budget is u32::MAX; only the model's 1-token window can force
+    // this pruning. If the window were ignored, q1 would still be present.
+    assert!(
+        captured.iter().all(|m| m.content != "q1"),
+        "old turn must be pruned when the model window is the binding limit"
+    );
+    assert!(captured.iter().any(|m| m.content == "q2"));
 }

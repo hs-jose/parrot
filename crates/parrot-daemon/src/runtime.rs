@@ -103,7 +103,11 @@ pub async fn run_with_confirm_timeout(
             (*working_dir).clone(),
         )
         .with_confirm_config(confirm_config)
-        .with_hooks(hook_registry),
+        .with_hooks(hook_registry)
+        .with_context_limits(
+            config.session.max_history_tokens,
+            config.session.keep_recent_turns,
+        ),
     ));
     // Wrap once in an Arc so each spawned handler can share the daemon's
     // current default config without per-connection cloning.

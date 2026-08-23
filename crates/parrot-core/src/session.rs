@@ -73,6 +73,11 @@ pub struct SessionManager {
     working_dir: std::path::PathBuf,
     confirm_config: ConfirmConfig,
     hooks: Option<Arc<HookRegistry>>,
+    /// Context prune limits (`[session]` from parrot.toml), inherited by
+    /// every engine this manager spawns. Defaults mirror the pre-config
+    /// hardcoded values.
+    max_history_tokens: u32,
+    keep_recent_turns: u32,
 }
 
 impl SessionManager {
@@ -92,6 +97,8 @@ impl SessionManager {
             working_dir,
             confirm_config: ConfirmConfig::default(),
             hooks: None,
+            max_history_tokens: 100_000,
+            keep_recent_turns: 10,
         }
     }
 
@@ -105,6 +112,14 @@ impl SessionManager {
 
     pub fn with_hooks(mut self, registry: Arc<HookRegistry>) -> Self {
         self.hooks = Some(registry);
+        self
+    }
+
+    /// Set context prune limits (`[session]` from parrot.toml). Every
+    /// engine spawned afterwards inherits them.
+    pub fn with_context_limits(mut self, max_history_tokens: u32, keep_recent_turns: u32) -> Self {
+        self.max_history_tokens = max_history_tokens;
+        self.keep_recent_turns = keep_recent_turns;
         self
     }
 
@@ -245,7 +260,8 @@ impl SessionManager {
             self.working_dir.clone(),
         )
         .with_confirm_config(self.confirm_config.clone())
-        .with_initial_context(initial_context);
+        .with_initial_context(initial_context)
+        .with_context_limits(self.max_history_tokens, self.keep_recent_turns);
         let engine = if let Some(h) = self.hooks.clone() {
             engine.with_hooks(h)
         } else {

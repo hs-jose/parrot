@@ -19,6 +19,40 @@ use uuid::Uuid;
 
 pub const MAX_REACT_ITERATIONS: u32 = 20;
 
+/// 单个工具结果进入事件日志与模型上下文前的硬上限（字节）。
+/// 兜底 `file_glob "**/*"` 这类无界输出：一次 9.4MB 的 ToolEnd 会让会话
+/// 永久 400（每次 resume 都重放该结果），且 prune 只能整轮删、救不回。
+/// 64KB ≈ char/4 估算下 ~16k token，单个工具结果不可能独自打爆预算。
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Cap tool result content at [`MAX_TOOL_OUTPUT_BYTES`] with a truncation
+/// marker. The cut point always lands on a UTF-8 char boundary.
+fn truncate_tool_content(content: &str) -> String {
+    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return content.to_string();
+    }
+    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}... (truncated, total {} bytes)",
+        &content[..end],
+        content.len()
+    )
+}
+
+/// Effective context prune budget: the `[session] max_history_tokens`
+/// config value, further capped by the model's context window when the
+/// provider reports one. The config stays the primary knob; the model
+/// window can only lower it.
+fn context_budget(max_history_tokens: u32, model_window: Option<u32>) -> u32 {
+    match model_window {
+        Some(w) => max_history_tokens.min(w),
+        None => max_history_tokens,
+    }
+}
+
 pub struct ReActEngine {
     session_id: Uuid,
     tool_registry: Arc<ToolRegistry>,
@@ -41,6 +75,11 @@ pub struct ReActEngine {
     /// The seq the EventLog was at after the resume replay. Used to keep
     /// `current_seq` continuous when appending new events post-resume.
     resume_seq_offset: u64,
+    /// Context prune budget (`[session] max_history_tokens`, wired in by
+    /// the daemon). Default mirrors the pre-config hardcoded value.
+    max_history_tokens: u32,
+    /// Complete turns kept when pruning (`[session] keep_recent_turns`).
+    keep_recent_turns: u32,
     hooks: Arc<HookRegistry>,
 }
 
@@ -77,6 +116,8 @@ impl ReActEngine {
             resumed_from_seq: None,
             pending_integrity_warning: None,
             resume_seq_offset: 0,
+            max_history_tokens: 100_000,
+            keep_recent_turns: 10,
             hooks: Arc::new(HookRegistry::empty()),
         }
     }
@@ -107,6 +148,14 @@ impl ReActEngine {
 
     pub fn with_hooks(mut self, registry: Arc<HookRegistry>) -> Self {
         self.hooks = registry;
+        self
+    }
+
+    /// Override context prune limits. The daemon passes `[session]`
+    /// `max_history_tokens` / `keep_recent_turns` from parrot.toml here.
+    pub fn with_context_limits(mut self, max_history_tokens: u32, keep_recent_turns: u32) -> Self {
+        self.max_history_tokens = max_history_tokens;
+        self.keep_recent_turns = keep_recent_turns;
         self
     }
 
@@ -178,7 +227,13 @@ impl ReActEngine {
             tracing::warn!(session_id = %session_id, kind = ?issue.kind, "replay integrity warning emitted");
         }
 
-        let context_manager = ContextManager::new(100_000, 10);
+        // 预算 = min([session] max_history_tokens, 模型 context_window)。
+        // 配置值是主旋钮，模型窗口只能进一步收紧。
+        let model_window = self.resolve_model_context_window().await;
+        let context_manager = ContextManager::new(
+            context_budget(self.max_history_tokens, model_window),
+            self.keep_recent_turns,
+        );
 
         // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
         // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
@@ -296,6 +351,18 @@ impl ReActEngine {
             .await
             .map(|p| p.provider_id().to_string())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// The model's context window as reported by its provider, if known.
+    /// Unknown models (e.g. provider doesn't list them) keep the config
+    /// budget unchanged.
+    async fn resolve_model_context_window(&self) -> Option<u32> {
+        let provider = self.provider_registry.resolve(&self.config.model).await?;
+        let models = provider.list_models().await.ok()?;
+        models
+            .iter()
+            .find(|m| m.id == self.config.model)
+            .map(|m| m.context_window)
     }
 
     /// ReAct 主循环：跑一轮 LLM，把 assistant 消息塞进 context；
@@ -610,7 +677,7 @@ impl ReActEngine {
         emit_hook_executions(&execs, session_id, event_tx);
         if let HookResult::Block { reason, .. } = tool_call_outcome {
             let result = parrot_protocol::types::ToolOutput {
-                content: format!("blocked: {reason}"),
+                content: truncate_tool_content(&format!("blocked: {reason}")),
                 is_error: true,
             };
             let tool_end = AgentEvent::ToolEnd {
@@ -672,7 +739,7 @@ impl ReActEngine {
             {
                 Abortable::Completed(r) => {
                     r.unwrap_or_else(|e| parrot_protocol::types::ToolOutput {
-                        content: format!("Error: {}", e),
+                        content: truncate_tool_content(&format!("Error: {}", e)),
                         is_error: true,
                     })
                 }
@@ -722,6 +789,13 @@ impl ReActEngine {
                 content, is_error, ..
             } => parrot_protocol::types::ToolOutput { content, is_error },
             _ => result,
+        };
+
+        // 工具输出统一截断：ToolEnd 事件、events.log、模型上下文三处同时
+        // 兜住，无界输出（如 file_glob "**/*"）无法再撑爆会话。
+        let result = parrot_protocol::types::ToolOutput {
+            content: truncate_tool_content(&result.content),
+            is_error: result.is_error,
         };
 
         let tool_end = AgentEvent::ToolEnd {
@@ -988,4 +1062,52 @@ pub fn system_prompt_hash(prompt: &str) -> String {
     hasher.update(prompt.as_bytes());
     let full = hasher.finalize();
     hex::encode(&full[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_tool_content_noop_under_cap() {
+        let content = "x".repeat(100);
+        assert_eq!(truncate_tool_content(&content), content);
+    }
+
+    #[test]
+    fn truncate_tool_content_caps_and_marks() {
+        let content = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1000);
+        let out = truncate_tool_content(&content);
+        assert!(
+            out.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "capped output must stay within cap + marker, got {}",
+            out.len()
+        );
+        assert_eq!(
+            out,
+            format!(
+                "{}... (truncated, total {} bytes)",
+                "x".repeat(MAX_TOOL_OUTPUT_BYTES),
+                content.len()
+            )
+        );
+    }
+
+    #[test]
+    fn truncate_tool_content_cuts_on_char_boundary() {
+        // Multibyte chars: the cut point must land on a UTF-8 boundary.
+        let content = "你".repeat(MAX_TOOL_OUTPUT_BYTES / 3 + 10);
+        let out = truncate_tool_content(&content);
+        assert!(out.starts_with('你'));
+        assert!(out.contains("(truncated"));
+        assert!(out.len() <= MAX_TOOL_OUTPUT_BYTES + 64);
+    }
+
+    #[test]
+    fn context_budget_takes_min_of_config_and_model_window() {
+        assert_eq!(context_budget(100_000, None), 100_000);
+        assert_eq!(context_budget(100_000, Some(200_000)), 100_000);
+        assert_eq!(context_budget(2_000_000, Some(200_000)), 200_000);
+        assert_eq!(context_budget(50, Some(200_000)), 50);
+    }
 }
