@@ -138,10 +138,12 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 
     let blink = blink_cursor();
 
-    // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。
+    // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。复用
+    // push_body_styled 的空行压缩逻辑，避免 markdown 段落空行在流式阶段
+    // 刷屏；光标贴在最后一行行尾（正在输入的位置）。
     if let Some(text) = app.streaming_text() {
         lines.push(header_line("●", palette::AI_FG, None));
-        if text.is_empty() {
+        if text.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 blink,
                 Style::default()
@@ -149,23 +151,17 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             )));
         } else {
-            for (i, l) in text.lines().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(l.to_string(), Style::default().fg(palette::BODY_FG)),
-                        Span::styled(
-                            blink,
-                            Style::default()
-                                .fg(palette::AI_FG)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(l.to_string(), Style::default().fg(palette::BODY_FG)),
-                    ]));
+            let before = lines.len();
+            push_body_styled(text, &mut lines, Style::default().fg(palette::BODY_FG));
+            // push_body_styled 至少 push 一行（含全空文本），所以 last_mut 必 Some。
+            if lines.len() > before {
+                if let Some(last) = lines.last_mut() {
+                    last.spans.push(Span::styled(
+                        blink,
+                        Style::default()
+                            .fg(palette::AI_FG)
+                            .add_modifier(Modifier::BOLD),
+                    ));
                 }
             }
         }
