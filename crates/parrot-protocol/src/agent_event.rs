@@ -115,6 +115,19 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+
+    /// Context compaction applied: pre-cut-point history was replaced by a
+    /// structured summary (marker-prefixed). Emitted BEFORE the triggering
+    /// turn's `TurnStart`. Replayed by `rebuild_context` with message-count
+    /// semantics: keep the last `kept_message_count` rebuilt messages, then
+    /// push this summary as a User message.
+    CompactionSummary {
+        session_id: SessionId,
+        turn_id: Uuid,
+        summary: String,
+        dropped_message_count: u32,
+        kept_message_count: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -222,7 +235,8 @@ impl AgentEvent {
             | Self::ToolEnd { session_id, .. }
             | Self::ToolConfirmRequired { session_id, .. }
             | Self::ReplayIntegrityWarning { session_id, .. }
-            | Self::HookFired { session_id, .. } => *session_id,
+            | Self::HookFired { session_id, .. }
+            | Self::CompactionSummary { session_id, .. } => *session_id,
         }
     }
 }

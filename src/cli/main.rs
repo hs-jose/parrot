@@ -210,6 +210,16 @@ fn print_history(events: &[PersistedAgentEvent]) {
             AgentEvent::HookFired { hook_id, .. } => {
                 format!("HookFired({})", hook_id)
             }
+            AgentEvent::CompactionSummary {
+                dropped_message_count,
+                kept_message_count,
+                ..
+            } => {
+                format!(
+                    "CompactionSummary(dropped={} kept={})",
+                    dropped_message_count, kept_message_count
+                )
+            }
         };
         println!("#{:-4} {} {}", e.seq, e.ts.format("%H:%M:%S"), kind);
     }

@@ -334,6 +334,7 @@ impl App {
                 )));
             }
             AgentEvent::HookFired { .. } => {}
+            AgentEvent::CompactionSummary { .. } => {}
         }
     }
 
