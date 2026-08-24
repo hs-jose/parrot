@@ -72,9 +72,11 @@ turn 之后、tail 内 TurnStart 之前"的位置,截断后必然保留。
 
 - **增量语义**:再次压缩时,旧摘要消息在切点之前、被并入新摘要的
   输入(消息自然携带,无需 Pi 的 UPDATE 双 prompt),摘要不膨胀。
-- **摘要调用**:`provider_registry.resolve(当前模型)`,
-  不带 tool_defs,`max_tokens = summary_max_tokens`(默认 4096)。
+- **摘要调用**:走 `provider_registry.resolve(当前模型)` 的
+  **非流式 `chat()`**(与主对话的 `chat_stream` 区分,便于测试与
+  日志区分),不带 tool_defs,`max_tokens = summary_max_tokens`。
   期间 Abort 不打断(调用短,MVP 接受,此处记录为已知取舍)。
+  模型返回空文本 ⇒ 视同失败,fail-open。
 - **旧摘要识别**:摘要消息内容以固定标记前缀
   `[CONVERSATION SUMMARY]` 开头;压缩与 rebuild 均据此定位。
   零 ChatMessage 类型改动,serde/resume 天然兼容。
@@ -92,20 +94,25 @@ CompactionSummary {
     session_id: SessionId,
     turn_id: TurnId,               // 触发本次压缩的 turn(事件在其 TurnStart 之前落盘)
     summary: String,              // 含标记前缀的完整摘要文本
-    dropped_event_count: u32,     // 本次压缩丢弃的上下文消息数
-    kept_from_seq: u64,           // 保留段起点事件 seq(见下,重建语义的必要字段)
+    dropped_message_count: u32,   // 本次压缩从上下文移除的消息数(含旧摘要)
+    kept_message_count: u32,      // 压缩后保留的原始消息数(不含 system 与摘要自身)
 }
 ```
 
 - 加入 `is_persistent()` 集合。
-- **resume**:`rebuild_context` 重建时记录每个事件 seq 对应的
-  已重建消息数;遇到 `CompactionSummary` → 把已重建列表截断到
-  `kept_from_seq` 时刻的长度(即丢弃来自 seq < kept_from_seq 事件的
-  消息),再输出一条 User 角色摘要消息(带标记前缀),继续重建
-  保留段。最终 context = system + 摘要 + 保留段。
-  `kept_from_seq` 指向保留段第一个 turn 的 `TurnStart` 事件 seq;
-  全部历史被摘要时指向 `CompactionSummary` 自身 seq(保留段为空)。
-  **该字段是重建正确性的必要输入,不是可选审计信息。**
+- **resume(消息计数语义)**:`rebuild_context` 按序重建;遇到
+  `CompactionSummary` 时,其已累积的消息列表恰好等于压缩前的
+  上下文(不含 system)。保留段 = 列表末尾 `kept_message_count`
+  条;新列表 = `[摘要(User, 带标记前缀)] + 保留段`,继续重建
+  后续事件。最终 context = system + 摘要 + 保留段。
+- **为何用消息计数而非事件 seq**:engine 侧记录"消息 ↔ 事件 seq"
+  映射需要侵入 resume 路径;消息计数在 live 与 replay 两条路径上
+  都直接可得,且 `rebuild_context` 对同一事件流确定性输出,语义
+  等价。不变量:`dropped + kept + 1(摘要) + 1(system,若有)
+  == 压缩时上下文总消息数`。
+- 已知限制(记录,不处理):hook `Inject` 注入的消息不落事件流
+  (既有缺口),若压缩发生在注入之后,重放的截断点可能与 live
+  有偏差;当前无内置 hook 使用 Inject,可接受。
 - **事件流不删不改**:原始 TurnStart/MessageEnd/ToolEnd 全部留在
   events.log,`CompactionSummary` 只是"上下文重建时的分界指令"。
   审计、debug、未来"解压回放"都保得住。
@@ -149,6 +156,9 @@ daemon 经现有 `with_context_limits` 路径传入;该方法参数扩为
 - 压缩时上下文不足两条 turn → 跳过(没东西可摘)。
 - keep 段极小(keep_recent_tokens 被模型窗口压得很低)→
   切点至少保留最近 1 个完整 turn。
+- 回退累计吞掉全部 turn(keep_recent_tokens ≥ 历史总量,但总量
+  已超阈值,典型如预算被模型窗口压小的场景)→ 强制只保留最新
+  1 个完整 turn,其余全部摘要——保证压缩一旦触发必有进展。
 - system prompt 不参与压缩,永远置顶。
 - `compaction = false` → 行为与现状完全一致(纯 prune)。
 
@@ -158,7 +168,7 @@ daemon 经现有 `with_context_limits` 路径传入;该方法参数扩为
 |---|---|
 | `compaction.rs` 纯函数 | 切点选择(阈值触发/不触发、turn 边界对齐、旧摘要识别、极小 keep 段)、估算 |
 | engine(`react_loop.rs` 模式) | MockProvider 记录收到的消息:断言压缩后请求含摘要消息且不含被压消息;断言摘要失败时 prune 兜底仍生效;断言 `CompactionSummary` 落盘于 TurnStart 之前 |
-| resume | 构造含 `CompactionSummary` 的 events.log → `rebuild_context` 按 `kept_from_seq` 截断,输出 = system + 摘要 + 保留段;半成品 turn 截断后 `CompactionSummary` 仍保留 |
+| resume | 构造含 `CompactionSummary` 的 events.log → `rebuild_context` 按 `kept_message_count` 截断,输出 = system + 摘要 + 保留段;半成品 turn 截断后 `CompactionSummary` 仍保留 |
 | protocol | roundtrip + `is_persistent` |
 | e2e | MockProvider 撑大上下文 → 断言 client 收到 `CompactionSummary` 事件 |
 
