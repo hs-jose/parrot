@@ -334,7 +334,14 @@ impl App {
                 )));
             }
             AgentEvent::HookFired { .. } => {}
-            AgentEvent::CompactionSummary { .. } => {}
+            AgentEvent::CompactionSummary {
+                dropped_message_count,
+                ..
+            } => {
+                self.entries.push(ChatEntry::Info(format!(
+                    "已压缩 {dropped_message_count} 条历史消息"
+                )));
+            }
         }
     }
 
@@ -722,5 +729,24 @@ mod tests {
         app.scroll_up(100);
         app.scroll_to_bottom();
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn compaction_summary_pushes_info_entry() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.apply_event(AgentEvent::CompactionSummary {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            summary: "[CONVERSATION SUMMARY]\n...".into(),
+            dropped_message_count: 6,
+            kept_message_count: 4,
+        });
+        match app.entries.last() {
+            Some(ChatEntry::Info(text)) => {
+                assert!(text.contains("6"), "info mentions dropped count: {text}");
+            }
+            other => panic!("expected Info entry, got {:?}", other),
+        }
     }
 }
