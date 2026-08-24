@@ -104,10 +104,16 @@ pub async fn run_with_confirm_timeout(
         )
         .with_confirm_config(confirm_config)
         .with_hooks(hook_registry)
-        .with_context_limits(
-            config.session.max_history_tokens,
-            config.session.keep_recent_turns,
-        ),
+        .with_context_limits(parrot_core::compaction::ContextLimits {
+            max_history_tokens: config.session.max_history_tokens,
+            keep_recent_turns: config.session.keep_recent_turns,
+            compaction: parrot_core::compaction::CompactionConfig {
+                enabled: config.session.compaction,
+                threshold: config.session.compaction_threshold,
+                keep_recent_tokens: config.session.keep_recent_tokens,
+                summary_max_tokens: config.session.summary_max_tokens,
+            },
+        }),
     ));
     // Wrap once in an Arc so each spawned handler can share the daemon's
     // current default config without per-connection cloning.

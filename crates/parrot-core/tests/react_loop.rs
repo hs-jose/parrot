@@ -27,10 +27,16 @@ use parrot_core::provider::ProviderStopReason;
 struct MockProvider {
     call_count: AtomicU32,
     captured_messages: tokio::sync::Mutex<Vec<parrot_core::types::ChatMessage>>,
+    /// Every provider call's messages (chat + chat_stream), in order.
+    captured_calls: tokio::sync::Mutex<Vec<Vec<parrot_core::types::ChatMessage>>>,
     /// Scripted first-call tool call; `None` ⇒ every call is plain text.
     first_tool: Option<(String, Value)>,
     /// Reported via `list_models`; caps the engine's context budget.
     context_window: u32,
+    /// Text returned by the non-stream `chat()` (compaction summary call).
+    summary_text: Option<String>,
+    /// When true, `chat()` returns Err (simulates summary failure).
+    fail_chat: bool,
 }
 
 impl MockProvider {
@@ -38,8 +44,11 @@ impl MockProvider {
         Self {
             call_count: AtomicU32::new(0),
             captured_messages: tokio::sync::Mutex::new(Vec::new()),
+            captured_calls: tokio::sync::Mutex::new(Vec::new()),
             first_tool: Some(("echo".to_string(), json!({"message": "hello"}))),
             context_window: 200_000,
+            summary_text: None,
+            fail_chat: false,
         }
     }
 
@@ -56,6 +65,20 @@ impl MockProvider {
     fn with_context_window(mut self, window: u32) -> Self {
         self.context_window = window;
         self
+    }
+
+    fn with_summary(mut self, text: &str) -> Self {
+        self.summary_text = Some(text.to_string());
+        self
+    }
+
+    fn fail_summary(mut self) -> Self {
+        self.fail_chat = true;
+        self
+    }
+
+    async fn captured_calls(&self) -> Vec<Vec<parrot_core::types::ChatMessage>> {
+        self.captured_calls.lock().await.clone()
     }
 
     async fn captured_messages(&self) -> Vec<parrot_core::types::ChatMessage> {
@@ -88,6 +111,7 @@ impl LlmProvider for MockProvider {
         _tools: &[ToolDefinition],
         _config: &GenerateConfig,
     ) -> Result<ChatStream, parrot_core::error::ProviderError> {
+        self.captured_calls.lock().await.push(messages.to_vec());
         *self.captured_messages.lock().await = messages.to_vec();
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
         let first_tool = self.first_tool.clone();
@@ -150,11 +174,26 @@ impl LlmProvider for MockProvider {
     async fn chat(
         &self,
         _model: &str,
-        _messages: &[parrot_core::types::ChatMessage],
+        messages: &[parrot_core::types::ChatMessage],
         _tools: &[ToolDefinition],
         _config: &GenerateConfig,
     ) -> Result<parrot_core::types::ChatMessage, parrot_core::error::ProviderError> {
-        unimplemented!("chat() is not used in ReAct loop; use chat_stream")
+        self.captured_calls.lock().await.push(messages.to_vec());
+        if self.fail_chat {
+            return Err(parrot_core::error::ProviderError::Network(
+                "summary call failed".to_string(),
+            ));
+        }
+        Ok(parrot_core::types::ChatMessage {
+            role: parrot_core::types::ChatRole::Assistant,
+            content: self
+                .summary_text
+                .clone()
+                .unwrap_or_else(|| "SUMMARY".to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        })
     }
 }
 
@@ -598,7 +637,14 @@ async fn context_limits_from_builder_drive_pruning() {
         data_dir,
         working_dir,
     )
-    .with_context_limits(1, 1);
+    .with_context_limits(parrot_core::compaction::ContextLimits {
+        max_history_tokens: 1,
+        keep_recent_turns: 1,
+        compaction: parrot_core::compaction::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    });
 
     let captured = run_two_turns_and_capture_last_context(mock, engine).await;
 
@@ -643,7 +689,14 @@ async fn model_context_window_caps_prune_budget() {
         data_dir,
         working_dir,
     )
-    .with_context_limits(u32::MAX, 1);
+    .with_context_limits(parrot_core::compaction::ContextLimits {
+        max_history_tokens: u32::MAX,
+        keep_recent_turns: 1,
+        compaction: parrot_core::compaction::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    });
 
     let captured = run_two_turns_and_capture_last_context(mock, engine).await;
 
@@ -654,4 +707,287 @@ async fn model_context_window_caps_prune_budget() {
         "old turn must be pruned when the model window is the binding limit"
     );
     assert!(captured.iter().any(|m| m.content == "q2"));
+}
+
+// ---------------------------------------------------------------------------
+// Compaction (structured summary) tests
+// ---------------------------------------------------------------------------
+
+fn compaction_engine(
+    tool_registry: Arc<ToolRegistry>,
+    provider_registry: Arc<ProviderRegistry>,
+    limits: parrot_core::compaction::ContextLimits,
+    data_dir: std::path::PathBuf,
+    working_dir: std::path::PathBuf,
+) -> ReActEngine {
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        tool_registry,
+        provider_registry,
+        config,
+        Some("You are a test assistant.".to_string()),
+        data_dir,
+        working_dir,
+    )
+    .with_context_limits(limits)
+}
+
+fn small_budget_limits() -> parrot_core::compaction::ContextLimits {
+    // est budget 1000 tokens ⇒ threshold 900; keep 300 tokens ⇒ 1 kept turn.
+    parrot_core::compaction::ContextLimits {
+        max_history_tokens: 1000,
+        keep_recent_turns: 10,
+        compaction: parrot_core::compaction::CompactionConfig {
+            enabled: true,
+            threshold: 0.9,
+            keep_recent_tokens: 300,
+            summary_max_tokens: 1024,
+        },
+    }
+}
+
+/// Drive 3 text-only turns; returns (all events, all provider calls).
+async fn run_three_turns(
+    mock: Arc<MockProvider>,
+    engine: ReActEngine,
+) -> (Vec<AgentEvent>, Vec<Vec<parrot_core::types::ChatMessage>>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    let mut events = Vec::new();
+    for i in 0..3 {
+        // ~1000 est tokens each: over the 900-token threshold by turn 3.
+        let q = format!("q{}{}", i, "x".repeat(4000));
+        cmd_tx.send(SessionCmd::Chat { message: q }).await.unwrap();
+        events.extend(collect_until_turn_end(&mut event_rx).await);
+    }
+    drop(cmd_tx);
+    events.extend(drain_until_agent_end(&mut event_rx).await);
+    let _ = engine_task.await;
+    let calls = mock.captured_calls().await;
+    (events, calls)
+}
+
+/// Whether a captured provider call is the compaction summary call:
+/// exactly [System(SUMMARIZATION_PROMPT), User(<conversation>)].
+fn is_summary_call(call: &[parrot_core::types::ChatMessage]) -> bool {
+    call.len() == 2
+        && call[0].role == parrot_core::types::ChatRole::System
+        && call[0].content.contains("压缩助手")
+}
+
+#[tokio::test]
+async fn compaction_summarizes_old_turns_and_keeps_recent() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(
+        MockProvider::new()
+            .text_only()
+            .with_summary("## 目标与任务\nfix bug"),
+    );
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let engine = compaction_engine(
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        small_budget_limits(),
+        data_dir,
+        working_dir,
+    );
+
+    let (events, calls) = run_three_turns(mock, engine).await;
+
+    // 1) A CompactionSummary event was emitted, BEFORE the 3rd turn's TurnStart.
+    let cs_idx = events
+        .iter()
+        .position(|ev| matches!(ev, AgentEvent::CompactionSummary { .. }))
+        .expect("CompactionSummary event expected");
+    let third_turn_start = events
+        .iter()
+        .position(|ev| {
+            matches!(
+                ev,
+                AgentEvent::TurnStart { user_message, .. } if user_message.starts_with("q2")
+            )
+        })
+        .expect("3rd TurnStart");
+    assert!(
+        cs_idx < third_turn_start,
+        "CompactionSummary must precede TurnStart"
+    );
+
+    // 2) The summary event content carries the marker and counts.
+    if let AgentEvent::CompactionSummary {
+        summary,
+        dropped_message_count,
+        kept_message_count,
+        ..
+    } = &events[cs_idx]
+    {
+        assert!(summary.starts_with("[CONVERSATION SUMMARY]"));
+        assert!(summary.contains("fix bug"));
+        assert!(
+            *dropped_message_count >= 2,
+            "turn-1 user+assistant summarized"
+        );
+        assert!(*kept_message_count >= 2, "turn-2 user+assistant kept");
+    } else {
+        panic!("unreachable");
+    }
+
+    // 3) The summary call itself: 2 messages (system prompt + conversation).
+    let summary_call = calls
+        .iter()
+        .find(|c| is_summary_call(c))
+        .expect("summary call captured");
+    assert!(summary_call[1].content.contains("<conversation>"));
+
+    // 4) The LAST main call (turn 3): contains summary message, no q0 turn,
+    //    keeps q1 turn verbatim.
+    let last_main = calls.last().expect("main call");
+    assert!(
+        last_main
+            .iter()
+            .any(|m| m.content.starts_with("[CONVERSATION SUMMARY]")),
+        "context must contain the summary message"
+    );
+    assert!(
+        !last_main.iter().any(|m| m.content.starts_with("q0")),
+        "summarized turn must be gone"
+    );
+    assert!(
+        last_main.iter().any(|m| m.content.starts_with("q1")),
+        "kept turn must remain verbatim"
+    );
+    assert_eq!(
+        last_main.first().map(|m| m.role.clone()),
+        Some(parrot_core::types::ChatRole::System),
+        "system stays on top"
+    );
+}
+
+#[tokio::test]
+async fn compaction_skipped_under_threshold() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(MockProvider::new().text_only());
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    // Huge budget ⇒ never over threshold.
+    let limits = parrot_core::compaction::ContextLimits {
+        max_history_tokens: 1_000_000,
+        ..small_budget_limits()
+    };
+    let engine = compaction_engine(
+        tool_registry,
+        provider_registry,
+        limits,
+        data_dir,
+        working_dir,
+    );
+
+    let (events, calls) = run_three_turns(mock, engine).await;
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::CompactionSummary { .. })),
+        "no compaction under threshold"
+    );
+    assert!(
+        calls.iter().all(|c| !is_summary_call(c)),
+        "no summary-style call captured"
+    );
+}
+
+#[tokio::test]
+async fn compaction_failure_falls_back_to_prune() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(MockProvider::new().text_only().fail_summary());
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    // Budget 1 token ⇒ prune keeps only keep_recent_turns=1 turn after the
+    // summary call fails.
+    let limits = parrot_core::compaction::ContextLimits {
+        max_history_tokens: 1,
+        keep_recent_turns: 1,
+        compaction: parrot_core::compaction::CompactionConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    };
+    let engine = compaction_engine(
+        tool_registry,
+        provider_registry,
+        limits,
+        data_dir,
+        working_dir,
+    );
+
+    let (events, calls) = run_three_turns(mock, engine).await;
+
+    // No CompactionSummary event (fail-open), turns still complete.
+    assert!(!events
+        .iter()
+        .any(|ev| matches!(ev, AgentEvent::CompactionSummary { .. })));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| matches!(ev, AgentEvent::TurnEnd { .. }))
+            .count(),
+        3,
+        "all turns must complete despite summary failure"
+    );
+    // Prune fallback: the last main call must not contain q0 (pruned).
+    let last_main = calls.last().expect("main call");
+    assert!(
+        !last_main.iter().any(|m| m.content.starts_with("q0")),
+        "q0 must be pruned by the fallback"
+    );
+}
+
+#[tokio::test]
+async fn compaction_disabled_matches_old_behavior() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(MockProvider::new().text_only());
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let mut limits = small_budget_limits();
+    limits.compaction.enabled = false;
+    let engine = compaction_engine(
+        tool_registry,
+        provider_registry,
+        limits,
+        data_dir,
+        working_dir,
+    );
+
+    let (events, _calls) = run_three_turns(mock, engine).await;
+    assert!(!events
+        .iter()
+        .any(|ev| matches!(ev, AgentEvent::CompactionSummary { .. })));
 }

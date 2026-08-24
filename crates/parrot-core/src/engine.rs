@@ -1,3 +1,6 @@
+use crate::compaction::{
+    plan_compaction, serialize_conversation, ContextLimits, SUMMARIZATION_PROMPT, SUMMARY_MARKER,
+};
 use crate::context::ContextManager;
 use crate::error::AgentError;
 use crate::event_log::EventLog;
@@ -75,11 +78,8 @@ pub struct ReActEngine {
     /// The seq the EventLog was at after the resume replay. Used to keep
     /// `current_seq` continuous when appending new events post-resume.
     resume_seq_offset: u64,
-    /// Context prune budget (`[session] max_history_tokens`, wired in by
-    /// the daemon). Default mirrors the pre-config hardcoded value.
-    max_history_tokens: u32,
-    /// Complete turns kept when pruning (`[session] keep_recent_turns`).
-    keep_recent_turns: u32,
+    /// Context limits (`[session]` + compaction, wired in by the daemon).
+    context_limits: ContextLimits,
     hooks: Arc<HookRegistry>,
 }
 
@@ -116,8 +116,7 @@ impl ReActEngine {
             resumed_from_seq: None,
             pending_integrity_warning: None,
             resume_seq_offset: 0,
-            max_history_tokens: 100_000,
-            keep_recent_turns: 10,
+            context_limits: ContextLimits::default(),
             hooks: Arc::new(HookRegistry::empty()),
         }
     }
@@ -151,11 +150,10 @@ impl ReActEngine {
         self
     }
 
-    /// Override context prune limits. The daemon passes `[session]`
-    /// `max_history_tokens` / `keep_recent_turns` from parrot.toml here.
-    pub fn with_context_limits(mut self, max_history_tokens: u32, keep_recent_turns: u32) -> Self {
-        self.max_history_tokens = max_history_tokens;
-        self.keep_recent_turns = keep_recent_turns;
+    /// Override context limits. The daemon passes `[session]` values from
+    /// parrot.toml here.
+    pub fn with_context_limits(mut self, limits: ContextLimits) -> Self {
+        self.context_limits = limits;
         self
     }
 
@@ -230,10 +228,8 @@ impl ReActEngine {
         // 预算 = min([session] max_history_tokens, 模型 context_window)。
         // 配置值是主旋钮，模型窗口只能进一步收紧。
         let model_window = self.resolve_model_context_window().await;
-        let context_manager = ContextManager::new(
-            context_budget(self.max_history_tokens, model_window),
-            self.keep_recent_turns,
-        );
+        let budget = context_budget(self.context_limits.max_history_tokens, model_window);
+        let context_manager = ContextManager::new(budget, self.context_limits.keep_recent_turns);
 
         // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
         // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
@@ -282,6 +278,10 @@ impl ReActEngine {
                         HookResult::Inject { messages } => context.extend(messages),
                         _ => {}
                     }
+                    // 压缩检查在 TurnStart 事件之前(spec §3.1):避免
+                    // CompactionSummary 落入半成品 turn 被 resume 截断丢弃。
+                    self.maybe_compact(&mut context, turn_id, budget, &event_tx, &mut event_log)
+                        .await;
                     let _ = event_tx
                         .send(AgentEvent::TurnStart {
                             session_id,
@@ -363,6 +363,96 @@ impl ReActEngine {
             .iter()
             .find(|m| m.id == self.config.model)
             .map(|m| m.context_window)
+    }
+
+    /// Pi 式上下文压缩(spec §3.1):超过预算阈值时,把切点之前的
+    /// 历史(含旧摘要)交给当前模型的非流式 `chat()` 生成结构化摘要,
+    /// 切点之后的近期消息原样保留。任何失败 fail-open:warn 后返回,
+    /// 后续 prune 兜底,会话永不因压缩卡死。
+    async fn maybe_compact(
+        &self,
+        context: &mut Vec<ChatMessage>,
+        turn_id: Uuid,
+        budget: u32,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        event_log: &mut EventLog,
+    ) {
+        let session_id = self.session_id;
+        let cfg = &self.context_limits.compaction;
+        let Some(plan) = plan_compaction(context, budget, cfg) else {
+            return;
+        };
+
+        let region: Vec<ChatMessage> = context[plan.summarize_start..plan.cut_index].to_vec();
+        let request = vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: SUMMARIZATION_PROMPT.to_string(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: serialize_conversation(&region),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+        ];
+
+        let Some(provider) = self.provider_registry.resolve(&self.config.model).await else {
+            tracing::warn!(session_id = %session_id, "compaction skipped: provider not found");
+            return;
+        };
+        let mut summary_config = self.config.clone();
+        summary_config.max_tokens = Some(cfg.summary_max_tokens);
+        let summary = match provider
+            .chat(&self.config.model, &request, &[], &summary_config)
+            .await
+        {
+            Ok(m) => m.content,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "compaction summary call failed; falling back to prune"
+                );
+                return;
+            }
+        };
+        if summary.trim().is_empty() {
+            tracing::warn!(session_id = %session_id, "compaction summary empty; falling back to prune");
+            return;
+        }
+
+        let summary_content = format!("{SUMMARY_MARKER}\n{summary}");
+        let kept: Vec<ChatMessage> = context[plan.cut_index..].to_vec();
+        let dropped = (plan.cut_index - plan.summarize_start) as u32;
+        let kept_count = kept.len() as u32;
+
+        let head: Vec<ChatMessage> = context[..plan.summarize_start].to_vec();
+        *context = head;
+        context.push(ChatMessage {
+            role: ChatRole::User,
+            content: summary_content.clone(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        });
+        context.extend(kept);
+
+        let event = AgentEvent::CompactionSummary {
+            session_id,
+            turn_id,
+            summary: summary_content,
+            dropped_message_count: dropped,
+            kept_message_count: kept_count,
+        };
+        let _ = event_tx.send(event.clone()).await.ok();
+        if let Err(e) = event_log.append(event) {
+            tracing::warn!(error = ?e, "failed to persist CompactionSummary");
+        }
     }
 
     /// ReAct 主循环：跑一轮 LLM，把 assistant 消息塞进 context；

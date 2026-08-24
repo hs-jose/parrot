@@ -48,11 +48,36 @@ pub struct SandboxConfig {
     pub require_confirmation: Vec<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+fn default_compaction_threshold() -> f32 {
+    0.9
+}
+fn default_keep_recent_tokens() -> u32 {
+    20_000
+}
+fn default_summary_max_tokens() -> u32 {
+    4096
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub data_dir: String,
     pub max_history_tokens: u32,
     pub keep_recent_turns: u32,
+    /// 结构化摘要压缩总开关(spec §5)。
+    #[serde(default = "default_true")]
+    pub compaction: bool,
+    /// 估算/budget 触发比例。
+    #[serde(default = "default_compaction_threshold")]
+    pub compaction_threshold: f32,
+    /// 切点保留预算(token 估算)。
+    #[serde(default = "default_keep_recent_tokens")]
+    pub keep_recent_tokens: u32,
+    /// 摘要调用 max_tokens 上限。
+    #[serde(default = "default_summary_max_tokens")]
+    pub summary_max_tokens: u32,
 }
 
 fn default_hook_timeout() -> u64 {
@@ -207,6 +232,10 @@ impl AppConfig {
                 data_dir: String::new(),
                 max_history_tokens: 100_000,
                 keep_recent_turns: 6,
+                compaction: true,
+                compaction_threshold: 0.9,
+                keep_recent_tokens: 20_000,
+                summary_max_tokens: 4096,
             },
             hooks: HooksConfig::default(),
         }

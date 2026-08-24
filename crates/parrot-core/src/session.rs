@@ -1,3 +1,4 @@
+use crate::compaction::ContextLimits;
 use crate::confirm::ConfirmRouter;
 use crate::engine::ReActEngine;
 use crate::hooks::HookRegistry;
@@ -73,11 +74,9 @@ pub struct SessionManager {
     working_dir: std::path::PathBuf,
     confirm_config: ConfirmConfig,
     hooks: Option<Arc<HookRegistry>>,
-    /// Context prune limits (`[session]` from parrot.toml), inherited by
-    /// every engine this manager spawns. Defaults mirror the pre-config
-    /// hardcoded values.
-    max_history_tokens: u32,
-    keep_recent_turns: u32,
+    /// Context limits (`[session]` from parrot.toml), inherited by
+    /// every engine this manager spawns.
+    context_limits: ContextLimits,
 }
 
 impl SessionManager {
@@ -97,8 +96,7 @@ impl SessionManager {
             working_dir,
             confirm_config: ConfirmConfig::default(),
             hooks: None,
-            max_history_tokens: 100_000,
-            keep_recent_turns: 10,
+            context_limits: ContextLimits::default(),
         }
     }
 
@@ -115,11 +113,10 @@ impl SessionManager {
         self
     }
 
-    /// Set context prune limits (`[session]` from parrot.toml). Every
-    /// engine spawned afterwards inherits them.
-    pub fn with_context_limits(mut self, max_history_tokens: u32, keep_recent_turns: u32) -> Self {
-        self.max_history_tokens = max_history_tokens;
-        self.keep_recent_turns = keep_recent_turns;
+    /// Set context limits (`[session]` from parrot.toml). Every engine
+    /// spawned afterwards inherits them.
+    pub fn with_context_limits(mut self, limits: ContextLimits) -> Self {
+        self.context_limits = limits;
         self
     }
 
@@ -204,7 +201,8 @@ impl SessionManager {
         )
         .with_confirm_config(self.confirm_config.clone())
         .with_initial_context(replayed_context)
-        .with_resumed_from(resumed_from_seq);
+        .with_resumed_from(resumed_from_seq)
+        .with_context_limits(self.context_limits.clone());
 
         if let Some(issue) = integrity_warning {
             engine = engine.with_pending_integrity_warning(issue);
@@ -261,7 +259,7 @@ impl SessionManager {
         )
         .with_confirm_config(self.confirm_config.clone())
         .with_initial_context(initial_context)
-        .with_context_limits(self.max_history_tokens, self.keep_recent_turns);
+        .with_context_limits(self.context_limits.clone());
         let engine = if let Some(h) = self.hooks.clone() {
             engine.with_hooks(h)
         } else {
