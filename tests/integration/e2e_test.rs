@@ -56,7 +56,7 @@ use parrot_core::provider::{
     ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
 };
 use parrot_core::tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry};
-use parrot_core::types::{ChatMessage, GenerateConfig, ModelInfo};
+use parrot_core::types::{ChatMessage, ChatRole, GenerateConfig, ModelInfo};
 use parrot_protocol::types::Usage;
 use parrot_transport::TransportClient;
 use serde_json::{json, Value};
@@ -161,7 +161,14 @@ impl LlmProvider for MockProvider {
         _tools: &[ToolDefinition],
         _config: &GenerateConfig,
     ) -> Result<ChatMessage, ProviderError> {
-        unimplemented!("chat() not used in ReAct loop")
+        // Compaction summary call: return a fixed structured summary.
+        Ok(ChatMessage {
+            role: ChatRole::Assistant,
+            content: "## 目标与任务\ne2e compaction test".to_string(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        })
     }
 }
 
@@ -555,11 +562,32 @@ async fn spawn_daemon_with_provider(
     String,
     tokio::task::JoinHandle<()>,
 ) {
-    let port = free_port();
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let data_dir = tmp.path().join("data");
     let token_path = tmp.path().join("token");
     std::fs::create_dir_all(&data_dir).unwrap();
+    let config = test_config(0, &data_dir, &token_path);
+    std::mem::forget(tmp);
+    spawn_daemon_with_provider_and_config(provider, config).await
+}
+
+/// Spawn a daemon with a caller-supplied config. The caller owns any temp
+/// dir backing the config paths (no `forget` here — cleanup is the caller's).
+async fn spawn_daemon_with_provider_and_config(
+    provider: Arc<dyn LlmProvider>,
+    mut config: AppConfig,
+) -> (
+    mpsc::Receiver<ServerMessage>,
+    mpsc::Sender<ClientMessage>,
+    String,
+    tokio::task::JoinHandle<()>,
+) {
+    // Capture the port BEFORE the config is moved into the spawn task.
+    let port = free_port();
+    config.daemon.host = "127.0.0.1".to_string();
+    config.daemon.port = port;
+
+    let token_path = std::path::PathBuf::from(&config.daemon.auth_token_file);
 
     let auth = parrot_daemon::auth::Auth::new(&token_path)
         .await
@@ -580,7 +608,6 @@ async fn spawn_daemon_with_provider(
         .register(Arc::new(EchoTool) as Arc<dyn Tool>)
         .await;
 
-    let config = test_config(port, &data_dir, &token_path);
     let daemon_handle = tokio::spawn(async move {
         parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
             .await
@@ -605,8 +632,6 @@ async fn spawn_daemon_with_provider(
         "HelloAck",
     )
     .await;
-
-    std::mem::forget(tmp);
 
     (conn.receiver, conn.sender, token, daemon_handle)
 }
@@ -1422,6 +1447,120 @@ async fn e2e_shell_runs_command_on_daemon_and_returns_result() {
 
     assert!(output.contains("parrot-shell-ok"), "got: {output}");
     assert_eq!(exit_code, 0);
+
+    daemon_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// E2E: compaction emits CompactionSummary over the wire
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_compaction_emits_summary_event_and_compacts_context() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("data");
+    let token_path = tmp.path().join("token");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut config = test_config(0, &data_dir, &token_path);
+    // Est-token budget 1000 => threshold 900; default keep 20000 makes the
+    // walk-back swallow every turn, so the fallback keeps only the newest
+    // complete turn.
+    config.session.max_history_tokens = 1000;
+
+    let provider = Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>;
+    let (mut rx, tx, _token, daemon_handle) =
+        spawn_daemon_with_provider_and_config(provider, config).await;
+
+    // Create a session.
+    tx.send(ClientMessage::CreateSession {
+        config: Some(SessionConfig {
+            model: Some("mock-model".to_string()),
+            provider: None,
+            system_prompt: None,
+        }),
+    })
+    .await
+    .expect("send CreateSession");
+    let session_id = expect_server_message(
+        &mut rx,
+        |m| {
+            if let ServerMessage::SessionCreated { session_id } = m {
+                Some(*session_id)
+            } else {
+                None
+            }
+        },
+        "SessionCreated",
+    )
+    .await;
+
+    // Turn 1 + Turn 2: ~1000 est tokens each. Turn 3's pre-check crosses 900.
+    // Collect ALL events while draining each turn so the CompactionSummary
+    // (delivered before turn 3's TurnStart) is not skipped and lost by a
+    // predicate-based TurnEnd wait.
+    let mut all_events: Vec<AgentEvent> = Vec::new();
+    for i in 0..3 {
+        let msg = format!("q{}{}", i, "x".repeat(4000));
+        tx.send(ClientMessage::Chat {
+            session_id,
+            message: msg,
+        })
+        .await
+        .expect("send Chat");
+
+        // Wait for the turn to finish before sending the next (engine is
+        // single-turn serialized: a Chat during an active turn is ignored).
+        let got_turn_end = timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Some(ServerMessage::AgentEvent { event }) => {
+                        let is_turn_end = matches!(event, AgentEvent::TurnEnd { .. });
+                        all_events.push(event);
+                        if is_turn_end {
+                            return true;
+                        }
+                    }
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(got_turn_end, "timed out waiting for turn {i} TurnEnd");
+    }
+
+    // The 3rd turn must have emitted a CompactionSummary before its TurnStart.
+    let cs_idx = all_events
+        .iter()
+        .position(|ev| matches!(ev, AgentEvent::CompactionSummary { .. }))
+        .expect("CompactionSummary event expected");
+    let turn_start_positions: Vec<usize> = all_events
+        .iter()
+        .enumerate()
+        .filter(|(_, ev)| matches!(ev, AgentEvent::TurnStart { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(turn_start_positions.len(), 3, "one TurnStart per chat");
+    assert!(
+        cs_idx < turn_start_positions[2],
+        "CompactionSummary must precede the 3rd turn's TurnStart"
+    );
+
+    let (summary, dropped, kept) = match &all_events[cs_idx] {
+        AgentEvent::CompactionSummary {
+            summary,
+            dropped_message_count,
+            kept_message_count,
+            ..
+        } => (summary.clone(), *dropped_message_count, *kept_message_count),
+        _ => unreachable!("checked above"),
+    };
+
+    assert!(summary.starts_with("[CONVERSATION SUMMARY]"));
+    assert!(summary.contains("e2e compaction test"));
+    assert!(dropped >= 2, "turn 1 user+assistant summarized");
+    assert!(kept >= 2, "turn 2 kept verbatim");
 
     daemon_handle.abort();
 }
