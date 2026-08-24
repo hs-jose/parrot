@@ -309,6 +309,26 @@ pub fn rebuild_context(events: &[PersistedAgentEvent]) -> Vec<ChatMessage> {
                     tool_calls: None,
                 });
             }
+            AgentEvent::CompactionSummary {
+                summary,
+                kept_message_count,
+                ..
+            } => {
+                // 消息计数语义(spec §4):当前已重建列表 == 压缩前上下文
+                // (不含 system)。保留末尾 kept_message_count 条,摘要以
+                // User 角色插在最前。
+                let kept = (*kept_message_count as usize).min(ctx.len());
+                let kept_msgs: Vec<ChatMessage> = ctx.split_off(ctx.len() - kept);
+                ctx.clear(); // drop the summarized prefix
+                ctx.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: summary.clone(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                });
+                ctx.extend(kept_msgs);
+            }
             _ => {}
         }
     }
@@ -569,5 +589,161 @@ mod tests {
         assert_eq!(ctx[0].content, "hi");
         assert_eq!(ctx[1].role, ChatRole::Assistant);
         assert_eq!(ctx[1].content, "hello");
+    }
+
+    #[test]
+    fn rebuild_applies_compaction_summary() {
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let m1 = Uuid::new_v4();
+        let m2 = Uuid::new_v4();
+        // Turn 1 (to be summarized), Turn 2 (kept), then compaction.
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t1,
+                    user_message: "old question".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::MessageEnd {
+                    session_id: sid,
+                    turn_id: t1,
+                    message_id: m1,
+                    final_content: "old answer".into(),
+                    tool_calls: vec![],
+                    stop_reason: MessageStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                2,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t2,
+                    user_message: "new question".into(),
+                },
+            ),
+            make_persisted(
+                3,
+                AgentEvent::MessageEnd {
+                    session_id: sid,
+                    turn_id: t2,
+                    message_id: m2,
+                    final_content: "new answer".into(),
+                    tool_calls: vec![],
+                    stop_reason: MessageStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                4,
+                AgentEvent::CompactionSummary {
+                    session_id: sid,
+                    turn_id: t2,
+                    summary: "[CONVERSATION SUMMARY]\n## 目标\n...".into(),
+                    dropped_message_count: 2,
+                    kept_message_count: 2,
+                },
+            ),
+        ];
+        let ctx = rebuild_context(&events);
+        assert_eq!(ctx.len(), 3, "summary + kept 2 messages");
+        assert_eq!(ctx[0].role, ChatRole::User);
+        assert!(ctx[0].content.starts_with("[CONVERSATION SUMMARY]"));
+        assert_eq!(ctx[1].content, "new question");
+        assert_eq!(ctx[2].content, "new answer");
+        assert!(
+            !ctx.iter().any(|m| m.content == "old question"),
+            "summarized messages must be dropped"
+        );
+    }
+
+    #[test]
+    fn rebuild_compaction_keeps_all_when_count_exceeds() {
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t1,
+                    user_message: "q".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::CompactionSummary {
+                    session_id: sid,
+                    turn_id: t1,
+                    summary: "[CONVERSATION SUMMARY]\n...".into(),
+                    dropped_message_count: 0,
+                    kept_message_count: 99, // more than rebuilt
+                },
+            ),
+        ];
+        let ctx = rebuild_context(&events);
+        assert_eq!(ctx.len(), 2);
+        assert!(ctx[0].content.starts_with("[CONVERSATION SUMMARY]"));
+        assert_eq!(ctx[1].content, "q");
+    }
+
+    #[test]
+    fn truncate_keeps_compaction_summary_before_partial_turn() {
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t1,
+                    user_message: "done turn".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::TurnEnd {
+                    session_id: sid,
+                    turn_id: t1,
+                    stop_reason: TurnStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                2,
+                AgentEvent::CompactionSummary {
+                    session_id: sid,
+                    turn_id: Uuid::new_v4(),
+                    summary: "[CONVERSATION SUMMARY]\n...".into(),
+                    dropped_message_count: 1,
+                    kept_message_count: 1,
+                },
+            ),
+            make_persisted(
+                3,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: Uuid::new_v4(),
+                    user_message: "partial turn".into(),
+                },
+            ),
+        ];
+        let (keep, drop, issue) = truncate_to_last_complete_turn(events);
+        assert!(issue.is_some(), "partial turn must be detected");
+        assert_eq!(keep.len(), 3, "CompactionSummary must survive truncation");
+        assert!(
+            matches!(
+                keep.last().map(|e| &e.event),
+                Some(AgentEvent::CompactionSummary { .. })
+            ),
+            "last kept event is the CompactionSummary"
+        );
+        assert_eq!(drop.len(), 1);
     }
 }
