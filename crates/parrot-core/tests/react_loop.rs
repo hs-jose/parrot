@@ -925,11 +925,12 @@ async fn compaction_failure_falls_back_to_prune() {
         .register(provider, vec!["mock-model".to_string()])
         .await;
 
-    // Budget 1 token ⇒ prune keeps only keep_recent_turns=1 turn after the
-    // summary call fails.
+    // Budget 1 token ⇒ always over threshold. keep_recent_turns=2 keeps two
+    // complete turns alive through prune, so turn 3's maybe_compact fires a
+    // summary call (which fails) before prune drops the oldest turn.
     let limits = parrot_core::compaction::ContextLimits {
         max_history_tokens: 1,
-        keep_recent_turns: 1,
+        keep_recent_turns: 2,
         compaction: parrot_core::compaction::CompactionConfig {
             enabled: true,
             ..Default::default()
@@ -962,6 +963,10 @@ async fn compaction_failure_falls_back_to_prune() {
     assert!(
         !last_main.iter().any(|m| m.content.starts_with("q0")),
         "q0 must be pruned by the fallback"
+    );
+    assert!(
+        calls.iter().any(|c| is_summary_call(c)),
+        "the summary call must have been attempted (and failed) for this test to exercise fail-open"
     );
 }
 
