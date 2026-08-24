@@ -1,5 +1,9 @@
 use crate::types::{ChatMessage, ChatRole};
 
+pub(crate) fn estimate_tokens(msg: &ChatMessage) -> u32 {
+    (msg.content.len() as u32) / 4 + 1
+}
+
 pub struct ContextManager {
     pub max_tokens: u32,
     pub keep_recent_turns: u32,
@@ -13,10 +17,6 @@ impl ContextManager {
         }
     }
 
-    fn estimate_tokens(msg: &ChatMessage) -> u32 {
-        (msg.content.len() as u32) / 4 + 1
-    }
-
     /// Prune the context by removing complete logical turns oldest-first.
     ///
     /// A logical turn starts at a ChatRole::User message and spans all messages
@@ -28,13 +28,13 @@ impl ContextManager {
             return;
         }
 
-        let total_tokens: u32 = messages.iter().map(Self::estimate_tokens).sum();
+        let total_tokens: u32 = messages.iter().map(estimate_tokens).sum();
         if total_tokens <= self.max_tokens {
             return;
         }
 
         loop {
-            let current_tokens: u32 = messages.iter().map(Self::estimate_tokens).sum();
+            let current_tokens: u32 = messages.iter().map(estimate_tokens).sum();
             if current_tokens <= self.max_tokens {
                 break;
             }

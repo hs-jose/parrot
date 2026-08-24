@@ -1,3 +1,4 @@
+pub mod compaction;
 pub mod confirm;
 pub mod context;
 pub mod engine;
