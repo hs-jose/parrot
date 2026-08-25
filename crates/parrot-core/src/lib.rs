@@ -8,6 +8,7 @@ pub mod hooks;
 pub mod provider;
 pub mod session;
 pub mod tool;
+pub mod tool_output;
 pub mod types;
 
 pub use confirm::ConfirmRouter;

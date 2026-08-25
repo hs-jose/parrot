@@ -3,7 +3,6 @@ use crate::types::{ChatMessage, ChatRole};
 
 pub const SUMMARY_MARKER: &str = "[CONVERSATION SUMMARY]";
 
-/// 摘要请求的 system prompt(spec §6,固定内嵌常量)。
 pub const SUMMARIZATION_PROMPT: &str = "你是压缩助手。将以下对话历史压缩为结构化摘要,供后续对话参考。\n输出格式(纯文本,不调用任何工具):\n<summary>\n## 目标与任务\n## 关键事实与决定(文件路径、命令、命名、约束)\n## 未完成事项与下一步\n## 关键文件/代码位置\n</summary>";
 
 #[derive(Debug, Clone)]
@@ -49,7 +48,6 @@ pub struct CompactionPlan {
     /// 保留区起点下标(指向某个 User 消息,tool 配对安全)。
     pub cut_index: usize,
 }
-
 pub fn is_summary_message(msg: &ChatMessage) -> bool {
     msg.role == ChatRole::User && msg.content.starts_with(SUMMARY_MARKER)
 }
@@ -71,11 +69,8 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
 
 /// 决定是否压缩以及在哪儿切。返回 `None` 表示本轮不压缩:
 /// 禁用 / 未超阈值 / 不足两条完整 turn / 待摘要区为空。
-///
-/// 切点规则(spec §3.1):从最新 turn 往回累计估算 token 直到
-/// ≥ `keep_recent_tokens`,切点对齐到 User 消息(turn 边界),
-/// Tool 消息绝不孤立。若回退累计吞掉全部 turn(keep 预算 ≥ 历史
-/// 总量但总量已超阈值),强制只保留最新 1 个完整 turn(spec §7)。
+/// 切点对齐 User 消息(turn 边界),Tool 消息绝不孤立;
+/// 回退累计吞掉全部 turn 时强制只留最新 1 个完整 turn。
 pub fn plan_compaction(
     context: &[ChatMessage],
     budget_tokens: u32,
@@ -136,6 +131,49 @@ pub fn plan_compaction(
         summarize_start: body_start,
         cut_index,
     })
+}
+
+fn user_msg(content: String) -> ChatMessage {
+    ChatMessage {
+        role: ChatRole::User,
+        content,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: None,
+    }
+}
+
+/// 摘要请求体:[System(压缩指令), User(待摘要对话)]。
+pub fn build_summary_request(region: &[ChatMessage]) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: ChatRole::System,
+            content: SUMMARIZATION_PROMPT.to_string(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        },
+        user_msg(serialize_conversation(region)),
+    ]
+}
+
+/// 把压缩计划应用到上下文:head + 摘要(User) + 保留段。
+/// 返回 (dropped, kept) 计数,供 CompactionSummary 事件使用。
+pub fn apply_summary(
+    context: &mut Vec<ChatMessage>,
+    plan: &CompactionPlan,
+    summary: &str,
+) -> (u32, u32) {
+    let summary_content = format!("{SUMMARY_MARKER}\n{summary}");
+    let kept: Vec<ChatMessage> = context[plan.cut_index..].to_vec();
+    let head: Vec<ChatMessage> = context[..plan.summarize_start].to_vec();
+    let dropped = (plan.cut_index - plan.summarize_start) as u32;
+    let kept_count = kept.len() as u32;
+
+    *context = head;
+    context.push(user_msg(summary_content));
+    context.extend(kept);
+    (dropped, kept_count)
 }
 
 #[cfg(test)]
@@ -308,5 +346,36 @@ mod tests {
             "[CONVERSATION SUMMARY]\nabc"
         )));
         assert!(!is_summary_message(&msg(ChatRole::User, "plain")));
+    }
+
+    #[test]
+    fn build_summary_request_shape() {
+        let region = vec![msg(ChatRole::User, "hi"), msg(ChatRole::Assistant, "yo")];
+        let req = build_summary_request(&region);
+        assert_eq!(req.len(), 2);
+        assert_eq!(req[0].role, ChatRole::System);
+        assert!(req[0].content.contains("压缩助手"));
+        assert_eq!(req[1].role, ChatRole::User);
+        assert!(req[1].content.contains("[user]\nhi"));
+        assert!(req[1].content.contains("[assistant]\nyo"));
+    }
+
+    #[test]
+    fn apply_summary_rebuilds_context() {
+        let mut ctx = context_with_turns(3, 4000);
+        let plan = CompactionPlan {
+            summarize_start: 1,
+            cut_index: 5,
+        };
+        let (dropped, kept) = apply_summary(&mut ctx, &plan, "summary text");
+        assert_eq!(dropped, 4);
+        assert_eq!(kept, 2);
+        assert_eq!(ctx.len(), 4);
+        assert_eq!(ctx[0].role, ChatRole::System);
+        assert_eq!(ctx[1].role, ChatRole::User);
+        assert!(ctx[1].content.starts_with(SUMMARY_MARKER));
+        assert!(ctx[1].content.ends_with("summary text"));
+        assert!(ctx[2].content.starts_with("q2"));
+        assert_eq!(ctx[3].content, "done");
     }
 }

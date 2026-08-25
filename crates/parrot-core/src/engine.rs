@@ -1,5 +1,5 @@
 use crate::compaction::{
-    plan_compaction, serialize_conversation, ContextLimits, SUMMARIZATION_PROMPT, SUMMARY_MARKER,
+    apply_summary, build_summary_request, plan_compaction, ContextLimits, SUMMARY_MARKER,
 };
 use crate::context::ContextManager;
 use crate::error::AgentError;
@@ -8,6 +8,7 @@ use crate::hooks::{HookEvent, HookExecution, HookRegistry, HookResult};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
 use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool_output::truncate_tool_content;
 use crate::types::{ChatMessage, ChatRole, GenerateConfig, ToolCallInfo as CoreToolCallInfo};
 use parrot_protocol::agent_event::{
     AgentEndReason, AgentEvent, IntegrityIssue, MessageDeltaPayload, MessageStopReason,
@@ -21,29 +22,6 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 pub const MAX_REACT_ITERATIONS: u32 = 20;
-
-/// 单个工具结果进入事件日志与模型上下文前的硬上限（字节）。
-/// 兜底 `file_glob "**/*"` 这类无界输出：一次 9.4MB 的 ToolEnd 会让会话
-/// 永久 400（每次 resume 都重放该结果），且 prune 只能整轮删、救不回。
-/// 64KB ≈ char/4 估算下 ~16k token，单个工具结果不可能独自打爆预算。
-pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
-
-/// Cap tool result content at [`MAX_TOOL_OUTPUT_BYTES`] with a truncation
-/// marker. The cut point always lands on a UTF-8 char boundary.
-fn truncate_tool_content(content: &str) -> String {
-    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
-        return content.to_string();
-    }
-    let mut end = MAX_TOOL_OUTPUT_BYTES;
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}... (truncated, total {} bytes)",
-        &content[..end],
-        content.len()
-    )
-}
 
 /// Effective context prune budget: the `[session] max_history_tokens`
 /// config value, further capped by the model's context window when the
@@ -365,10 +343,8 @@ impl ReActEngine {
             .map(|m| m.context_window)
     }
 
-    /// Pi 式上下文压缩(spec §3.1):超过预算阈值时,把切点之前的
-    /// 历史(含旧摘要)交给当前模型的非流式 `chat()` 生成结构化摘要,
-    /// 切点之后的近期消息原样保留。任何失败 fail-open:warn 后返回,
-    /// 后续 prune 兜底,会话永不因压缩卡死。
+    /// Pi 式上下文压缩(spec §3.1):超阈值时把切点前历史交给当前模型
+    /// 生成结构化摘要,近期消息原样保留。失败 fail-open,prune 兜底。
     async fn maybe_compact(
         &self,
         context: &mut Vec<ChatMessage>,
@@ -384,22 +360,7 @@ impl ReActEngine {
         };
 
         let region: Vec<ChatMessage> = context[plan.summarize_start..plan.cut_index].to_vec();
-        let request = vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: SUMMARIZATION_PROMPT.to_string(),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: serialize_conversation(&region),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: None,
-            },
-        ];
+        let request = build_summary_request(&region);
 
         let Some(provider) = self.provider_registry.resolve(&self.config.model).await else {
             tracing::warn!(session_id = %session_id, "compaction skipped: provider not found");
@@ -426,26 +387,12 @@ impl ReActEngine {
             return;
         }
 
-        let summary_content = format!("{SUMMARY_MARKER}\n{summary}");
-        let kept: Vec<ChatMessage> = context[plan.cut_index..].to_vec();
-        let dropped = (plan.cut_index - plan.summarize_start) as u32;
-        let kept_count = kept.len() as u32;
-
-        let head: Vec<ChatMessage> = context[..plan.summarize_start].to_vec();
-        *context = head;
-        context.push(ChatMessage {
-            role: ChatRole::User,
-            content: summary_content.clone(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-        });
-        context.extend(kept);
+        let (dropped, kept_count) = apply_summary(context, &plan, &summary);
 
         let event = AgentEvent::CompactionSummary {
             session_id,
             turn_id,
-            summary: summary_content,
+            summary: format!("{SUMMARY_MARKER}\n{summary}"),
             dropped_message_count: dropped,
             kept_message_count: kept_count,
         };
@@ -1157,41 +1104,6 @@ pub fn system_prompt_hash(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_tool_content_noop_under_cap() {
-        let content = "x".repeat(100);
-        assert_eq!(truncate_tool_content(&content), content);
-    }
-
-    #[test]
-    fn truncate_tool_content_caps_and_marks() {
-        let content = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 1000);
-        let out = truncate_tool_content(&content);
-        assert!(
-            out.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
-            "capped output must stay within cap + marker, got {}",
-            out.len()
-        );
-        assert_eq!(
-            out,
-            format!(
-                "{}... (truncated, total {} bytes)",
-                "x".repeat(MAX_TOOL_OUTPUT_BYTES),
-                content.len()
-            )
-        );
-    }
-
-    #[test]
-    fn truncate_tool_content_cuts_on_char_boundary() {
-        // Multibyte chars: the cut point must land on a UTF-8 boundary.
-        let content = "你".repeat(MAX_TOOL_OUTPUT_BYTES / 3 + 10);
-        let out = truncate_tool_content(&content);
-        assert!(out.starts_with('你'));
-        assert!(out.contains("(truncated"));
-        assert!(out.len() <= MAX_TOOL_OUTPUT_BYTES + 64);
-    }
 
     #[test]
     fn context_budget_takes_min_of_config_and_model_window() {

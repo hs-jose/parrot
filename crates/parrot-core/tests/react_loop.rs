@@ -593,7 +593,7 @@ async fn oversized_tool_output_is_truncated_in_event_and_context() {
         })
         .expect("ToolEnd present");
     assert!(
-        tool_end.content.len() <= parrot_core::engine::MAX_TOOL_OUTPUT_BYTES + 64,
+        tool_end.content.len() <= parrot_core::tool_output::MAX_TOOL_OUTPUT_BYTES + 64,
         "ToolEnd content must be capped, got {} bytes",
         tool_end.content.len()
     );
@@ -607,7 +607,7 @@ async fn oversized_tool_output_is_truncated_in_event_and_context() {
         .find(|m| m.role == parrot_core::types::ChatRole::Tool)
         .expect("tool message present in second-call context");
     assert!(tool_msg.content.contains("(truncated, total 200000 bytes)"));
-    assert!(tool_msg.content.len() <= parrot_core::engine::MAX_TOOL_OUTPUT_BYTES + 64);
+    assert!(tool_msg.content.len() <= parrot_core::tool_output::MAX_TOOL_OUTPUT_BYTES + 64);
 }
 
 #[tokio::test]
