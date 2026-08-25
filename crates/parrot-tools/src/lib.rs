@@ -7,7 +7,6 @@ pub mod file_read;
 pub mod file_write;
 pub mod shell_exec;
 pub mod web_fetch;
-pub mod web_search;
 
 pub async fn register_all(registry: &ToolRegistry, config: &AppConfig) {
     let working_dir = std::path::PathBuf::from(&config.tools.sandbox.working_dir);
@@ -52,9 +51,6 @@ pub async fn register_all(registry: &ToolRegistry, config: &AppConfig) {
     if config.tools.web_allowed {
         registry
             .register(std::sync::Arc::new(web_fetch::WebFetchTool::new()))
-            .await;
-        registry
-            .register(std::sync::Arc::new(web_search::WebSearchTool::new()))
             .await;
     }
 }
