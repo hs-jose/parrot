@@ -1,4 +1,5 @@
 use crate::error::AgentError;
+use crate::tool_output::truncate_tool_content;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -6,10 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-// `ToolOutput` is canonical in `parrot-protocol::types` (it appears on the wire
-// in `ServerMessage::ToolResult` and inside `EventLogEntry::ToolResult`). Core
-// re-exports it so the `Tool::call` trait returns the same type the daemon
-// persists and ships — no boundary conversion needed.
 pub use parrot_protocol::types::ToolOutput;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -37,41 +34,17 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> Value;
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError>;
-}
 
-/// 工具级策略钩子:before 可拒绝调用,after 变换结果。
-/// 与 HookRegistry(用户可配、fail-open)分工:这里是框架内建机制,
-/// 有序且不可绕过;after 链中最后注册者最后执行(截断收口用)。
-#[async_trait]
-pub trait ToolHook: Send + Sync {
-    fn id(&self) -> &str;
-    async fn before(&self, _tool: &str, _args: &Value) -> ToolDecision {
-        ToolDecision::Proceed
+    /// 工具级前置策略:返回 Err(reason) 拒绝调用。默认放行。
+    async fn before_call(&self, _arguments: &Value) -> Result<(), String> {
+        Ok(())
     }
-    async fn after(&self, _tool: &str, _output: &mut ToolOutput) {}
-}
-
-#[derive(Debug, Clone)]
-pub enum ToolDecision {
-    Proceed,
-    Deny { reason: String },
-}
-
-pub struct TruncateHook;
-
-#[async_trait]
-impl ToolHook for TruncateHook {
-    fn id(&self) -> &str {
-        "truncate"
-    }
-    async fn after(&self, _tool: &str, output: &mut ToolOutput) {
-        output.content = crate::tool_output::truncate_tool_content(&output.content);
-    }
+    /// 工具级输出变换(截断之前)。默认 no-op。
+    async fn after_call(&self, _output: &mut ToolOutput) {}
 }
 
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
-    hooks: RwLock<Vec<Arc<dyn ToolHook>>>,
 }
 
 impl Default for ToolRegistry {
@@ -84,21 +57,11 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
-            // 截断默认注册且必须保持最后:所有 after 变换(含用户 hook
-            // Replace 注入的内容)之后才收口,无界输出无法穿透。
-            hooks: RwLock::new(vec![Arc::new(TruncateHook)]),
         }
     }
     pub async fn register(&self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
         self.tools.write().await.insert(name, tool);
-    }
-    /// 追加一个工具钩子;after 链按注册序执行,TruncateHook 永远垫底。
-    pub async fn add_hook(&self, hook: Arc<dyn ToolHook>) {
-        let mut hooks = self.hooks.write().await;
-        hooks.retain(|h| h.id() != "truncate");
-        hooks.push(hook);
-        hooks.push(Arc::new(TruncateHook));
     }
     pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.read().await.get(name).cloned()
@@ -116,49 +79,38 @@ impl ToolRegistry {
         defs
     }
 
-    /// 管道:before 钩子链 → call → Err 转 error ToolOutput → after 链。
-    /// Deny 与执行错误都产生合成 error 输出并统一走 after 链(截断收口)。
-    /// Err 仅当工具不存在。
+    /// 管道:before_call → call → after_call → 截断(注册表机制,最后)。
+    /// Deny 与执行错误都产生合成 error 输出并统一走 after_call + 截断,
+    /// 保证进入上下文/事件日志的工具输出一定被截断。Err 仅当工具不存在。
     pub async fn execute(
         &self,
         name: &str,
         arguments: Value,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, AgentError> {
-        let hooks = self.hooks.read().await.clone();
-
-        let mut denied = None;
-        for hook in &hooks {
-            if let ToolDecision::Deny { reason } = hook.before(name, &arguments).await {
-                denied = Some(ToolOutput {
-                    content: format!("blocked: {reason}"),
-                    is_error: true,
-                });
-                break;
-            }
-        }
-
-        let mut output = match denied {
-            Some(o) => o,
-            None => {
-                let Some(tool) = self.get(name).await else {
-                    return Err(AgentError::ToolExecution {
-                        tool: name.to_string(),
-                        message: "Tool not found".to_string(),
-                    });
-                };
-                tool.call(arguments, ctx)
-                    .await
-                    .unwrap_or_else(|e| ToolOutput {
-                        content: format!("Error: {e}"),
-                        is_error: true,
-                    })
-            }
+        let Some(tool) = self.get(name).await else {
+            return Err(AgentError::ToolExecution {
+                tool: name.to_string(),
+                message: "Tool not found".to_string(),
+            });
         };
 
-        for hook in &hooks {
-            hook.after(name, &mut output).await;
-        }
+        let mut output = match tool.before_call(&arguments).await {
+            Ok(()) => tool
+                .call(arguments, ctx)
+                .await
+                .unwrap_or_else(|e| ToolOutput {
+                    content: format!("Error: {e}"),
+                    is_error: true,
+                }),
+            Err(reason) => ToolOutput {
+                content: format!("blocked: {reason}"),
+                is_error: true,
+            },
+        };
+
+        tool.after_call(&mut output).await;
+        output.content = truncate_tool_content(&output.content);
         Ok(output)
     }
 }
@@ -271,33 +223,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_deny_blocks_call() {
+    async fn before_call_deny_blocks_call() {
         let registry = ToolRegistry::new();
-        registry.register(Arc::new(EchoTool)).await;
-        registry.add_hook(Arc::new(DenyAllHook)).await;
+        registry.register(Arc::new(DenyAllTool)).await;
         let ctx = ToolContext {
             working_dir: std::path::PathBuf::from("."),
             max_file_size_bytes: 10 * 1024 * 1024,
         };
-        let out = registry
-            .execute("echo", json!({"message": "hi"}), &ctx)
-            .await
-            .unwrap();
+        let out = registry.execute("deny_all", json!({}), &ctx).await.unwrap();
         assert!(out.is_error);
         assert_eq!(out.content, "blocked: denied by policy");
     }
 
     #[tokio::test]
-    async fn denied_output_also_runs_after_hooks() {
+    async fn denied_output_also_truncated() {
         let registry = ToolRegistry::new();
-        registry.register(Arc::new(EchoTool)).await;
-        registry.add_hook(Arc::new(DenyHugeReasonHook)).await;
+        registry.register(Arc::new(DenyHugeReasonTool)).await;
         let ctx = ToolContext {
             working_dir: std::path::PathBuf::from("."),
             max_file_size_bytes: 10 * 1024 * 1024,
         };
         let out = registry
-            .execute("echo", json!({"message": "hi"}), &ctx)
+            .execute("deny_huge", json!({}), &ctx)
             .await
             .unwrap();
         assert!(out.is_error);
@@ -305,16 +252,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_after_hook_runs_before_truncate() {
+    async fn after_call_runs_before_truncate() {
         let registry = ToolRegistry::new();
-        registry.register(Arc::new(BigTool)).await;
-        registry.add_hook(Arc::new(AppendHook)).await;
+        registry.register(Arc::new(AppendTool)).await;
         let ctx = ToolContext {
             working_dir: std::path::PathBuf::from("."),
             max_file_size_bytes: 10 * 1024 * 1024,
         };
-        let out = registry.execute("big", json!({}), &ctx).await.unwrap();
-        // Append 放大后截断仍生效 ⇒ 证明 after 链中截断垫底。
+        let out = registry.execute("append", json!({}), &ctx).await.unwrap();
         assert!(out.content.contains("(truncated"));
     }
 
@@ -360,42 +305,68 @@ mod tests {
         }
     }
 
-    struct DenyAllHook;
+    struct DenyAllTool;
 
     #[async_trait]
-    impl ToolHook for DenyAllHook {
-        fn id(&self) -> &str {
+    impl Tool for DenyAllTool {
+        fn name(&self) -> &str {
             "deny_all"
         }
-        async fn before(&self, _tool: &str, _args: &Value) -> ToolDecision {
-            ToolDecision::Deny {
-                reason: "denied by policy".into(),
-            }
+        fn description(&self) -> &str {
+            "Denies itself"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+            unreachable!("before_call should have denied")
+        }
+        async fn before_call(&self, _args: &Value) -> Result<(), String> {
+            Err("denied by policy".into())
         }
     }
 
-    struct DenyHugeReasonHook;
+    struct DenyHugeReasonTool;
 
     #[async_trait]
-    impl ToolHook for DenyHugeReasonHook {
-        fn id(&self) -> &str {
+    impl Tool for DenyHugeReasonTool {
+        fn name(&self) -> &str {
             "deny_huge"
         }
-        async fn before(&self, _tool: &str, _args: &Value) -> ToolDecision {
-            ToolDecision::Deny {
-                reason: "n".repeat(crate::tool_output::MAX_TOOL_OUTPUT_BYTES * 2),
-            }
+        fn description(&self) -> &str {
+            "Denies with huge reason"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+            unreachable!("before_call should have denied")
+        }
+        async fn before_call(&self, _args: &Value) -> Result<(), String> {
+            Err("n".repeat(crate::tool_output::MAX_TOOL_OUTPUT_BYTES * 2))
         }
     }
 
-    struct AppendHook;
+    struct AppendTool;
 
     #[async_trait]
-    impl ToolHook for AppendHook {
-        fn id(&self) -> &str {
+    impl Tool for AppendTool {
+        fn name(&self) -> &str {
             "append"
         }
-        async fn after(&self, _tool: &str, output: &mut ToolOutput) {
+        fn description(&self) -> &str {
+            "Appends oversized content in after_call"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+            Ok(ToolOutput {
+                content: "small".to_string(),
+                is_error: false,
+            })
+        }
+        async fn after_call(&self, output: &mut ToolOutput) {
             output
                 .content
                 .push_str(&"y".repeat(crate::tool_output::MAX_TOOL_OUTPUT_BYTES));
