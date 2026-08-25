@@ -117,8 +117,8 @@ impl ToolRegistry {
     }
 
     /// 管道:before 钩子链 → call → Err 转 error ToolOutput → after 链。
-    /// 返回 Ok(output) 表示管道走完(含 Deny / 执行错误,均体现为
-    /// is_error 输出);Err 仅当工具不存在。
+    /// Deny 与执行错误都产生合成 error 输出并统一走 after 链(截断收口)。
+    /// Err 仅当工具不存在。
     pub async fn execute(
         &self,
         name: &str,
@@ -126,28 +126,35 @@ impl ToolRegistry {
         ctx: &ToolContext,
     ) -> Result<ToolOutput, AgentError> {
         let hooks = self.hooks.read().await.clone();
+
+        let mut denied = None;
         for hook in &hooks {
             if let ToolDecision::Deny { reason } = hook.before(name, &arguments).await {
-                return Ok(ToolOutput {
+                denied = Some(ToolOutput {
                     content: format!("blocked: {reason}"),
                     is_error: true,
                 });
+                break;
             }
         }
 
-        let Some(tool) = self.get(name).await else {
-            return Err(AgentError::ToolExecution {
-                tool: name.to_string(),
-                message: "Tool not found".to_string(),
-            });
+        let mut output = match denied {
+            Some(o) => o,
+            None => {
+                let Some(tool) = self.get(name).await else {
+                    return Err(AgentError::ToolExecution {
+                        tool: name.to_string(),
+                        message: "Tool not found".to_string(),
+                    });
+                };
+                tool.call(arguments, ctx)
+                    .await
+                    .unwrap_or_else(|e| ToolOutput {
+                        content: format!("Error: {e}"),
+                        is_error: true,
+                    })
+            }
         };
-        let mut output = tool
-            .call(arguments, ctx)
-            .await
-            .unwrap_or_else(|e| ToolOutput {
-                content: format!("Error: {e}"),
-                is_error: true,
-            });
 
         for hook in &hooks {
             hook.after(name, &mut output).await;
@@ -281,6 +288,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denied_output_also_runs_after_hooks() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+        registry.add_hook(Arc::new(DenyHugeReasonHook)).await;
+        let ctx = ToolContext {
+            working_dir: std::path::PathBuf::from("."),
+            max_file_size_bytes: 10 * 1024 * 1024,
+        };
+        let out = registry
+            .execute("echo", json!({"message": "hi"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("(truncated, total"));
+    }
+
+    #[tokio::test]
     async fn custom_after_hook_runs_before_truncate() {
         let registry = ToolRegistry::new();
         registry.register(Arc::new(BigTool)).await;
@@ -346,6 +370,20 @@ mod tests {
         async fn before(&self, _tool: &str, _args: &Value) -> ToolDecision {
             ToolDecision::Deny {
                 reason: "denied by policy".into(),
+            }
+        }
+    }
+
+    struct DenyHugeReasonHook;
+
+    #[async_trait]
+    impl ToolHook for DenyHugeReasonHook {
+        fn id(&self) -> &str {
+            "deny_huge"
+        }
+        async fn before(&self, _tool: &str, _args: &Value) -> ToolDecision {
+            ToolDecision::Deny {
+                reason: "n".repeat(crate::tool_output::MAX_TOOL_OUTPUT_BYTES * 2),
             }
         }
     }
