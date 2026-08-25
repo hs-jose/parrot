@@ -771,8 +771,12 @@ impl ReActEngine {
                 )
                 .await;
             emit_hook_executions(&execs, session_id, event_tx);
-            match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args.clone(), &tool_ctx))
-                .await
+            match race_with_abort(
+                cmd_rx,
+                self.tool_registry
+                    .execute(&tc.name, args.clone(), &tool_ctx),
+            )
+            .await
             {
                 Abortable::Completed(r) => {
                     r.unwrap_or_else(|e| parrot_protocol::types::ToolOutput {
@@ -821,18 +825,16 @@ impl ReActEngine {
             )
             .await;
         emit_hook_executions(&execs, session_id, event_tx);
+        // 用户 hook Replace 可注入无界内容,截断必须在它之后收口
+        // (TruncateHook 在管道外再兜一次)。
         let result = match tool_result_decision {
             HookResult::Replace {
                 content, is_error, ..
-            } => parrot_protocol::types::ToolOutput { content, is_error },
+            } => parrot_protocol::types::ToolOutput {
+                content: truncate_tool_content(&content),
+                is_error,
+            },
             _ => result,
-        };
-
-        // 工具输出统一截断：ToolEnd 事件、events.log、模型上下文三处同时
-        // 兜住，无界输出（如 file_glob "**/*"）无法再撑爆会话。
-        let result = parrot_protocol::types::ToolOutput {
-            content: truncate_tool_content(&result.content),
-            is_error: result.is_error,
         };
 
         let tool_end = AgentEvent::ToolEnd {
@@ -917,21 +919,6 @@ impl ReActEngine {
 
         router.unregister(&self.session_id, tool_id).await;
         Ok(decision)
-    }
-
-    async fn execute_tool(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<parrot_protocol::types::ToolOutput, AgentError> {
-        match self.tool_registry.get(name).await {
-            Some(tool) => tool.call(args, ctx).await,
-            None => Err(AgentError::ToolExecution {
-                tool: name.to_string(),
-                message: "Tool not found".to_string(),
-            }),
-        }
     }
 }
 
