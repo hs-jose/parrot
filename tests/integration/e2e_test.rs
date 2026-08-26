@@ -11,7 +11,7 @@
 
 use parrot_config::AppConfig;
 use parrot_protocol::agent_event::{
-    AgentEndReason, AgentEvent, MessageDeltaPayload, TurnStopReason,
+    AgentEndReason, AgentEvent, MessageDeltaPayload, PersistedAgentEvent, TurnStopReason,
 };
 use parrot_protocol::types::SessionConfig;
 use parrot_protocol::{ClientMessage, ServerMessage};
@@ -55,6 +55,7 @@ use parrot_core::error::{AgentError, ProviderError};
 use parrot_core::provider::{
     ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
 };
+use parrot_core::session::{SessionCmd, SessionManager};
 use parrot_core::tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry};
 use parrot_core::types::{ChatMessage, ChatRole, GenerateConfig, ModelInfo};
 use parrot_protocol::types::Usage;
@@ -1563,4 +1564,127 @@ async fn e2e_compaction_emits_summary_event_and_compacts_context() {
     assert!(kept >= 2, "turn 2 kept verbatim");
 
     daemon_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// E2E: closing the engine's command channel makes it exit cleanly and
+// persist `AgentEnd` as the last event in `events.log`. This is the
+// graceful-exit path that `shutdown_all` relies on (it drops `cmd_tx` to
+// trigger the same `None` branch), exercised here without a real signal
+// and without `shutdown_all`, so the emitted reason is `ClientDisconnect`.
+//
+// Driven in-process against the real `SessionManager` + `ReActEngine` +
+// on-disk `EventLog`, because the engine's `cmd_tx` is owned by the
+// `SessionManager` and cannot be closed by an external WS client (a client
+// disconnect leaves the session live for resume). The WS layer is therefore
+// not on this invariant's path; the real engine + real file IO is.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_engine_persists_agent_end_on_cmd_channel_close() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let sessions_dir = tmp.path().join("data").join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(
+            Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>,
+            vec!["mock-model".to_string()],
+        )
+        .await;
+    let tool_registry = Arc::new(ToolRegistry::new());
+    tool_registry
+        .register(Arc::new(EchoTool) as Arc<dyn Tool>)
+        .await;
+
+    let mut mgr = SessionManager::new(
+        tool_registry,
+        provider_registry,
+        GenerateConfig {
+            model: "mock-model".to_string(),
+            temperature: None,
+            max_tokens: Some(8192),
+            stop_sequences: None,
+        },
+        sessions_dir.clone(),
+        tmp.path().to_path_buf(),
+    );
+
+    let session_id = mgr
+        .create_session(Some(SessionConfig {
+            model: Some("mock-model".to_string()),
+            provider: None,
+            system_prompt: None,
+        }))
+        .await
+        .expect("create session");
+    let mut event_rx = mgr
+        .take_event_receiver(&session_id)
+        .expect("event receiver");
+    // Clone the command sender so dropping the manager (which owns the
+    // original) plus this clone leaves the engine's `cmd_rx` with no senders.
+    let cmd_tx = mgr.get_handle(&session_id).expect("handle").cmd_tx.clone();
+
+    // Drive one full turn to completion so that `AgentEnd` is later proven
+    // to be the *last* persisted event, following normal operation.
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "hi".to_string(),
+        })
+        .await
+        .expect("send chat");
+    let turned = timeout(Duration::from_secs(10), async {
+        loop {
+            match event_rx.recv().await {
+                Some(AgentEvent::TurnEnd { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(turned, "timed out waiting for TurnEnd");
+
+    // Close the command channel: `cmd_rx.recv()` returns `None` → the
+    // engine's `None` branch (reason left as the default `ClientDisconnect`,
+    // since `shutdown_all` was never called) → `fire_and_drop` *persists*
+    // `AgentEnd` to `events.log` and *then* emits it.
+    drop(cmd_tx);
+    drop(mgr);
+    let ended = timeout(Duration::from_secs(10), async {
+        loop {
+            match event_rx.recv().await {
+                Some(AgentEvent::AgentEnd { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        ended,
+        "engine did not emit AgentEnd after command channel closed"
+    );
+
+    let log_path = sessions_dir.join(session_id.to_string()).join("events.log");
+    let content = std::fs::read_to_string(&log_path).expect("events.log");
+    let last_line = content
+        .lines()
+        .rfind(|l| !l.is_empty())
+        .expect("non-empty log");
+    let entry: PersistedAgentEvent = serde_json::from_str(last_line).expect("parse last event");
+    assert!(
+        matches!(
+            entry.event,
+            AgentEvent::AgentEnd {
+                reason: AgentEndReason::ClientClose | AgentEndReason::ClientDisconnect,
+                ..
+            }
+        ),
+        "expected AgentEnd as last event, got {:?}",
+        entry.event
+    );
 }
