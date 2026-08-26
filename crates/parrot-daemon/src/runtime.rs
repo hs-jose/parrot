@@ -123,34 +123,69 @@ pub async fn run_with_confirm_timeout(
     let listener = ws_server.bind().await?;
 
     loop {
-        match accept_connection(&listener).await {
-            Ok(client_conn) => {
-                let auth = Arc::clone(&auth);
-                let session_manager = Arc::clone(&session_manager);
-                let session_store = Arc::clone(&session_store);
-                let provider_registry = Arc::clone(&provider_registry);
-                let confirm_router = Arc::clone(&confirm_router);
-                let default_config = Arc::clone(&default_config);
-                let working_dir = Arc::clone(&working_dir);
+        let sig = async {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = unix_terminate_signal() => {},
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = sig => break,
+            res = accept_connection(&listener) => match res {
+                Ok(client_conn) => {
+                    let auth = Arc::clone(&auth);
+                    let session_manager = Arc::clone(&session_manager);
+                    let session_store = Arc::clone(&session_store);
+                    let provider_registry = Arc::clone(&provider_registry);
+                    let confirm_router = Arc::clone(&confirm_router);
+                    let default_config = Arc::clone(&default_config);
+                    let working_dir = Arc::clone(&working_dir);
 
-                tokio::spawn(async move {
-                    handle_connection(
-                        client_conn,
-                        auth,
-                        session_manager,
-                        session_store,
-                        provider_registry,
-                        confirm_router,
-                        default_config,
-                        working_dir,
-                    )
-                    .await;
-                });
-            }
-            Err(e) => {
-                error!("Failed to accept connection: {}", e);
-            }
+                    tokio::spawn(async move {
+                        handle_connection(
+                            client_conn,
+                            auth,
+                            session_manager,
+                            session_store,
+                            provider_registry,
+                            confirm_router,
+                            default_config,
+                            working_dir,
+                        )
+                        .await;
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                }
+            },
         }
+    }
+
+    info!("Shutdown signal received, draining sessions...");
+    session_manager
+        .write()
+        .await
+        .shutdown_all(Duration::from_secs(3))
+        .await;
+    info!("All sessions drained, exiting");
+    Ok(())
+}
+
+async fn unix_terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<()>().await;
     }
 }
 
