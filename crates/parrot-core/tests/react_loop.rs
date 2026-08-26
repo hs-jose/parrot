@@ -996,3 +996,72 @@ async fn compaction_disabled_matches_old_behavior() {
         .iter()
         .any(|ev| matches!(ev, AgentEvent::CompactionSummary { .. })));
 }
+
+/// Regression test for the `with_end_reason` builder + shared-Arc plumbing
+/// (daemon graceful-shutdown prep). The engine's `None` branch overwrites
+/// `end_reason` to `ClientDisconnect`; when the Arc is shared via
+/// `with_end_reason`, that overwrite must be visible to an external holder,
+/// and the same value must flow to `AgentEnd`. Pins the invariant that the
+/// guard reads from the threaded Arc, not a private local.
+#[tokio::test]
+async fn with_end_reason_shares_arc_with_engine_guard() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(MockProvider::new().text_only());
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+
+    // Init to a non-default value so the engine's None-branch overwrite is
+    // detectable through this shared Arc.
+    let external_reason = Arc::new(std::sync::Mutex::new(AgentEndReason::DaemonShutdown));
+
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("sys".to_string()),
+        data_dir,
+        working_dir,
+    )
+    .with_end_reason(Arc::clone(&external_reason));
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    // Dropping cmd_tx makes the engine's recv() return None, firing the
+    // None-branch overwrite to ClientDisconnect then AgentEnd.
+    drop(cmd_tx);
+    let trailing = drain_until_agent_end(&mut event_rx).await;
+    let _ = engine_task.await;
+
+    // The external holder observes the overwrite ⇒ the Arc is shared.
+    let observed = external_reason.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        AgentEndReason::ClientDisconnect,
+        "engine None-branch overwrite must be visible via the shared end_reason Arc"
+    );
+
+    // The guard emitted the same value from the shared Arc.
+    let agent_end_reason = trailing
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::AgentEnd { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("AgentEnd present");
+    assert_eq!(agent_end_reason, AgentEndReason::ClientDisconnect);
+}

@@ -59,6 +59,11 @@ pub struct ReActEngine {
     /// Context limits (`[session]` + compaction, wired in by the daemon).
     context_limits: ContextLimits,
     hooks: Arc<HookRegistry>,
+    /// Shared with `SessionManager` (via `with_end_reason`) so a future
+    /// `shutdown_all` can set `DaemonShutdown` before triggering the clean
+    /// exit path. Defaults to `ClientDisconnect`; `run()`'s `None` branch
+    /// resets it on normal channel-close.
+    end_reason: Arc<Mutex<AgentEndReason>>,
 }
 
 impl ReActEngine {
@@ -96,6 +101,7 @@ impl ReActEngine {
             resume_seq_offset: 0,
             context_limits: ContextLimits::default(),
             hooks: Arc::new(HookRegistry::empty()),
+            end_reason: Arc::new(Mutex::new(AgentEndReason::ClientDisconnect)),
         }
     }
 
@@ -132,6 +138,16 @@ impl ReActEngine {
     /// parrot.toml here.
     pub fn with_context_limits(mut self, limits: ContextLimits) -> Self {
         self.context_limits = limits;
+        self
+    }
+
+    /// Share the engine's `end_reason` slot with the caller (the
+    /// `SessionManager`). The same `Arc` is read by `AgentEndGuard` when it
+    /// emits `AgentEnd`, so mutating it externally (e.g. setting
+    /// `DaemonShutdown`) before the clean exit path controls the emitted
+    /// reason. Defaults to `ClientDisconnect` if unset.
+    pub fn with_end_reason(mut self, reason: Arc<Mutex<AgentEndReason>>) -> Self {
+        self.end_reason = reason;
         self
     }
 
@@ -212,15 +228,13 @@ impl ReActEngine {
         // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
         // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
         let total_usage: Arc<Mutex<Usage>> = Arc::new(Mutex::new(Usage::default()));
-        let end_reason: Arc<Mutex<AgentEndReason>> =
-            Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
         let event_tx_for_guard = event_tx.clone();
         let guard = AgentEndGuard {
             session_id,
             event_tx: event_tx_for_guard,
             fired: false,
             total_usage: Arc::clone(&total_usage),
-            reason: Arc::clone(&end_reason),
+            reason: Arc::clone(&self.end_reason),
             hooks: Arc::clone(&self.hooks),
             working_dir: self.working_dir.clone(),
         };
@@ -314,7 +328,7 @@ impl ReActEngine {
                     // Top-level abort with no active turn — ignore.
                 }
                 None => {
-                    *end_reason.lock().unwrap() = AgentEndReason::ClientDisconnect;
+                    *self.end_reason.lock().unwrap() = AgentEndReason::ClientDisconnect;
                     break;
                 }
             }

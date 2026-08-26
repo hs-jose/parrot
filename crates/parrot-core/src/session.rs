@@ -5,13 +5,12 @@ use crate::hooks::HookRegistry;
 use crate::provider::ProviderRegistry;
 use crate::tool::ToolRegistry;
 use crate::types::{ChatMessage, GenerateConfig};
-use parrot_protocol::agent_event::AgentEvent;
+use parrot_protocol::agent_event::{AgentEndReason, AgentEvent};
 use parrot_protocol::types::SessionConfig as ProtocolSessionConfig;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 pub enum SessionCmd {
@@ -23,7 +22,8 @@ pub struct SessionHandle {
     pub id: Uuid,
     pub cmd_tx: mpsc::Sender<SessionCmd>,
     event_rx: Option<mpsc::Receiver<AgentEvent>>,
-    pub abort_handle: AbortHandle,
+    pub join_handle: tokio::task::JoinHandle<()>,
+    pub end_reason: Arc<Mutex<AgentEndReason>>,
 }
 
 /// What the engine should inject as the system prompt when the client didn't
@@ -190,6 +190,9 @@ impl SessionManager {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCmd>(32);
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(64);
 
+        let end_reason: Arc<Mutex<AgentEndReason>> =
+            Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
+
         let mut engine = ReActEngine::new(
             id,
             Arc::clone(&self.tool_registry),
@@ -202,7 +205,8 @@ impl SessionManager {
         .with_confirm_config(self.confirm_config.clone())
         .with_initial_context(replayed_context)
         .with_resumed_from(resumed_from_seq)
-        .with_context_limits(self.context_limits.clone());
+        .with_context_limits(self.context_limits.clone())
+        .with_end_reason(Arc::clone(&end_reason));
 
         if let Some(issue) = integrity_warning {
             engine = engine.with_pending_integrity_warning(issue);
@@ -214,10 +218,9 @@ impl SessionManager {
             engine
         };
 
-        let abort_handle = tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             engine.run(cmd_rx, event_tx).await;
-        })
-        .abort_handle();
+        });
 
         self.sessions.insert(
             id,
@@ -225,7 +228,8 @@ impl SessionManager {
                 id,
                 cmd_tx,
                 event_rx: Some(event_rx),
-                abort_handle,
+                join_handle,
+                end_reason,
             },
         );
 
@@ -248,6 +252,9 @@ impl SessionManager {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCmd>(32);
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(64);
 
+        let end_reason: Arc<Mutex<AgentEndReason>> =
+            Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
+
         let engine = ReActEngine::new(
             id,
             Arc::clone(&self.tool_registry),
@@ -259,17 +266,17 @@ impl SessionManager {
         )
         .with_confirm_config(self.confirm_config.clone())
         .with_initial_context(initial_context)
-        .with_context_limits(self.context_limits.clone());
+        .with_context_limits(self.context_limits.clone())
+        .with_end_reason(Arc::clone(&end_reason));
         let engine = if let Some(h) = self.hooks.clone() {
             engine.with_hooks(h)
         } else {
             engine
         };
 
-        let abort_handle = tokio::spawn(async move {
+        let join_handle = tokio::spawn(async move {
             engine.run(cmd_rx, event_tx).await;
-        })
-        .abort_handle();
+        });
 
         self.sessions.insert(
             id,
@@ -277,7 +284,8 @@ impl SessionManager {
                 id,
                 cmd_tx,
                 event_rx: Some(event_rx),
-                abort_handle,
+                join_handle,
+                end_reason,
             },
         );
 
@@ -332,7 +340,7 @@ impl SessionManager {
     /// or event receiver already taken) before re-spawning from disk.
     pub fn remove(&mut self, id: &Uuid) -> bool {
         if let Some(handle) = self.sessions.remove(id) {
-            handle.abort_handle.abort();
+            handle.join_handle.abort();
             true
         } else {
             false
