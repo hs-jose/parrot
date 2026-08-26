@@ -346,4 +346,119 @@ impl SessionManager {
             false
         }
     }
+
+    /// Cooperative daemon graceful-shutdown: set `end_reason` to
+    /// `DaemonShutdown` on every live session, send `Abort` to interrupt
+    /// in-flight work, drop the command senders (taking the handles) so
+    /// idle engines exit via their `None` branch, then await each
+    /// `JoinHandle` up to `deadline`. Sessions that don't exit in time are
+    /// force-aborted (their `AgentEndGuard` Drop fires a best-effort
+    /// `AgentEnd`). The `DaemonShutdown` reason is preserved because the
+    /// engine's `None` branch leaves a pre-set `DaemonShutdown` untouched.
+    pub async fn shutdown_all(&mut self, deadline: Duration) {
+        for handle in self.sessions.values() {
+            *handle.end_reason.lock().unwrap() = AgentEndReason::DaemonShutdown;
+            let _ = handle.cmd_tx.send(SessionCmd::Abort).await;
+        }
+        // A second Abort in case the first was consumed mid-turn and the
+        // engine is now awaiting the next command.
+        for handle in self.sessions.values() {
+            let _ = handle.cmd_tx.send(SessionCmd::Abort).await;
+        }
+        let handles: Vec<(Uuid, tokio::task::JoinHandle<()>)> = std::mem::take(&mut self.sessions)
+            .into_values()
+            .map(|h| (h.id, h.join_handle))
+            .collect();
+        for (id, mut join) in handles {
+            match tokio::time::timeout(deadline, &mut join).await {
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::warn!(session_id = %id, "shutdown deadline exceeded, force-aborting");
+                    join.abort();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_all_aborts_active_session_within_deadline() {
+        let mut mgr = SessionManager::new(
+            Arc::new(ToolRegistry::new()),
+            Arc::new(ProviderRegistry::new()),
+            GenerateConfig::default(),
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("."),
+        );
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCmd>(32);
+        let (evt_tx, _evt_rx) = mpsc::channel::<AgentEvent>(64);
+        let end_reason: Arc<Mutex<AgentEndReason>> =
+            Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
+        let id = Uuid::new_v4();
+        let join = tokio::spawn(async move {
+            let mut aborted = false;
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let SessionCmd::Abort = cmd {
+                    aborted = true;
+                    break;
+                }
+            }
+            let _ = (aborted, evt_tx);
+        });
+        mgr.sessions.insert(
+            id,
+            SessionHandle {
+                id,
+                cmd_tx: cmd_tx.clone(),
+                event_rx: None,
+                join_handle: join,
+                end_reason: Arc::clone(&end_reason),
+            },
+        );
+
+        mgr.shutdown_all(Duration::from_millis(500)).await;
+
+        assert_eq!(*end_reason.lock().unwrap(), AgentEndReason::DaemonShutdown);
+        assert!(cmd_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_force_aborts_unresponsive_session() {
+        let mut mgr = SessionManager::new(
+            Arc::new(ToolRegistry::new()),
+            Arc::new(ProviderRegistry::new()),
+            GenerateConfig::default(),
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("."),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCmd>(32);
+        let (_evt_tx, _evt_rx) = mpsc::channel::<AgentEvent>(64);
+        let end_reason: Arc<Mutex<AgentEndReason>> =
+            Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
+        let id = Uuid::new_v4();
+        let join = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        mgr.sessions.insert(
+            id,
+            SessionHandle {
+                id,
+                cmd_tx,
+                event_rx: None,
+                join_handle: join,
+                end_reason,
+            },
+        );
+
+        let start = std::time::Instant::now();
+        mgr.shutdown_all(Duration::from_millis(100)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "must not hang"
+        );
+    }
 }

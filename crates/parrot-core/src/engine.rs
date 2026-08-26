@@ -328,7 +328,11 @@ impl ReActEngine {
                     // Top-level abort with no active turn — ignore.
                 }
                 None => {
-                    *self.end_reason.lock().unwrap() = AgentEndReason::ClientDisconnect;
+                    let mut reason = self.end_reason.lock().unwrap();
+                    if !matches!(*reason, AgentEndReason::DaemonShutdown) {
+                        *reason = AgentEndReason::ClientDisconnect;
+                    }
+                    drop(reason);
                     break;
                 }
             }
