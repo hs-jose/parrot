@@ -109,6 +109,20 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     ]);
     let bar = Paragraph::new(line).style(Style::default().bg(palette::STATUS_BG));
     f.render_widget(bar, area);
+    if let Some(label) = activity_label(app) {
+        let right = Line::from(vec![
+            Span::styled(
+                format!("{}, ", spinner_frame()),
+                Style::default().fg(palette::AI_FG),
+            ),
+            Span::styled(label, Style::default().fg(palette::STATUS_FG)),
+            Span::raw(" "),
+        ]);
+        let right_para = Paragraph::new(right)
+            .style(Style::default().bg(palette::STATUS_BG))
+            .alignment(Alignment::Right);
+        f.render_widget(right_para, area);
+    }
 }
 
 fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -136,50 +150,13 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         }
     }
 
-    let blink = blink_cursor();
-
-    // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。复用
-    // push_body_styled 的空行压缩逻辑，避免 markdown 段落空行在流式阶段
-    // 刷屏；光标贴在最后一行行尾（正在输入的位置）。
+    // 流式输出中的 assistant 消息：单独渲染。状态指示（Thinking/Working）
+    // 在状态栏右侧固定位置，不再作为聊天行插入，避免底部锚定视图反复位移。
     if let Some(text) = app.streaming_text() {
-        lines.push(header_line("●", palette::AI_FG, None));
-        if text.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                blink,
-                Style::default()
-                    .fg(palette::AI_FG)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            let before = lines.len();
+        if !text.trim().is_empty() {
+            lines.push(header_line("●", palette::AI_FG, None));
             push_body_styled(text, &mut lines, Style::default().fg(palette::BODY_FG));
-            // push_body_styled 至少 push 一行（含全空文本），所以 last_mut 必 Some。
-            if lines.len() > before {
-                if let Some(last) = lines.last_mut() {
-                    last.spans.push(Span::styled(
-                        blink,
-                        Style::default()
-                            .fg(palette::AI_FG)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-            }
         }
-    } else if app.is_thinking() {
-        lines.push(Line::from(Span::styled(
-            "  Thinking…",
-            Style::default()
-                .fg(palette::AI_FG)
-                .add_modifier(Modifier::DIM),
-        )));
-    }
-    if app.is_working() {
-        lines.push(Line::from(Span::styled(
-            "  Working…",
-            Style::default()
-                .fg(palette::AI_FG)
-                .add_modifier(Modifier::DIM),
-        )));
     }
 
     let view_h = inner.height as usize;
@@ -414,17 +391,26 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
     f.render_widget(input, text_area);
 }
 
-/// 500ms 周期的闪烁光标块，用于模拟流式打字中。
-fn blink_cursor() -> &'static str {
+/// 状态栏右侧的活动指示：spinner + 状态标签，位置固定不推动聊天内容。
+fn activity_label(app: &App) -> Option<String> {
+    if app.is_working() {
+        Some("Working…".into())
+    } else if app.is_thinking() {
+        Some("Thinking…".into())
+    } else if app.is_turn_active() {
+        Some("Streaming…".into())
+    } else {
+        None
+    }
+}
+
+fn spinner_frame() -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if (ms / 500).is_multiple_of(2) {
-        "█"
-    } else {
-        " "
-    }
+    FRAMES[(ms / 100) as usize % FRAMES.len()]
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

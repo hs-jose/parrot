@@ -125,7 +125,10 @@ async fn run_loop(
             Some(ev) = ui_rx.recv() => {
                 match ev {
                     UiEvent::Quit => break,
-                    UiEvent::Resize(_, _) => *dirty = true,
+                    UiEvent::Resize(_, _) => {
+                        let _ = terminal.clear();
+                        *dirty = true;
+                    }
                     UiEvent::Paste(s) => {
                         let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
                         for (i, line) in normalized.split('\n').enumerate() {

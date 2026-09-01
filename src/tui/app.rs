@@ -338,8 +338,8 @@ impl App {
                 dropped_message_count,
                 ..
             } => {
-                self.entries.push(ChatEntry::Info(format!(
-                    "已压缩 {dropped_message_count} 条历史消息"
+                self.entries.push(ChatEntry::Warning(format!(
+                    "上下文已压缩：{dropped_message_count} 条历史消息已生成结构化摘要"
                 )));
             }
         }
@@ -732,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summary_pushes_info_entry() {
+    fn compaction_summary_pushes_warning_entry() {
         let sid_v = sid();
         let mut app = App::new(sid_v);
         app.apply_event(AgentEvent::CompactionSummary {
@@ -743,10 +743,10 @@ mod tests {
             kept_message_count: 4,
         });
         match app.entries.last() {
-            Some(ChatEntry::Info(text)) => {
-                assert!(text.contains("6"), "info mentions dropped count: {text}");
+            Some(ChatEntry::Warning(text)) => {
+                assert!(text.contains("6"), "warning mentions dropped count: {text}");
             }
-            other => panic!("expected Info entry, got {:?}", other),
+            other => panic!("expected Warning entry, got {:?}", other),
         }
     }
 }
