@@ -384,6 +384,13 @@ impl ReActEngine {
             tracing::warn!(session_id = %session_id, "compaction skipped: provider not found");
             return;
         };
+        let _ = event_tx
+            .send(AgentEvent::CompactionStart {
+                session_id,
+                turn_id,
+            })
+            .await
+            .ok();
         let mut summary_config = self.config.clone();
         summary_config.max_tokens = Some(cfg.summary_max_tokens);
         let summary = match provider

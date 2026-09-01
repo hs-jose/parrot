@@ -79,6 +79,8 @@ pub(crate) struct App {
     turn_active: bool,
     /// 正在执行、尚未 `ToolEnd` 的工具数量。
     tools_in_flight: u32,
+    /// 上下文压缩摘要调用进行中（`CompactionStart` → `CompactionSummary`/`TurnStart`）。
+    pub compacting: bool,
 }
 
 impl App {
@@ -100,6 +102,7 @@ impl App {
             total_usage: Usage::default(),
             turn_active: false,
             tools_in_flight: 0,
+            compacting: false,
         }
     }
 
@@ -218,6 +221,7 @@ impl App {
             AgentEvent::TurnStart { user_message, .. } => {
                 self.turn_active = true;
                 self.tools_in_flight = 0;
+                self.compacting = false;
                 self.entries.push(ChatEntry::User {
                     text: user_message,
                     time: stamp(),
@@ -334,10 +338,14 @@ impl App {
                 )));
             }
             AgentEvent::HookFired { .. } => {}
+            AgentEvent::CompactionStart { .. } => {
+                self.compacting = true;
+            }
             AgentEvent::CompactionSummary {
                 dropped_message_count,
                 ..
             } => {
+                self.compacting = false;
                 self.entries.push(ChatEntry::Warning(format!(
                     "上下文已压缩：{dropped_message_count} 条历史消息已生成结构化摘要"
                 )));
@@ -729,6 +737,40 @@ mod tests {
         app.scroll_up(100);
         app.scroll_to_bottom();
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn compaction_start_and_summary_toggle_compacting() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.apply_event(AgentEvent::CompactionStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+        });
+        assert!(app.compacting);
+        app.apply_event(AgentEvent::CompactionSummary {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            summary: "[CONVERSATION SUMMARY]\n...".into(),
+            dropped_message_count: 6,
+            kept_message_count: 4,
+        });
+        assert!(!app.compacting);
+
+        app.apply_event(AgentEvent::CompactionStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+        });
+        assert!(app.compacting);
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            user_message: "hi".into(),
+        });
+        assert!(
+            !app.compacting,
+            "TurnStart clears compacting (failure path)"
+        );
     }
 
     #[test]

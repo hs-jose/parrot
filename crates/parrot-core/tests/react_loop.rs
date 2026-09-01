@@ -275,6 +275,7 @@ fn variant_name(ev: &AgentEvent) -> &'static str {
         AgentEvent::ToolConfirmRequired { .. } => "ToolConfirmRequired",
         AgentEvent::ReplayIntegrityWarning { .. } => "ReplayIntegrityWarning",
         AgentEvent::HookFired { .. } => "HookFired",
+        AgentEvent::CompactionStart { .. } => "CompactionStart",
         AgentEvent::CompactionSummary { .. } => "CompactionSummary",
     }
 }

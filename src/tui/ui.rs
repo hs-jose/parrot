@@ -393,7 +393,9 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
 
 /// 状态栏右侧的活动指示：spinner + 状态标签，位置固定不推动聊天内容。
 fn activity_label(app: &App) -> Option<String> {
-    if app.is_working() {
+    if app.compacting {
+        Some("Compacting…".into())
+    } else if app.is_working() {
         Some("Working…".into())
     } else if app.is_thinking() {
         Some("Thinking…".into())

@@ -542,6 +542,24 @@ fn server_shell_result_roundtrip() {
 }
 
 #[test]
+fn compaction_start_roundtrip() {
+    let sid = uuid::Uuid::new_v4();
+    let msg = AgentEvent::CompactionStart {
+        session_id: sid,
+        turn_id: uuid::Uuid::new_v4(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+    assert!(!msg.is_persistent());
+    assert_eq!(msg.session_id(), sid);
+    assert_eq!(
+        serde_json::to_value(&msg).unwrap()["type"],
+        serde_json::json!("CompactionStart")
+    );
+}
+
+#[test]
 fn compaction_summary_roundtrip() {
     let sid = uuid::Uuid::new_v4();
     let msg = AgentEvent::CompactionSummary {

@@ -210,6 +210,7 @@ fn print_history(events: &[PersistedAgentEvent]) {
             AgentEvent::HookFired { hook_id, .. } => {
                 format!("HookFired({})", hook_id)
             }
+            AgentEvent::CompactionStart { .. } => "CompactionStart".to_string(),
             AgentEvent::CompactionSummary {
                 dropped_message_count,
                 kept_message_count,
