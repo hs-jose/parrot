@@ -30,6 +30,7 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = execute!(
             std::io::stdout(),
             crossterm::event::PopKeyboardEnhancementFlags
@@ -76,6 +77,7 @@ pub(crate) async fn run_tui(
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
     );
+    let _ = execute!(stdout, crossterm::event::EnableBracketedPaste);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -99,6 +101,7 @@ pub(crate) async fn run_tui(
     let _ = disable_raw_mode();
     let mut stdout = std::io::stdout();
     let _ = execute!(stdout, LeaveAlternateScreen);
+    let _ = execute!(stdout, crossterm::event::DisableBracketedPaste);
     let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
     result
 }
@@ -124,8 +127,14 @@ async fn run_loop(
                     UiEvent::Quit => break,
                     UiEvent::Resize(_, _) => *dirty = true,
                     UiEvent::Paste(s) => {
-                        for c in s.chars() {
-                            input.insert_char(c);
+                        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+                        for (i, line) in normalized.split('\n').enumerate() {
+                            if i > 0 {
+                                input.insert_newline();
+                            }
+                            for c in line.chars() {
+                                input.insert_char(c);
+                            }
                         }
                         *dirty = true;
                     }
@@ -264,14 +273,6 @@ async fn handle_key(
                 Ok(None)
             }
             KeyCode::PageDown => {
-                app.scroll_down((app.view_height / 2).max(1));
-                Ok(None)
-            }
-            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.scroll_up((app.view_height / 2).max(1));
-                Ok(None)
-            }
-            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.scroll_down((app.view_height / 2).max(1));
                 Ok(None)
             }
