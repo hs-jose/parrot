@@ -222,13 +222,10 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
             } else {
                 format!(" {}", truncate_str(&args, 48))
             };
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("▸ {tool_name}{args_str}"),
-                    Style::default().fg(palette::TOOL_FG),
-                ),
-            ];
+            let mut spans = vec![Span::styled(
+                format!("▸ {tool_name}{args_str}"),
+                Style::default().fg(palette::TOOL_FG),
+            )];
             match result {
                 Some(r) if r.is_error => {
                     spans.push(Span::styled(
@@ -247,13 +244,13 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
         }
         ChatEntry::Error(s) => {
             lines.push(Line::from(Span::styled(
-                format!("  [error] {s}"),
+                format!("[error] {s}"),
                 Style::default().fg(palette::ERROR_FG),
             )));
         }
         ChatEntry::Warning(s) => {
             lines.push(Line::from(Span::styled(
-                format!("  [warn] {s}"),
+                format!("[warn] {s}"),
                 Style::default().fg(palette::WARN_FG),
             )));
         }
@@ -263,7 +260,6 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
             exit_code,
         } => {
             lines.push(Line::from(vec![
-                Span::raw("  "),
                 Span::styled(
                     format!("▸ !{command}"),
                     Style::default().fg(palette::TOOL_FG),
@@ -291,7 +287,7 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
                 push_body_styled(&shown, lines, style);
                 if truncated {
                     lines.push(Line::from(Span::styled(
-                        "  …（已截断）",
+                        "…（已截断）",
                         Style::default().fg(palette::DIM),
                     )));
                 }
@@ -299,7 +295,7 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
         }
         ChatEntry::Info(s) => {
             lines.push(Line::from(Span::styled(
-                format!("  {s}"),
+                s.clone(),
                 Style::default().fg(palette::DIM),
             )));
         }
@@ -324,25 +320,30 @@ fn compact_args(args: &Value) -> String {
     serde_json::to_string(args).unwrap_or_default()
 }
 
-/// 将正文按行展开，统一缩进两格 + 柔和正文色。连续空行压缩为一行，
-/// 行首/行尾的空行去掉，避免"空行刷屏"和与消息间空行叠加。
+/// 将正文按行展开 + 柔和正文色。连续空行压缩为一行,行首/行尾的
+/// 空行去掉,避免"空行刷屏"和与消息间空行叠加。
 fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
     push_body_styled(text, lines, Style::default().fg(palette::BODY_FG));
 }
 
-/// Markdown 渲染:tui-markdown 解析为 styled Lines,统一加两格缩进。
+/// Markdown 渲染:tui-markdown 解析为 styled Lines。
 /// 标题/代码块样式在 Line 级,须 patch 到每个 span;流式中的未闭合
 /// 结构按纯文本呈现,闭合后自动升级为富格式。
 fn push_markdown(text: &str, lines: &mut Vec<Line<'_>>) {
-    let dedented = dedent(text);
     let options = tui_markdown::Options::new(ThemeSheet);
-    let md = tui_markdown::from_str_with_options(&dedented, &options);
+    let md = tui_markdown::from_str_with_options(text, &options);
     for line in md.lines {
         let line_style = line.style;
-        let mut spans = vec![Span::raw("  ")];
-        for s in line.spans {
-            let st = patch_body(line_style.patch(s.style));
-            spans.push(Span::styled(s.content.into_owned(), st));
+        let mut spans: Vec<Span<'_>> = line
+            .spans
+            .into_iter()
+            .map(|s| {
+                let st = patch_body(line_style.patch(s.style));
+                Span::styled(s.content.into_owned(), st)
+            })
+            .collect();
+        if spans.is_empty() {
+            spans.push(Span::default());
         }
         lines.push(Line::from(spans));
     }
@@ -355,24 +356,6 @@ fn patch_body(st: ratatui::style::Style) -> ratatui::style::Style {
     } else {
         st
     }
-}
-
-/// 剥掉所有非空行的公共行首空白。模型输出偶尔整段带 4+ 空格缩进,
-/// CommonMark 会吞成 indented code block,`##`/围栏原样可见。
-fn dedent(text: &str) -> String {
-    let min_indent = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    if min_indent == 0 {
-        return text.to_string();
-    }
-    text.lines()
-        .map(|l| l.get(min_indent..).unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// tui-markdown 样式表,对齐 Tokyo Night 调色板。
@@ -401,26 +384,9 @@ impl tui_markdown::StyleSheet for ThemeSheet {
     }
 }
 
-#[cfg(test)]
-mod probe_tmp {
-    #[test]
-    fn probe_from_str() {
-        let s = "## 原因二:方案\n\n```\n① dir /s x.txt\n```";
-        let md = tui_markdown::from_str(s);
-        for (i, line) in md.lines.iter().enumerate() {
-            let spans: Vec<String> = line
-                .spans
-                .iter()
-                .map(|sp| format!("[{:?} style={:?}]", sp.content, sp.style))
-                .collect();
-            println!("L{i}: {}", spans.join(""));
-        }
-    }
-}
-
 fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
     if text.trim().is_empty() {
-        lines.push(Line::from(Span::raw("  ")));
+        lines.push(Line::default());
         return;
     }
     let mut pending_blank = false;
@@ -433,13 +399,10 @@ fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
             continue;
         }
         if pending_blank {
-            lines.push(Line::from(Span::raw("  ")));
+            lines.push(Line::default());
             pending_blank = false;
         }
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(l.to_string(), style),
-        ]));
+        lines.push(Line::from(Span::styled(l.to_string(), style)));
         emitted = true;
     }
 }
@@ -556,7 +519,7 @@ mod tests {
             "heading must be bold, got {:?}",
             heading.spans
         );
-        // 代码块内容行(第 3 行:缩进 + 代码)应为 code 样式而非正文。
+        // 代码块内容行(第 3 行)应为 code 样式而非正文。
         let code_line = &lines[3];
         assert!(
             code_line
@@ -568,31 +531,6 @@ mod tests {
         );
     }
 
-    /// 模型输出若整段带 4+ 空格缩进,CommonMark 会吞成 indented code
-    /// block。dedent 后正常渲染。
-    #[test]
-    fn push_markdown_renders_indented_model_output() {
-        let raw = "    ## 标题:方案\n\n    ```\n    ① dir /s x.txt\n    ```\n";
-        let mut lines = Vec::new();
-        push_markdown(raw, &mut lines);
-        let heading = &lines[0];
-        assert!(
-            heading
-                .spans
-                .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
-            "indented heading must still render as heading, got {:?}",
-            heading.spans
-        );
-    }
-
-    #[test]
-    fn dedent_strips_common_indent_only() {
-        assert_eq!(dedent("a\n    b"), "a\n    b");
-        assert_eq!(dedent("  a\n  b"), "a\nb");
-        assert_eq!(dedent("    a\n\n    b"), "a\n\nb");
-        assert_eq!(dedent("    a\n  b"), "  a\nb");
-    }
     use parrot_protocol::types::ToolOutput;
     use parrot_protocol::SessionId;
     use ratatui::backend::TestBackend;
@@ -704,11 +642,7 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec![
-                "  line1".to_string(),
-                "  ".to_string(),
-                "  line2".to_string()
-            ]
+            vec!["line1".to_string(), "".to_string(), "line2".to_string()]
         );
     }
 
@@ -720,6 +654,6 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
-        assert_eq!(rendered, vec!["  line1".to_string()]);
+        assert_eq!(rendered, vec!["line1".to_string()]);
     }
 }
