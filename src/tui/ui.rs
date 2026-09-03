@@ -330,21 +330,91 @@ fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
     push_body_styled(text, lines, Style::default().fg(palette::BODY_FG));
 }
 
-/// Markdown 渲染：tui-markdown 解析为 styled Lines,统一加两格缩进。
-/// 解析容错——流式中的未闭合结构按纯文本呈现,闭合后自动升级为富格式。
+/// Markdown 渲染:tui-markdown 解析为 styled Lines,统一加两格缩进。
+/// 标题/代码块样式在 Line 级,须 patch 到每个 span;流式中的未闭合
+/// 结构按纯文本呈现,闭合后自动升级为富格式。
 fn push_markdown(text: &str, lines: &mut Vec<Line<'_>>) {
-    let md = tui_markdown::from_str(text);
+    let dedented = dedent(text);
+    let options = tui_markdown::Options::new(ThemeSheet);
+    let md = tui_markdown::from_str_with_options(&dedented, &options);
     for line in md.lines {
+        let line_style = line.style;
         let mut spans = vec![Span::raw("  ")];
-        spans.extend(line.spans.into_iter().map(|s| {
-            let st = if s.style.fg.is_some() || s.style != Style::default() {
-                s.style
-            } else {
-                Style::default().fg(palette::BODY_FG)
-            };
-            Span::styled(s.content.into_owned(), st)
-        }));
+        for s in line.spans {
+            let st = patch_body(line_style.patch(s.style));
+            spans.push(Span::styled(s.content.into_owned(), st));
+        }
         lines.push(Line::from(spans));
+    }
+}
+
+/// 库默认无样式的 span 视为主题正文色,有样式的保持。
+fn patch_body(st: ratatui::style::Style) -> ratatui::style::Style {
+    if st == ratatui::style::Style::new() {
+        st.fg(palette::BODY_FG)
+    } else {
+        st
+    }
+}
+
+/// 剥掉所有非空行的公共行首空白。模型输出偶尔整段带 4+ 空格缩进,
+/// CommonMark 会吞成 indented code block,`##`/围栏原样可见。
+fn dedent(text: &str) -> String {
+    let min_indent = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    if min_indent == 0 {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|l| l.get(min_indent..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// tui-markdown 样式表,对齐 Tokyo Night 调色板。
+#[derive(Clone, Copy)]
+struct ThemeSheet;
+
+impl tui_markdown::StyleSheet for ThemeSheet {
+    fn heading(&self, level: u8) -> ratatui::style::Style {
+        match level {
+            1 => Style::default().fg(palette::INPUT_BORDER).bold(),
+            2..=3 => Style::default().fg(palette::USER_FG).bold(),
+            _ => Style::default().fg(palette::USER_FG),
+        }
+    }
+
+    fn code(&self) -> ratatui::style::Style {
+        Style::default().fg(palette::OK_FG)
+    }
+
+    fn link(&self) -> ratatui::style::Style {
+        Style::default().fg(palette::INPUT_BORDER)
+    }
+
+    fn blockquote(&self) -> ratatui::style::Style {
+        Style::default().fg(palette::DIM)
+    }
+}
+
+#[cfg(test)]
+mod probe_tmp {
+    #[test]
+    fn probe_from_str() {
+        let s = "## 原因二:方案\n\n```\n① dir /s x.txt\n```";
+        let md = tui_markdown::from_str(s);
+        for (i, line) in md.lines.iter().enumerate() {
+            let spans: Vec<String> = line
+                .spans
+                .iter()
+                .map(|sp| format!("[{:?} style={:?}]", sp.content, sp.style))
+                .collect();
+            println!("L{i}: {}", spans.join(""));
+        }
     }
 }
 
@@ -469,6 +539,60 @@ fn draw_confirm_modal(f: &mut ratatui::Frame<'_>, area: Rect, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 标题/代码块样式在 Line 级,接线必须 patch 到 span,否则 markdown
+    /// 结构与正文视觉无差别(用户报告的"没渲染")。
+    #[test]
+    fn push_markdown_applies_line_level_styles() {
+        let raw = "## 标题:方案\n\n```\n① dir /s x.txt\n```\n";
+        let mut lines = Vec::new();
+        push_markdown(raw, &mut lines);
+        let heading = &lines[0];
+        assert!(
+            heading
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "heading must be bold, got {:?}",
+            heading.spans
+        );
+        // 代码块内容行(第 3 行:缩进 + 代码)应为 code 样式而非正文。
+        let code_line = &lines[3];
+        assert!(
+            code_line
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(palette::OK_FG)),
+            "code line must use code style, got {:?}",
+            code_line.spans
+        );
+    }
+
+    /// 模型输出若整段带 4+ 空格缩进,CommonMark 会吞成 indented code
+    /// block。dedent 后正常渲染。
+    #[test]
+    fn push_markdown_renders_indented_model_output() {
+        let raw = "    ## 标题:方案\n\n    ```\n    ① dir /s x.txt\n    ```\n";
+        let mut lines = Vec::new();
+        push_markdown(raw, &mut lines);
+        let heading = &lines[0];
+        assert!(
+            heading
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "indented heading must still render as heading, got {:?}",
+            heading.spans
+        );
+    }
+
+    #[test]
+    fn dedent_strips_common_indent_only() {
+        assert_eq!(dedent("a\n    b"), "a\n    b");
+        assert_eq!(dedent("  a\n  b"), "a\nb");
+        assert_eq!(dedent("    a\n\n    b"), "a\n\nb");
+        assert_eq!(dedent("    a\n  b"), "  a\nb");
+    }
     use parrot_protocol::types::ToolOutput;
     use parrot_protocol::SessionId;
     use ratatui::backend::TestBackend;
