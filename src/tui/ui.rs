@@ -26,7 +26,11 @@ mod palette {
     pub const INPUT_BORDER: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
 }
 
-pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &mut App, input: &tui_textarea::TextArea<'_>) {
+pub(crate) fn draw(
+    f: &mut ratatui::Frame<'_>,
+    app: &mut App,
+    input: &ratatui_textarea::TextArea<'_>,
+) {
     let area = f.area();
     // 输入区按内容行数动态增长，+2 为上下边框；上限不超过终端高度的 1/3，
     // 避免长输入把对话区挤没。
@@ -155,7 +159,7 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     if let Some(text) = app.streaming_text() {
         if !text.trim().is_empty() {
             lines.push(header_line("●", palette::AI_FG, None));
-            push_body_styled(text, &mut lines, Style::default().fg(palette::BODY_FG));
+            push_markdown(text, &mut lines);
         }
     }
 
@@ -202,7 +206,7 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
         }
         ChatEntry::Assistant { text, time } => {
             lines.push(header_line("●", palette::AI_FG, Some(time)));
-            push_body(text, lines);
+            push_markdown(text, lines);
         }
         ChatEntry::Tool {
             tool_name,
@@ -326,6 +330,24 @@ fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
     push_body_styled(text, lines, Style::default().fg(palette::BODY_FG));
 }
 
+/// Markdown 渲染：tui-markdown 解析为 styled Lines,统一加两格缩进。
+/// 解析容错——流式中的未闭合结构按纯文本呈现,闭合后自动升级为富格式。
+fn push_markdown(text: &str, lines: &mut Vec<Line<'_>>) {
+    let md = tui_markdown::from_str(text);
+    for line in md.lines {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(line.spans.into_iter().map(|s| {
+            let st = if s.style.fg.is_some() || s.style != Style::default() {
+                s.style
+            } else {
+                Style::default().fg(palette::BODY_FG)
+            };
+            Span::styled(s.content.into_owned(), st)
+        }));
+        lines.push(Line::from(spans));
+    }
+}
+
 fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
     if text.trim().is_empty() {
         lines.push(Line::from(Span::raw("  ")));
@@ -352,7 +374,7 @@ fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
     }
 }
 
-fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::TextArea<'_>) {
+fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &ratatui_textarea::TextArea<'_>) {
     // 输入卡片：圆角蓝边框标示焦点；快捷键提示收进边框标题，不再占用内容行。
     let block = Block::default()
         .borders(Borders::ALL)
@@ -502,7 +524,7 @@ mod tests {
                 time: "14:33".into(),
             });
             app.entries.push(ChatEntry::Error("boom".into()));
-            let input = tui_textarea::TextArea::default();
+            let input = ratatui_textarea::TextArea::default();
             terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         }
     }
@@ -512,7 +534,7 @@ mod tests {
     fn draw_renders_rounded_borders_around_chat_and_input() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         let mut app = App::new(SessionId::new_v4());
-        let input = tui_textarea::TextArea::default();
+        let input = ratatui_textarea::TextArea::default();
         terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         let buf = terminal.backend().buffer();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -538,7 +560,7 @@ mod tests {
         }
         app.scroll_to_top();
         terminal
-            .draw(|f| draw(f, &mut app, &tui_textarea::TextArea::default()))
+            .draw(|f| draw(f, &mut app, &ratatui_textarea::TextArea::default()))
             .unwrap();
         assert!(
             app.scroll_offset < u16::MAX,

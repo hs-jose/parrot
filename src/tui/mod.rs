@@ -18,8 +18,8 @@ use parrot_protocol::types::ConfirmDecision;
 use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui_textarea::TextArea;
 use tokio::sync::mpsc;
-use tui_textarea::TextArea;
 
 use crate::conn::Connection;
 use crate::tui::app::Mode;
@@ -307,7 +307,7 @@ async fn handle_key(
             }
             _ => {
                 // TextArea handles other keys (cursor/backspace/etc.)
-                input.input(tui_textarea::Input::from(k));
+                input.input(ratatui_textarea::Input::from(k));
                 Ok(None)
             }
         },
