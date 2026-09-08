@@ -1607,6 +1607,7 @@ dependencies = [
  "parrot-daemon",
  "parrot-hooks",
  "parrot-protocol",
+ "parrot-tools",
  "parrot-transport",
  "ratatui",
  "ratatui-textarea",

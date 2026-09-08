@@ -1,0 +1,10 @@
+{
+  "name": "chat_stream_file_read",
+  "description": "Emits a single tool_use block for file_read(parrot_file_edit_e2e.txt) then stops with ToolUse.",
+  "events": [
+    { "ToolCallStart": { "id": "tc_1", "name": "file_read" } },
+    { "ToolCallDelta": { "id": "tc_1", "args_delta": "{\"path\":\"parrot_file_edit_e2e.txt\"}" } },
+    { "ToolCallEnd": { "id": "tc_1", "arguments": { "path": "parrot_file_edit_e2e.txt" } } },
+    { "Finish": { "stop_reason": "ToolUse", "usage": { "input_tokens": 10, "output_tokens": 5 } } }
+  ]
+}

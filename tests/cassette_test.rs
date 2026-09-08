@@ -533,3 +533,195 @@ where
         Err(_) => panic!("expect_agent_event({label}): timed out after 10s"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// file_edit e2e：真实 file_read / file_edit 工具经 cassette 驱动，完成一次
+// 真实落盘编辑（read-before-edit 护栏必须放行：file_read 先成功）。
+// 引擎 working_dir = 测试进程 CWD（包根），故用包根下专名文件并在结束时清理。
+// ---------------------------------------------------------------------------
+
+const E2E_FILE: &str = "parrot_file_edit_e2e.txt";
+
+#[tokio::test]
+async fn cassette_file_edit_rewrites_file_on_disk() {
+    let path = std::path::PathBuf::from(E2E_FILE);
+    let _ = std::fs::remove_file(&path); // 清理上次失败残留
+    std::fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").expect("seed file");
+
+    let provider = CassetteProvider::load(&[
+        "chat_stream_file_read",
+        "chat_stream_file_edit",
+        "chat_stream_end_turn",
+    ]);
+
+    // spawn 逻辑与 spawn_daemon_with_cassette_provider 相同，但注册真实的
+    // file_read / file_edit 工具（该文件自包含，不做共享重构）。
+    let port = free_port();
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("data");
+    let token_path = tmp.path().join("token");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let auth = parrot_daemon::auth::Auth::new(&token_path)
+        .await
+        .expect("init auth");
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+    let auth = Arc::new(auth);
+
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(
+            Arc::new(provider) as Arc<dyn LlmProvider>,
+            vec!["claude-sonnet-4-6".to_string()],
+        )
+        .await;
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    tool_registry
+        .register(Arc::new(parrot_tools::file_read::FileReadTool::new()) as Arc<dyn Tool>)
+        .await;
+    tool_registry
+        .register(Arc::new(parrot_tools::file_edit::FileEditTool::new()) as Arc<dyn Tool>)
+        .await;
+
+    let config = test_config(port, &data_dir, &token_path);
+    let daemon_handle = tokio::spawn(async move {
+        parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
+            .await
+            .expect("daemon run_with");
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let url = format!("ws://127.0.0.1:{port}");
+    let client = parrot_transport::WsTransportClient::new();
+    let mut conn = match client.connect(&url, &token).await {
+        Ok(c) => c,
+        Err(e) => {
+            daemon_handle.abort();
+            let _ = std::fs::remove_file(&path);
+            panic!("client connect: {e}");
+        }
+    };
+    expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::HelloAck { .. } = m {
+                Some(())
+            } else {
+                None
+            }
+        },
+        "HelloAck",
+    )
+    .await;
+
+    std::mem::forget(tmp);
+
+    let session_id = create_session(&conn.sender, &mut conn.receiver).await;
+    conn.sender
+        .send(ClientMessage::Chat {
+            session_id,
+            message: "edit the file".to_string(),
+        })
+        .await
+        .expect("send Chat");
+
+    // 1. ToolStart(file_read) → ToolEnd 成功
+    let name = expect_agent_event(
+        &mut conn.receiver,
+        |ev| match ev {
+            AgentEvent::ToolStart {
+                session_id: sid,
+                tool_name,
+                ..
+            } if *sid == session_id => Some(tool_name.clone()),
+            _ => None,
+        },
+        "ToolStart(file_read)",
+    )
+    .await;
+    assert_eq!(name, "file_read");
+
+    let (content, is_error) = expect_agent_event(
+        &mut conn.receiver,
+        |ev| match ev {
+            AgentEvent::ToolEnd {
+                session_id: sid,
+                result,
+                ..
+            } if *sid == session_id => Some((result.content.clone(), result.is_error)),
+            _ => None,
+        },
+        "ToolEnd(file_read)",
+    )
+    .await;
+    assert!(!is_error, "file_read failed: {content}");
+
+    // 2. ToolStart(file_edit) → ToolEnd "Successfully replaced 1 occurrence"
+    let name = expect_agent_event(
+        &mut conn.receiver,
+        |ev| match ev {
+            AgentEvent::ToolStart {
+                session_id: sid,
+                tool_name,
+                ..
+            } if *sid == session_id => Some(tool_name.clone()),
+            _ => None,
+        },
+        "ToolStart(file_edit)",
+    )
+    .await;
+    assert_eq!(name, "file_edit");
+
+    let (content, is_error) = expect_agent_event(
+        &mut conn.receiver,
+        |ev| match ev {
+            AgentEvent::ToolEnd {
+                session_id: sid,
+                result,
+                ..
+            } if *sid == session_id => Some((result.content.clone(), result.is_error)),
+            _ => None,
+        },
+        "ToolEnd(file_edit)",
+    )
+    .await;
+    assert!(!is_error, "file_edit failed: {content}");
+    assert!(
+        content.contains("Successfully replaced 1 occurrence"),
+        "unexpected edit output: {content}"
+    );
+
+    // 3. TurnEnd(EndTurn)
+    let stop = expect_agent_event(
+        &mut conn.receiver,
+        |ev| match ev {
+            AgentEvent::TurnEnd {
+                session_id: sid,
+                stop_reason,
+                ..
+            } if *sid == session_id => Some(stop_reason.clone()),
+            _ => None,
+        },
+        "TurnEnd(EndTurn)",
+    )
+    .await;
+    assert_eq!(stop, TurnStopReason::EndTurn);
+
+    // 4. 落盘断言：文件被真实改写
+    let after = std::fs::read_to_string(&path).expect("read edited file");
+    assert!(
+        after.contains("println!(\"edited\")"),
+        "file was not edited: {after}"
+    );
+    assert!(
+        !after.contains("println!(\"hello\")"),
+        "old text still present: {after}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    daemon_handle.abort();
+}

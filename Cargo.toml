@@ -73,6 +73,7 @@ parrot-config    = { path = "crates/parrot-config" }
 parrot-protocol  = { path = "crates/parrot-protocol" }
 parrot-transport = { path = "crates/parrot-transport" }
 parrot-hooks     = { path = "crates/parrot-hooks" }
+parrot-tools     = { path = "crates/parrot-tools" }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 async-trait      = { workspace = true }
