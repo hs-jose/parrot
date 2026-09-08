@@ -30,6 +30,10 @@ pub(crate) enum ChatEntry {
         tool_name: String,
         arguments: Value,
         result: Option<ToolOutput>,
+        /// 是否展开显示完整参数与结果（纯 UI 状态，不持久化；replay 默认紧凑）。
+        /// 渲染层（ui.rs）接线前对 bin 目标是 dead code，先压制告警。
+        #[allow(dead_code)]
+        expanded: bool,
     },
     Shell {
         command: String,
@@ -79,6 +83,10 @@ pub(crate) struct App {
     tools_in_flight: u32,
     /// 上下文压缩摘要调用进行中（`CompactionStart` → `CompactionSummary`/`TurnStart`）。
     pub compacting: bool,
+    /// 当前选中的工具条目（tool_call_id）。Tab 循环选中、Enter 展开。
+    /// 键盘处理接线前对 bin 目标是 dead code，先压制告警。
+    #[allow(dead_code)]
+    pub selected_tool: Option<String>,
 }
 
 impl App {
@@ -100,6 +108,7 @@ impl App {
             turn_active: false,
             tools_in_flight: 0,
             compacting: false,
+            selected_tool: None,
         }
     }
 
@@ -139,6 +148,75 @@ impl App {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+    }
+
+    /// Tab / Shift+Tab：在工具条目间循环移动选中。
+    /// 键盘处理接线前对 bin 目标是 dead code，先压制告警。
+    #[allow(dead_code)]
+    pub fn select_next_tool(&mut self, forward: bool) {
+        let ids: Vec<&str> = self
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ChatEntry::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            self.selected_tool = None;
+            return;
+        }
+        let next = match self
+            .selected_tool
+            .as_deref()
+            .and_then(|sel| ids.iter().position(|id| *id == sel))
+        {
+            Some(i) => {
+                if forward {
+                    (i + 1) % ids.len()
+                } else {
+                    (i + ids.len() - 1) % ids.len()
+                }
+            }
+            None => {
+                if forward {
+                    0
+                } else {
+                    ids.len() - 1
+                }
+            }
+        };
+        self.selected_tool = Some(ids[next].to_string());
+    }
+
+    /// 展开/收起选中的工具条目。无选中时返回 false（调用方据此让 Enter
+    /// 走发送消息的原路径）。键盘处理接线前先压制 dead code 告警。
+    #[allow(dead_code)]
+    pub fn toggle_selected_tool(&mut self) -> bool {
+        let Some(sel) = self.selected_tool.clone() else {
+            return false;
+        };
+        for e in self.entries.iter_mut() {
+            if let ChatEntry::Tool {
+                tool_call_id,
+                expanded,
+                ..
+            } = e
+            {
+                if *tool_call_id == sel {
+                    *expanded = !*expanded;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 单击 Esc 清除选中（双击 Esc 的中断/退出语义不变）。
+    /// 键盘处理接线前对 bin 目标是 dead code，先压制告警。
+    #[allow(dead_code)]
+    pub fn clear_tool_selection(&mut self) {
+        self.selected_tool = None;
     }
 
     pub fn confirm_decision(
@@ -287,6 +365,7 @@ impl App {
                     tool_name,
                     arguments,
                     result: None,
+                    expanded: false,
                 });
             }
             AgentEvent::ToolUpdate { .. } => {}
@@ -760,6 +839,72 @@ mod tests {
             !app.compacting,
             "TurnStart clears compacting (failure path)"
         );
+    }
+
+    fn tool_start_app() -> (App, uuid::Uuid) {
+        let sid = uuid::Uuid::new_v4();
+        let mut app = App::new(sid);
+        app.apply_event(AgentEvent::ToolStart {
+            session_id: sid,
+            turn_id: uuid::Uuid::new_v4(),
+            parent_message_id: uuid::Uuid::new_v4(),
+            tool_call_id: "tc_1".into(),
+            tool_name: "file_read".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        });
+        app.apply_event(AgentEvent::ToolStart {
+            session_id: sid,
+            turn_id: uuid::Uuid::new_v4(),
+            parent_message_id: uuid::Uuid::new_v4(),
+            tool_call_id: "tc_2".into(),
+            tool_name: "file_edit".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        });
+        (app, sid)
+    }
+
+    #[test]
+    fn select_next_tool_cycles_forward_and_backward() {
+        let (mut app, _) = tool_start_app();
+        app.select_next_tool(true);
+        assert_eq!(app.selected_tool.as_deref(), Some("tc_1"));
+        app.select_next_tool(true);
+        assert_eq!(app.selected_tool.as_deref(), Some("tc_2"));
+        app.select_next_tool(true);
+        assert_eq!(app.selected_tool.as_deref(), Some("tc_1"), "正向应环绕");
+
+        app.clear_tool_selection();
+        app.select_next_tool(false);
+        assert_eq!(
+            app.selected_tool.as_deref(),
+            Some("tc_2"),
+            "无选中时反向取最后一个"
+        );
+    }
+
+    #[test]
+    fn toggle_selected_tool_toggles_expansion() {
+        let (mut app, _) = tool_start_app();
+        app.select_next_tool(true);
+        assert!(app.toggle_selected_tool(), "首次切换应成功");
+        assert!(matches!(
+            &app.entries[0],
+            ChatEntry::Tool { expanded: true, .. }
+        ));
+        assert!(app.toggle_selected_tool());
+        assert!(matches!(
+            &app.entries[0],
+            ChatEntry::Tool {
+                expanded: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn toggle_without_selection_is_noop() {
+        let (mut app, _) = tool_start_app();
+        assert!(!app.toggle_selected_tool());
     }
 
     #[test]

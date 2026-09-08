@@ -581,6 +581,7 @@ mod tests {
                     content: "ok".into(),
                     is_error: false,
                 }),
+                expanded: false,
             });
             app.entries.push(ChatEntry::Assistant {
                 text: "这个文件的结构如下：……".into(),
