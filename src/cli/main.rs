@@ -1,6 +1,8 @@
 mod conn;
 mod daemon;
 mod stream;
+#[path = "../tool_display.rs"]
+mod tool_display;
 #[path = "../tui/mod.rs"]
 mod tui;
 

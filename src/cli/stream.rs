@@ -41,20 +41,32 @@ pub(crate) async fn print_stream(
                         write!(stdout, "{}", delta)?;
                         stdout.flush()?;
                     }
-                    MessageDeltaPayload::ToolCallStart { tool_name, .. } => {
-                        writeln!(stdout, "\n[Calling tool: {}]", tool_name)?;
-                        stdout.flush()?;
-                    }
+                    MessageDeltaPayload::ToolCallStart { .. } => {}
                     MessageDeltaPayload::ToolCallArgsDelta { .. } => {}
                 },
                 AgentEvent::MessageEnd { .. } => {}
-                AgentEvent::ToolStart { .. } => {}
+                AgentEvent::ToolStart {
+                    tool_name,
+                    arguments,
+                    ..
+                } => {
+                    let args = crate::tool_display::compact_args(&arguments);
+                    let args_str = if args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", truncate(&args, 96))
+                    };
+                    writeln!(stdout, "\n▸ {tool_name}{args_str}")?;
+                    stdout.flush()?;
+                }
                 AgentEvent::ToolUpdate { .. } => {}
                 AgentEvent::ToolEnd { result, .. } => {
                     if result.is_error {
                         writeln!(stdout, "[Tool error: {}]", result.content)?;
-                        stdout.flush()?;
+                    } else {
+                        writeln!(stdout, "{}", result.content)?;
                     }
+                    stdout.flush()?;
                 }
                 AgentEvent::ToolConfirmRequired {
                     tool_call_id,

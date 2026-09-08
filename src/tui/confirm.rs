@@ -1,5 +1,5 @@
+use crate::tool_display::truncate_str;
 use crate::tui::app::PendingConfirmation;
-use crate::tui::ui::truncate_str;
 
 /// 格式化工具二次确认 modal 文本：
 /// 第 1 行：工具名

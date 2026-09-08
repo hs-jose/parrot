@@ -2,8 +2,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
-use serde_json::Value;
 
+use crate::tool_display::{compact_args, truncate_str};
 use crate::tui::app::{App, ChatEntry, Mode};
 use crate::tui::confirm::format_confirmation;
 
@@ -353,24 +353,6 @@ fn entry_lines(e: &ChatEntry, selected_tool: Option<&str>, lines: &mut Vec<Line<
     }
 }
 
-/// 将工具参数压缩成单行展示串：单字段对象直接取值（如 `{"path":"x"}` → `x`），
-/// 多字段对象退化为紧凑 JSON，由调用方再截断。
-fn compact_args(args: &Value) -> String {
-    if args.is_null() {
-        return String::new();
-    }
-    if let Some(obj) = args.as_object() {
-        if obj.len() == 1 {
-            if let Some(v) = obj.values().next() {
-                if let Some(s) = v.as_str() {
-                    return s.to_string();
-                }
-            }
-        }
-    }
-    serde_json::to_string(args).unwrap_or_default()
-}
-
 /// 将正文按行展开 + 柔和正文色。连续空行压缩为一行,行首/行尾的
 /// 空行去掉,避免"空行刷屏"和与消息间空行叠加。
 fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
@@ -521,17 +503,6 @@ fn spinner_frame() -> &'static str {
     FRAMES[(ms / 100) as usize % FRAMES.len()]
 }
 
-/// 按字符数截断（超出补 `…`）。ui 渲染与 confirm modal 共用。
-pub(crate) fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
-    }
-}
-
 fn draw_confirm_modal(f: &mut ratatui::Frame<'_>, area: Rect, text: &str) {
     let width = 60.min(area.width);
     let height = 14.min(area.height);
@@ -587,6 +558,7 @@ mod tests {
     use parrot_protocol::SessionId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use serde_json::Value;
 
     #[test]
     fn compact_args_single_field_object_uses_value() {
