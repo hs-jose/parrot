@@ -52,6 +52,9 @@ pub async fn register_all(registry: &ToolRegistry, config: &AppConfig) {
         registry
             .register(std::sync::Arc::new(file_write::FileWriteTool::new()))
             .await;
+        registry
+            .register(std::sync::Arc::new(file_edit::FileEditTool::new()))
+            .await;
     }
 
     if config.tools.shell_allowed {
@@ -64,5 +67,27 @@ pub async fn register_all(registry: &ToolRegistry, config: &AppConfig) {
         registry
             .register(std::sync::Arc::new(web_fetch::WebFetchTool::new()))
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ToolRegistry / register_all 经 `use super::*;` 继承自 lib.rs 顶层。
+    use super::*;
+    use parrot_config::AppConfig;
+
+    #[tokio::test]
+    async fn file_edit_gated_by_file_write_allowed() {
+        let mut config = AppConfig::default_config();
+        config.tools.file_write_allowed = false;
+        let registry = ToolRegistry::new();
+        register_all(&registry, &config).await;
+        assert!(registry.get("file_edit").await.is_none());
+
+        let mut config = AppConfig::default_config();
+        config.tools.file_write_allowed = true;
+        let registry = ToolRegistry::new();
+        register_all(&registry, &config).await;
+        assert!(registry.get("file_edit").await.is_some());
     }
 }
