@@ -115,3 +115,18 @@ fn replay_no_streaming_text_after_flush() {
     // After replaying all events, no in-progress streaming text should remain.
     assert!(app.streaming_text().is_none() || app.streaming_text().unwrap().is_empty());
 }
+
+#[test]
+fn replay_tool_entries_default_compact() {
+    let events = load_fixture("multi_turn_session");
+    let sid: SessionId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+    let mut app = App::new(sid);
+    replay(&mut app, &events);
+
+    match &app.entries[4] {
+        ChatEntry::Tool { expanded, .. } => {
+            assert!(!expanded, "History replay 重建的工具条目应默认紧凑");
+        }
+        other => panic!("expected Tool entry, got {:?}", other),
+    }
+}
