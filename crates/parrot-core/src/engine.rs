@@ -7,7 +7,7 @@ use crate::event_log::EventLog;
 use crate::hooks::{HookEvent, HookExecution, HookRegistry, HookResult};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
-use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool::{SharedFilesRead, ToolContext, ToolRegistry};
 use crate::tool_output::truncate_tool_content;
 use crate::types::{ChatMessage, ChatRole, GenerateConfig, ToolCallInfo as CoreToolCallInfo};
 use parrot_protocol::agent_event::{
@@ -16,6 +16,7 @@ use parrot_protocol::agent_event::{
 };
 use parrot_protocol::types::{ConfirmDecision, Usage};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
@@ -58,6 +59,9 @@ pub struct ReActEngine {
     /// `shutdown_all` 可在触发干净退出路径前把原因改成 `DaemonShutdown`。
     /// 默认 `ClientDisconnect`；`run()` 的 `None` 分支在通道正常关闭时重置。
     end_reason: Arc<Mutex<AgentEndReason>>,
+    /// 本会话已成功 file_read 过的文件集合（`ToolContext.files_read` 的
+    /// 数据源）。resume 创建新 engine → 集合为空，模型必须重读。
+    files_read: SharedFilesRead,
 }
 
 impl ReActEngine {
@@ -91,6 +95,7 @@ impl ReActEngine {
             context_limits: ContextLimits::default(),
             hooks: Arc::new(HookRegistry::empty()),
             end_reason: Arc::new(Mutex::new(AgentEndReason::ClientDisconnect)),
+            files_read: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -691,7 +696,8 @@ impl ReActEngine {
             return Ok(());
         }
 
-        let tool_ctx = ToolContext::new(self.working_dir.clone(), 10 * 1024 * 1024);
+        let tool_ctx = ToolContext::new(self.working_dir.clone(), 10 * 1024 * 1024)
+            .with_files_read(Arc::clone(&self.files_read));
 
         let needs_confirm = self
             .confirm_config
