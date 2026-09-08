@@ -3,10 +3,11 @@ use parrot_core::error::AgentError;
 use parrot_core::tool::{Tool, ToolContext, ToolOutput};
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct FileReadTool;
 
 impl FileReadTool {
-    pub fn new(_working_dir: std::path::PathBuf, _max_file_size: u64) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -43,19 +44,9 @@ impl Tool for FileReadTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let path_str = arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::ToolExecution {
-                tool: "file_read".to_string(),
-                message: "Missing 'path' argument".to_string(),
-            })?;
+        let path_str = super::str_arg(&arguments, "path", "file_read")?;
 
-        let path = if std::path::Path::new(path_str).is_absolute() {
-            std::path::PathBuf::from(path_str)
-        } else {
-            ctx.working_dir.join(path_str)
-        };
+        let path = super::resolve_arg_path(path_str, &ctx.working_dir);
 
         let metadata = std::fs::metadata(&path).map_err(|e| AgentError::ToolExecution {
             tool: "file_read".to_string(),

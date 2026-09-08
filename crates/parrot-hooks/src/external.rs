@@ -1,12 +1,12 @@
-//! ExternalHook: invokes a user-supplied child process per hook event.
+//! ExternalHook：每个 hook 事件调用一次用户提供的子进程。
 //!
-//! Lifecycle: spawn child → write JSON envelope to stdin (tokio writer task)
-//! → await stdout with timeout → parse last non-empty line as JSON action →
-//! fail-open `Err(AgentError::ExternalHook{...})` on any failure.
+//! 生命周期：spawn 子进程 → 把 JSON 信封写进 stdin（tokio writer 任务）
+//! → 带 timeout 等 stdout → 把最后一个非空行解析成 JSON action →
+//! 任何失败都 fail-open 返回 `Err(AgentError::ExternalHook{...})`。
 //!
-//! Strict separation of concerns:
-//! - `parse_points` and `parse_action` are pure fns, unit-tested below.
-//! - `build_envelope` is pure; serialization happens in `handle`.
+//! 关注点严格分离：
+//! - `parse_points` 与 `parse_action` 是纯函数，下方有单元测试。
+//! - `build_envelope` 是纯函数；序列化发生在 `handle` 里。
 
 use parrot_config::ExternalHookConfig;
 use parrot_core::error::AgentError;
@@ -14,9 +14,9 @@ use parrot_core::hooks::{Hook, HookAction, HookCtx, HookEvent, HookPoints};
 use std::path::Path;
 use std::time::Duration;
 
-/// Discriminator enum for the wire JSON returned by the child process.
-/// Tag is `action` (not `kind`, which is HookAction's serde tag) — matches
-/// hook author intuition: `{"action": "block", "reason": "..."}`.
+/// 子进程返回的线上 JSON 的判别枚举。tag 是 `action`（不是 `kind`，
+/// 后者是 HookAction 的 serde tag）——贴合 hook 作者直觉：
+/// `{"action": "block", "reason": "..."}`。
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum WireAction {
@@ -60,12 +60,12 @@ pub struct ExternalHook {
 }
 
 impl ExternalHook {
-    /// Build an `ExternalHook` from config. Unknown `events` strings return
-    /// `Err`; the caller (`build_registry`) converts that to a warn + skip.
-    pub fn new(cfg: &ExternalHookConfig, _global_timeout: Duration) -> Result<Self, String> {
+    /// 从配置构建 `ExternalHook`。未知的 `events` 字符串返回 `Err`，
+    /// 调用方（`build_registry`）把它转成 warn + 跳过。
+    pub fn new(cfg: &ExternalHookConfig) -> Result<Self, String> {
         let points = parse_points(&cfg.events)?;
         let timeout_override = cfg.timeout_seconds.map(|s| Duration::from_secs(s.max(1)));
-        let config = toml_to_json(&cfg.config)?;
+        let config = serde_json::to_value(&cfg.config).map_err(|e| format!("toml->json: {e}"))?;
         Ok(Self {
             id: cfg.id.clone(),
             command: cfg.command.clone(),
@@ -73,10 +73,6 @@ impl ExternalHook {
             timeout_override,
             config,
         })
-    }
-
-    fn resolve_timeout(&self, ctx: &HookCtx<'_>) -> Duration {
-        self.timeout_override.unwrap_or(ctx.timeout)
     }
 }
 
@@ -98,7 +94,7 @@ impl Hook for ExternalHook {
         use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
 
-        let timeout = self.resolve_timeout(ctx);
+        let timeout = self.timeout_override.unwrap_or(ctx.timeout);
         let timeout_ms = timeout.as_millis() as u64;
         let envelope = build_envelope(&event, &self.config, &self.id, ctx.working_dir, timeout_ms);
         let envelope_str =
@@ -114,9 +110,9 @@ impl Hook for ExternalHook {
             });
         }
 
-        // kill_on_drop(true) ensures child is SIGKILL'd+reaped when the
-        // timeout future is dropped (the timeout branch can't reach child
-        // because wait_with_output consumes by ownership).
+        // kill_on_drop(true)：超时 future 被 drop 时确保子进程被
+        // SIGKILL 并收割（超时分支拿不到 child，因为 wait_with_output
+        // 按所有权消费它）。
         let mut child = Command::new(&self.command[0])
             .args(&self.command[1..])
             .stdin(std::process::Stdio::piped())
@@ -129,9 +125,9 @@ impl Hook for ExternalHook {
                 detail: format!("spawn: {e}"),
             })?;
 
-        // writer task: feed JSON envelope into stdin then close. Best-effort
-        // (writer task errors are ignored). Closes stdin on drop, unblocking
-        // the child's stdin reads if any.
+        // writer 任务：把 JSON 信封写进 stdin 然后关闭。尽力而为
+        // （writer 任务的错误被忽略）。drop 时关闭 stdin，若有子进程
+        // 在读 stdin 则解除其阻塞。
         let stdin = child.stdin.take().expect("piped");
         let envelope_bytes = format!("{}\n", envelope_str).into_bytes();
         let writer_handle: tokio::task::JoinHandle<std::io::Result<()>> =
@@ -140,8 +136,8 @@ impl Hook for ExternalHook {
                 stdin.write_all(&envelope_bytes).await
             });
 
-        // await output with timeout. wait_with_output consumes `child`;
-        // kill_on_drop(true) handles cleanup if the future is cancelled.
+        // 带 timeout 等输出。wait_with_output 会消费 `child`；
+        // future 被取消时由 kill_on_drop(true) 负责清理。
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
@@ -153,7 +149,7 @@ impl Hook for ExternalHook {
                 });
             }
             Err(_) => {
-                // Inner future (owning child) dropped here; child killed on drop.
+                // 内层 future（持有 child）在此被 drop；child 随 drop 被杀。
                 let _ = writer_handle.await;
                 self.log_stderr(Vec::new());
                 return Err(AgentError::ExternalHook {
@@ -182,17 +178,16 @@ impl Hook for ExternalHook {
 }
 
 impl ExternalHook {
-    /// Truncate child-process stderr to 4KB and forward via tracing::warn.
-    /// Empty stderr is silently dropped. Successful hook output isn't logged
-    /// here; stdout was already consumed by parse_action.
+    /// 把子进程 stderr 截到 4KB 后经 tracing::warn 转发。空 stderr 静默
+    /// 丢弃。hook 成功输出不在这里记日志——stdout 已被 parse_action 消费。
     fn log_stderr(&self, stderr: Vec<u8>) {
         let stderr = String::from_utf8_lossy(&stderr);
         if stderr.is_empty() {
             return;
         }
         let trimmed = if stderr.len() > 4096 {
-            // Find the last char boundary <= 4096 to avoid panicking on
-            // multi-byte UTF-8 (e.g., Chinese/emoji in hook stderr).
+            // 找 <= 4096 的最后一个字符边界，避免多字节 UTF-8
+            // （如 hook stderr 里的中文/emoji）导致 panic。
             let mut end = 4096;
             while end > 0 && !stderr.is_char_boundary(end) {
                 end -= 1;
@@ -214,16 +209,7 @@ impl ExternalHook {
     }
 }
 
-/// Convert `toml::Value` to `serde_json::Value` via serde Serialize bridge.
-/// `toml::Value` and `serde_json::Value` both implement Serialize; the
-/// serde serializer walks the toml tree and emits a parallel json tree.
-/// Datetime variants serialize as strings (toml's own Datetime Serialize
-/// impl emits ISO strings).
-fn toml_to_json(v: &toml::Value) -> Result<serde_json::Value, String> {
-    serde_json::to_value(v).map_err(|e| format!("toml->json: {e}"))
-}
-
-/// Pure: parse HookPoints bitflag from event-kind strings.
+/// 纯函数：把 event-kind 字符串解析成 HookPoints 位标志。
 pub(crate) fn parse_points(events: &[String]) -> Result<HookPoints, String> {
     let mut p = HookPoints::empty();
     for ev in events {
@@ -242,8 +228,8 @@ pub(crate) fn parse_points(events: &[String]) -> Result<HookPoints, String> {
     Ok(p)
 }
 
-/// Pure: parse the last non-empty line of stdout into a HookAction.
-/// Empty / whitespace-only input ⇒ `Ok(HookAction::NoOp)` (silent allow).
+/// 纯函数：把 stdout 最后一个非空行解析成 HookAction。
+/// 空/纯空白输入 ⇒ `Ok(HookAction::NoOp)`（静默放行）。
 pub(crate) fn parse_action(last_line: &str) -> Result<HookAction, String> {
     let trimmed = last_line.trim();
     if trimmed.is_empty() {
@@ -254,8 +240,8 @@ pub(crate) fn parse_action(last_line: &str) -> Result<HookAction, String> {
     Ok(wire.into_hook_action())
 }
 
-/// Pure: build the JSON envelope written to the child process's stdin.
-/// Returned `Value` is `to_string`'d by `handle`; no IO here.
+/// 纯函数：构造写到子进程 stdin 的 JSON 信封。返回的 `Value` 由
+/// `handle` 做 `to_string`；此处无 IO。
 pub(crate) fn build_envelope(
     event: &HookEvent<'_>,
     config: &serde_json::Value,
@@ -273,7 +259,7 @@ pub(crate) fn build_envelope(
     })
 }
 
-/// Helper: take last non-empty line from a byte buffer. Pure.
+/// 辅助：从字节缓冲取最后一个非空行。纯函数。
 fn last_non_empty_line(stdout: &[u8]) -> &str {
     let s = std::str::from_utf8(stdout).unwrap_or("");
     s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")
@@ -330,13 +316,7 @@ mod tests {
     }
 
     fn sample_msg(role: ChatRole, content: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: content.into(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-        }
+        ChatMessage::new(role, content)
     }
 
     #[test]
@@ -447,7 +427,7 @@ mod tests {
             timeout_seconds: Some(2),
             config: toml::Value::Table(toml::value::Table::new()),
         };
-        let h = ExternalHook::new(&cfg, Duration::from_secs(5)).unwrap();
+        let h = ExternalHook::new(&cfg).unwrap();
         assert_eq!(h.id, "test");
         assert_eq!(h.points, HookPoints::TOOL_CALL | HookPoints::TOOL_RESULT);
         assert_eq!(h.timeout_override, Some(Duration::from_secs(2)));
@@ -462,7 +442,7 @@ mod tests {
             timeout_seconds: None,
             config: toml::Value::Table(toml::value::Table::new()),
         };
-        let err = ExternalHook::new(&cfg, Duration::from_secs(5)).unwrap_err();
+        let err = ExternalHook::new(&cfg).unwrap_err();
         assert!(err.contains("unknown event kind: not_a_real_event"));
     }
 
@@ -475,7 +455,7 @@ mod tests {
             timeout_seconds: Some(0),
             config: toml::Value::Table(toml::value::Table::new()),
         };
-        let h = ExternalHook::new(&cfg, Duration::from_secs(5)).unwrap();
+        let h = ExternalHook::new(&cfg).unwrap();
         assert_eq!(h.timeout_override, Some(Duration::from_secs(1)));
     }
 }

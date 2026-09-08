@@ -1,13 +1,11 @@
-//! Session metadata persistence: `meta.json` per session + global `index.json`.
+//! 会话元数据持久化：每个会话一个 `meta.json` + 全局 `index.json`。
 //!
-//! Lives in the daemon (not `parrot-core`) because it's pure IO and the
-//! design's "core = zero IO" rule says file IO belongs to the daemon. The
-//! engine appends to `events.log` via `EventLog` (a pre-existing core IO
-//! surface that's slated for later refactor); meta/index files are the
-//! daemon's responsibility and are updated synchronously on session creation
-//! and on each turn's `Finished` event.
+//! 放在 daemon（而非 `parrot-core`）是因为它是纯 IO，设计的"core = 零 IO"
+//! 规则规定文件 IO 归属 daemon。引擎经 `EventLog` 追加 `events.log`
+//! （这是既有的 core IO 面，留待后续重构）；meta/index 文件是 daemon 的
+//! 职责，在会话创建和每轮 `Finished` 事件时同步更新。
 //!
-//! See design doc §7 for the file layout and §4.4 for the lifecycle triggers.
+//! 文件布局见设计文档 §7，生命周期触发点见 §4.4。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,12 +20,7 @@ pub struct SessionMeta {
     pub model: String,
     pub provider: String,
     pub title: Option<String>,
-    /// Persisted so `ResumeSession` (Phase 1.5) can reconstruct the exact
-    /// system prompt the session was started with, even across daemon
-    /// restarts. `None` means "use daemon default".
-    pub system_prompt: Option<String>,
     pub total_tokens: u64,
-    pub last_snapshot_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -42,26 +35,23 @@ pub struct SessionIndexEntry {
     pub title: Option<String>,
     pub model: String,
     pub provider: String,
-    /// When the session was first created. Phase 1.5 addition: the wire
-    /// `SessionMeta` exposes `created_at`, and `ListSessions` reads only
-    /// `index.json` (not each session's `meta.json`), so the index must
-    /// carry `created_at` to populate the wire response without N extra
-    /// file reads. Older index.json files (written before this field) are
-    /// tolerated via `#[serde(default)]` — `updated_at` is used as a
-    /// fallback (the read path falls back to `updated_at` when `created_at`
-    /// equals the default epoch).
+    /// 会话首次创建时间。Phase 1.5 补充：线上 `SessionMeta` 暴露
+    /// `created_at`，而 `ListSessions` 只读 `index.json`（不读每个会话的
+    /// `meta.json`），所以索引必须带上 `created_at` 才能免去 N 次额外
+    /// 文件读取。老版本 index.json（无此字段写入）通过
+    /// `#[serde(default)]` 容忍——读取路径在 `created_at` 等于默认纪元
+    /// 时回退用 `updated_at`。
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     pub total_tokens: u64,
 }
 
-/// Manages `meta.json` per session and the global `index.json` under
-/// `{data_dir}/sessions/`. All writes use the atomic
-/// "write-to-tmp-then-rename" pattern so a crash never leaves a half-written
-/// file — the design doc §7 explicitly calls this out.
+/// 管理 `{data_dir}/sessions/` 下的每个会话 `meta.json` 与全局
+/// `index.json`。所有写入都走"写临时文件再 rename"的原子模式，崩溃
+/// 不会留下半截文件——设计文档 §7 明确要求这一点。
 pub struct SessionStore {
-    /// Path to the sessions root, e.g. `{data_dir}/parrot/sessions`.
+    /// 会话根目录路径，如 `{data_dir}/parrot/sessions`。
     sessions_dir: PathBuf,
 }
 
@@ -70,52 +60,37 @@ impl SessionStore {
         Self { sessions_dir }
     }
 
-    /// Path to the sessions root directory (`{data_dir}/parrot/sessions/`).
-    /// Exposed so the daemon can derive per-session paths (e.g. for
-    /// `EventLog::replay` when handling `GetHistory`).
+    /// 会话根目录路径（`{data_dir}/parrot/sessions/`）。暴露给 daemon
+    /// 派生单会话路径（如处理 `GetHistory` 时的 `EventLog::replay`）。
     pub fn sessions_dir(&self) -> PathBuf {
         self.sessions_dir.clone()
     }
 
-    /// Ensure the sessions directory exists. Call once at daemon startup.
+    /// 确保会话目录存在。daemon 启动时调用一次。
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.sessions_dir)
     }
 
-    /// Write the initial `meta.json` for a freshly-created session and add
-    /// an entry to `index.json`. Idempotent on the meta file (a second call
-    /// with the same id overwrites the meta — used to fix up missing fields).
+    /// 为新建会话写入初始 `meta.json` 并在 `index.json` 里加条目。
+    /// 对 meta 文件幂等（同 id 二次调用会覆盖——用于补齐缺失字段）。
     pub fn init_session(
         &self,
         id: Uuid,
         model: &str,
         provider: &str,
-        system_prompt: Option<&str>,
     ) -> std::io::Result<SessionMeta> {
         self.ensure_dir()?;
         let session_dir = self.sessions_dir.join(id.to_string());
         std::fs::create_dir_all(&session_dir)?;
 
-        let now = Utc::now();
-        let meta = SessionMeta {
-            id,
-            created_at: now,
-            updated_at: now,
-            model: model.to_string(),
-            provider: provider.to_string(),
-            title: None,
-            system_prompt: system_prompt.map(str::to_string),
-            total_tokens: 0,
-            last_snapshot_seq: 0,
-        };
+        let meta = fresh_meta(id, model, provider, Utc::now());
         self.write_meta_atomic(&meta)?;
         self.upsert_index_entry(&meta)?;
         Ok(meta)
     }
 
-    /// Read the `meta.json` for a session. Returns `Ok(None)` if the file
-    /// doesn't exist (e.g. session was created before meta.json support was
-    /// added, or the id is bogus).
+    /// 读取某会话的 `meta.json`。文件不存在时返回 `Ok(None)`
+    /// （比如会话创建于 meta.json 支持加入之前，或 id 无效）。
     pub fn read_meta(&self, id: Uuid) -> std::io::Result<Option<SessionMeta>> {
         let path = self.meta_path(id);
         if !path.exists() {
@@ -128,21 +103,13 @@ impl SessionStore {
         }
     }
 
-    /// Apply `f` to the current meta (or an empty default if missing) and
-    /// persist the result. Also updates the index entry. Used by the relay
-    /// task on `Finished` events to bump `updated_at` / `total_tokens`.
+    /// 对当前 meta（缺失时用空默认值）应用 `f` 并持久化结果，同时更新
+    /// 索引条目。relay 任务在 `Finished` 事件上用它更新
+    /// `updated_at` / `total_tokens`。
     pub fn update_meta(&self, id: Uuid, f: impl FnOnce(&mut SessionMeta)) -> std::io::Result<()> {
-        let mut meta = self.read_meta(id)?.unwrap_or_else(|| SessionMeta {
-            id,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            model: String::new(),
-            provider: String::new(),
-            title: None,
-            system_prompt: None,
-            total_tokens: 0,
-            last_snapshot_seq: 0,
-        });
+        let mut meta = self
+            .read_meta(id)?
+            .unwrap_or_else(|| fresh_meta(id, "", "", Utc::now()));
         f(&mut meta);
         self.write_meta_atomic(&meta)?;
         self.upsert_index_entry(&meta)?;
@@ -169,11 +136,7 @@ impl SessionStore {
     }
 
     fn write_meta_atomic(&self, meta: &SessionMeta) -> std::io::Result<()> {
-        let path = self.meta_path(meta.id);
-        let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(meta).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp, json)?;
-        atomic_rename(&tmp, &path)
+        write_json_atomic(&self.meta_path(meta.id), meta)
     }
 
     fn upsert_index_entry(&self, meta: &SessionMeta) -> std::io::Result<()> {
@@ -186,9 +149,8 @@ impl SessionStore {
             title: meta.title.clone(),
             model: meta.model.clone(),
             provider: meta.provider.clone(),
-            // Preserve the original `created_at` if this entry already
-            // exists (we're updating, not creating). Otherwise seed it from
-            // the meta's `created_at`.
+            // 条目已存在（更新而非创建）时保留原 `created_at`；
+            // 否则用 meta 的 `created_at` 播种。
             created_at: Some(
                 index
                     .sessions
@@ -205,24 +167,37 @@ impl SessionStore {
         } else {
             index.sessions.push(entry);
         }
-        // Keep newest-first for friendlier `ListSessions` output.
+        // 最新在前，`ListSessions` 输出更友好。
         index
             .sessions
             .sort_by_key(|b| std::cmp::Reverse(b.updated_at));
 
-        let path = self.sessions_dir.join("index.json");
-        let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(&index).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp, json)?;
-        atomic_rename(&tmp, &path)
+        write_json_atomic(&self.sessions_dir.join("index.json"), &index)
     }
 }
 
-fn atomic_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
-    // On Windows, `std::fs::rename` overwrites the destination if it exists
-    // (since 1.51+). On Unix, `rename` is atomic by POSIX. Either way this
-    // is the canonical "atomic write" pattern.
-    std::fs::rename(src, dst)
+/// 新建会话的 `SessionMeta` 初始值。`update_meta` 在 meta 缺失时的
+/// 兜底也复用它（model/provider 传空串）。
+fn fresh_meta(id: Uuid, model: &str, provider: &str, now: DateTime<Utc>) -> SessionMeta {
+    SessionMeta {
+        id,
+        created_at: now,
+        updated_at: now,
+        model: model.to_string(),
+        provider: provider.to_string(),
+        title: None,
+        total_tokens: 0,
+    }
+}
+
+/// 原子写 JSON：先写临时文件再 rename。Windows 上 rename 会覆盖已存在的
+/// 目标（Rust 1.51+ 起），Unix 上 rename 由 POSIX 保证原子——两端皆是
+/// 标准的原子写模式。
+fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -235,12 +210,11 @@ mod tests {
         let store = SessionStore::new(tmp.path().to_path_buf());
         let id = Uuid::new_v4();
         let meta = store
-            .init_session(id, "claude-sonnet-4-6", "anthropic", Some("be helpful"))
+            .init_session(id, "claude-sonnet-4-6", "anthropic")
             .unwrap();
         assert_eq!(meta.id, id);
         assert_eq!(meta.model, "claude-sonnet-4-6");
         assert_eq!(meta.provider, "anthropic");
-        assert_eq!(meta.system_prompt.as_deref(), Some("be helpful"));
         assert_eq!(meta.total_tokens, 0);
 
         let read_back = store.read_meta(id).unwrap().unwrap();
@@ -253,7 +227,7 @@ mod tests {
         let store = SessionStore::new(tmp.path().to_path_buf());
         let id = Uuid::new_v4();
         store
-            .init_session(id, "claude-sonnet-4-6", "anthropic", None)
+            .init_session(id, "claude-sonnet-4-6", "anthropic")
             .unwrap();
 
         store
@@ -274,10 +248,10 @@ mod tests {
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
         store
-            .init_session(id1, "claude-sonnet-4-6", "anthropic", None)
+            .init_session(id1, "claude-sonnet-4-6", "anthropic")
             .unwrap();
         store
-            .init_session(id2, "claude-haiku-3-5", "anthropic", None)
+            .init_session(id2, "claude-haiku-3-5", "anthropic")
             .unwrap();
 
         let index = store.read_index().unwrap();

@@ -1,7 +1,6 @@
 use chrono::Local;
 use parrot_protocol::agent_event::{
-    AgentEndReason, AgentEvent, MessageDeltaPayload, PersistedAgentEvent, ToolCallInfo,
-    TurnStopReason,
+    AgentEndReason, AgentEvent, MessageDeltaPayload, PersistedAgentEvent, TurnStopReason,
 };
 use parrot_protocol::types::{ConfirmDecision, ToolOutput, Usage};
 use parrot_protocol::{ServerMessage, SessionId};
@@ -66,7 +65,6 @@ pub(crate) struct App {
     /// 对话区可视高度（上次 draw 时记录），用于半页滚动。
     pub view_height: u16,
     cur_assistant_text: HashMap<Uuid, String>,
-    cur_assistant_tools: HashMap<Uuid, Vec<ToolCallInfo>>,
     cur_assistant_completed: HashMap<Uuid, bool>,
     current_message_id: Option<Uuid>,
     /// 模型名（来自 `AgentStart`），用于状态栏展示。
@@ -79,6 +77,8 @@ pub(crate) struct App {
     turn_active: bool,
     /// 正在执行、尚未 `ToolEnd` 的工具数量。
     tools_in_flight: u32,
+    /// 上下文压缩摘要调用进行中（`CompactionStart` → `CompactionSummary`/`TurnStart`）。
+    pub compacting: bool,
 }
 
 impl App {
@@ -92,7 +92,6 @@ impl App {
             scroll_offset: 0,
             view_height: 0,
             cur_assistant_text: HashMap::new(),
-            cur_assistant_tools: HashMap::new(),
             cur_assistant_completed: HashMap::new(),
             current_message_id: None,
             model: String::new(),
@@ -100,6 +99,7 @@ impl App {
             total_usage: Usage::default(),
             turn_active: false,
             tools_in_flight: 0,
+            compacting: false,
         }
     }
 
@@ -119,10 +119,8 @@ impl App {
         self.turn_active
     }
 
-    /// Cap the distance-from-bottom scroll offset at the visible scroll range.
-    /// Called from `draw_entries`, which is the only place the real range is
-    /// known. Prevents PgUp overshoot from requiring many PgDn presses to get
-    /// back to the bottom.
+    /// 把"距底部滚动偏移"限制在可视滚动范围内。由 `draw_entries` 调用——
+    /// 只有它知道真实范围。避免 PgUp 冲过头后要按很多次 PgDn 才能回底部。
     pub fn clamp_scroll(&mut self, max: u16) {
         self.scroll_offset = self.scroll_offset.min(max);
     }
@@ -195,9 +193,9 @@ impl App {
             } => {
                 self.model = model;
                 self.provider = provider;
-                // A new AgentStart means the session lifecycle has restarted
-                // (e.g. after a resume). Clear any previous AgentEnd marker so
-                // subsequent turns are processed instead of quitting the TUI.
+                // 新的 AgentStart 意味着会话生命周期重新开始
+                // （如 resume 之后）。清掉上一次的 AgentEnd 标记，
+                // 让后续 turn 正常处理而不是退出 TUI。
                 self.ended = false;
             }
             AgentEvent::AgentEnd {
@@ -218,6 +216,7 @@ impl App {
             AgentEvent::TurnStart { user_message, .. } => {
                 self.turn_active = true;
                 self.tools_in_flight = 0;
+                self.compacting = false;
                 self.entries.push(ChatEntry::User {
                     text: user_message,
                     time: stamp(),
@@ -252,7 +251,6 @@ impl App {
                 self.flush_open_assistant();
                 self.current_message_id = Some(message_id);
                 self.cur_assistant_text.insert(message_id, String::new());
-                self.cur_assistant_tools.insert(message_id, Vec::new());
                 self.cur_assistant_completed.insert(message_id, false);
             }
             AgentEvent::MessageDelta {
@@ -271,11 +269,9 @@ impl App {
             AgentEvent::MessageEnd {
                 message_id,
                 final_content,
-                tool_calls,
                 ..
             } => {
                 self.cur_assistant_text.insert(message_id, final_content);
-                self.cur_assistant_tools.insert(message_id, tool_calls);
                 self.cur_assistant_completed.insert(message_id, true);
                 self.flush_open_assistant();
             }
@@ -334,6 +330,18 @@ impl App {
                 )));
             }
             AgentEvent::HookFired { .. } => {}
+            AgentEvent::CompactionStart { .. } => {
+                self.compacting = true;
+            }
+            AgentEvent::CompactionSummary {
+                dropped_message_count,
+                ..
+            } => {
+                self.compacting = false;
+                self.entries.push(ChatEntry::Warning(format!(
+                    "上下文已压缩：{dropped_message_count} 条历史消息已生成结构化摘要"
+                )));
+            }
         }
     }
 
@@ -348,7 +356,6 @@ impl App {
         }
         for mid in completed_ids {
             if let Some(text) = self.cur_assistant_text.remove(&mid) {
-                let _tools = self.cur_assistant_tools.remove(&mid);
                 self.cur_assistant_completed.remove(&mid);
                 self.entries.push(ChatEntry::Assistant {
                     text,
@@ -366,22 +373,20 @@ impl App {
     /// 没有等到 MessageEnd 的残留，并重置 current_message_id。
     fn discard_incomplete_assistant(&mut self) {
         self.cur_assistant_text.clear();
-        self.cur_assistant_tools.clear();
         self.cur_assistant_completed.clear();
         self.current_message_id = None;
     }
 
-    /// Load persisted events (from GetHistory) into the app, rebuilding
-    /// entries as if the events had been received live. Used when resuming
-    /// an existing session so the TUI shows prior conversation.
+    /// 把持久化事件（来自 GetHistory）灌进 app，像实时收到一样重建
+    /// entries。resume 已有会话时使用，让 TUI 显示历史对话。
     pub fn load_history(&mut self, events: &[PersistedAgentEvent]) {
         for ev in events {
             self.apply_event(ev.event.clone());
         }
     }
 
-    /// Returns the accumulated text of the in-progress assistant message,
-    /// if any. Used by the UI to render streaming text before MessageEnd.
+    /// 返回进行中的 assistant 消息已累积文本（若有）。UI 在 MessageEnd
+    /// 之前用它渲染流式文本。
     pub fn streaming_text(&self) -> Option<&str> {
         self.current_message_id
             .and_then(|mid| self.cur_assistant_text.get(&mid))
@@ -461,7 +466,7 @@ mod tests {
         for ev in evs {
             app.apply_event(ev);
         }
-        // flush happens on TurnEnd; 模拟 TurnEnd 触发
+        // flush 在 TurnEnd 时发生；模拟 TurnEnd 触发
         app.apply_event(AgentEvent::TurnEnd {
             session_id: sid_v,
             turn_id: Uuid::new_v4(),
@@ -574,7 +579,7 @@ mod tests {
         let sid_v = sid();
         let mut app = App::new(sid_v);
 
-        // History load replays an old AgentEnd from a previous disconnect.
+        // 历史加载会回放上一次断连留下的旧 AgentEnd。
         app.apply_event(AgentEvent::AgentEnd {
             session_id: sid_v,
             reason: AgentEndReason::ClientClose,
@@ -585,7 +590,7 @@ mod tests {
         });
         assert!(app.ended);
 
-        // Resumed engine emits a new AgentStart.
+        // resume 后的引擎发来新的 AgentStart。
         let should_quit = app.apply_server_message(ServerMessage::AgentEvent {
             event: AgentEvent::AgentStart {
                 session_id: sid_v,
@@ -598,7 +603,7 @@ mod tests {
         assert!(!should_quit);
         assert!(!app.ended);
 
-        // New user turn should then be processed normally.
+        // 之后的新用户 turn 应正常处理。
         let should_quit = app.apply_server_message(ServerMessage::AgentEvent {
             event: AgentEvent::TurnStart {
                 session_id: sid_v,
@@ -721,5 +726,58 @@ mod tests {
         app.scroll_up(100);
         app.scroll_to_bottom();
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn compaction_start_and_summary_toggle_compacting() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.apply_event(AgentEvent::CompactionStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+        });
+        assert!(app.compacting);
+        app.apply_event(AgentEvent::CompactionSummary {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            summary: "[CONVERSATION SUMMARY]\n...".into(),
+            dropped_message_count: 6,
+            kept_message_count: 4,
+        });
+        assert!(!app.compacting);
+
+        app.apply_event(AgentEvent::CompactionStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+        });
+        assert!(app.compacting);
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            user_message: "hi".into(),
+        });
+        assert!(
+            !app.compacting,
+            "TurnStart clears compacting (failure path)"
+        );
+    }
+
+    #[test]
+    fn compaction_summary_pushes_warning_entry() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.apply_event(AgentEvent::CompactionSummary {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            summary: "[CONVERSATION SUMMARY]\n...".into(),
+            dropped_message_count: 6,
+            kept_message_count: 4,
+        });
+        match app.entries.last() {
+            Some(ChatEntry::Warning(text)) => {
+                assert!(text.contains("6"), "warning mentions dropped count: {text}");
+            }
+            other => panic!("expected Warning entry, got {:?}", other),
+        }
     }
 }

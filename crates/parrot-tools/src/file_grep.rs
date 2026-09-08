@@ -4,10 +4,11 @@ use parrot_core::tool::{Tool, ToolContext, ToolOutput};
 use regex::Regex;
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct FileGrepTool;
 
 impl FileGrepTool {
-    pub fn new(_working_dir: std::path::PathBuf) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -44,13 +45,7 @@ impl Tool for FileGrepTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let pattern_str = arguments
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::ToolExecution {
-                tool: "file_grep".to_string(),
-                message: "Missing 'pattern' argument".to_string(),
-            })?;
+        let pattern_str = super::str_arg(&arguments, "pattern", "file_grep")?;
 
         let re = Regex::new(pattern_str).map_err(|e| AgentError::ToolExecution {
             tool: "file_grep".to_string(),
@@ -60,19 +55,26 @@ impl Tool for FileGrepTool {
         let base_path = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .map(|p| {
-                if std::path::Path::new(p).is_absolute() {
-                    std::path::PathBuf::from(p)
-                } else {
-                    ctx.working_dir.join(p)
-                }
-            })
+            .map(|p| super::resolve_arg_path(p, &ctx.working_dir))
             .unwrap_or_else(|| ctx.working_dir.clone());
 
         let include_pattern = arguments
             .get("include")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+
+        // include 过滤 glob 只在入口编译一次；编译失败按工具错误返回
+        // （与非法 regex 的处理一致）。
+        let include_glob = if include_pattern.is_empty() {
+            None
+        } else {
+            Some(
+                glob::Pattern::new(include_pattern).map_err(|e| AgentError::ToolExecution {
+                    tool: "file_grep".to_string(),
+                    message: format!("Invalid include pattern '{}': {}", include_pattern, e),
+                })?,
+            )
+        };
 
         let mut results = Vec::new();
         let mut files_searched = 0u32;
@@ -82,7 +84,7 @@ impl Tool for FileGrepTool {
             &base_path,
             &ctx.working_dir,
             &re,
-            include_pattern,
+            include_glob.as_ref(),
             &mut results,
             &mut files_searched,
             max_results,
@@ -109,7 +111,7 @@ fn search_dir(
     dir: &std::path::Path,
     working_dir: &std::path::Path,
     re: &Regex,
-    include_pattern: &str,
+    include_glob: Option<&glob::Pattern>,
     results: &mut Vec<String>,
     files_searched: &mut u32,
     max_results: usize,
@@ -132,7 +134,7 @@ fn search_dir(
         let path = entry.path();
 
         if path.is_dir() {
-            // Skip hidden directories and common non-project dirs
+            // 跳过隐藏目录和常见非项目目录
             if let Some(name) = path.file_name() {
                 let name = name.to_string_lossy();
                 if name.starts_with('.') || name == "target" || name == "node_modules" {
@@ -143,28 +145,21 @@ fn search_dir(
                 &path,
                 working_dir,
                 re,
-                include_pattern,
+                include_glob,
                 results,
                 files_searched,
                 max_results,
             )?;
         } else if path.is_file() {
-            // Apply include filter
-            if !include_pattern.is_empty() {
-                let glob_pat = glob::Pattern::new(include_pattern).ok();
-                match glob_pat {
-                    Some(ref gp) => {
-                        if let Some(fname) = path.file_name() {
-                            if !gp.matches(&fname.to_string_lossy()) {
-                                continue;
-                            }
-                        }
-                    }
-                    None => continue,
+            // 应用 include 过滤
+            if let Some(gp) = include_glob {
+                match path.file_name() {
+                    Some(fname) if gp.matches(&fname.to_string_lossy()) => {}
+                    _ => continue,
                 }
             }
 
-            // Skip large files
+            // 跳过大文件
             if let Ok(metadata) = path.metadata() {
                 if metadata.len() > 1024 * 1024 {
                     continue;

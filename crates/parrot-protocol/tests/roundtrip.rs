@@ -209,6 +209,13 @@ fn agent_event_roundtrip_all_variants() {
                 dangling_tool_call_ids: vec!["tc_1".into()],
             },
         },
+        AgentEvent::CompactionSummary {
+            session_id: sid,
+            turn_id,
+            summary: "[CONVERSATION SUMMARY]\n...".into(),
+            dropped_message_count: 3,
+            kept_message_count: 5,
+        },
     ];
 
     for ev in &variants {
@@ -532,4 +539,43 @@ fn server_shell_result_roundtrip() {
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(msg, decoded);
+}
+
+#[test]
+fn compaction_start_roundtrip() {
+    let sid = uuid::Uuid::new_v4();
+    let msg = AgentEvent::CompactionStart {
+        session_id: sid,
+        turn_id: uuid::Uuid::new_v4(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+    assert!(!msg.is_persistent());
+    assert_eq!(msg.session_id(), sid);
+    assert_eq!(
+        serde_json::to_value(&msg).unwrap()["type"],
+        serde_json::json!("CompactionStart")
+    );
+}
+
+#[test]
+fn compaction_summary_roundtrip() {
+    let sid = uuid::Uuid::new_v4();
+    let msg = AgentEvent::CompactionSummary {
+        session_id: sid,
+        turn_id: uuid::Uuid::new_v4(),
+        summary: "[CONVERSATION SUMMARY]\n## 目标与任务\n...".into(),
+        dropped_message_count: 8,
+        kept_message_count: 4,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+    assert!(msg.is_persistent());
+    assert_eq!(msg.session_id(), sid);
+    assert_eq!(
+        serde_json::to_value(&msg).unwrap()["type"],
+        serde_json::json!("CompactionSummary")
+    );
 }

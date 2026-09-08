@@ -95,6 +95,8 @@ pub(crate) async fn print_stream(
                     stdout.flush()?;
                 }
                 AgentEvent::HookFired { .. } => {}
+                AgentEvent::CompactionStart { .. } => {}
+                AgentEvent::CompactionSummary { .. } => {}
             },
             Some(ServerMessage::Error { message, .. }) => {
                 writeln!(stdout, "\nError: {}", message)?;

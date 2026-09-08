@@ -3,10 +3,11 @@ use parrot_core::error::AgentError;
 use parrot_core::tool::{Tool, ToolContext, ToolOutput};
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct FileWriteTool;
 
 impl FileWriteTool {
-    pub fn new(_working_dir: std::path::PathBuf, _max_file_size: u64) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -39,21 +40,8 @@ impl Tool for FileWriteTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let path_str = arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::ToolExecution {
-                tool: "file_write".to_string(),
-                message: "Missing 'path' argument".to_string(),
-            })?;
-
-        let content = arguments
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::ToolExecution {
-                tool: "file_write".to_string(),
-                message: "Missing 'content' argument".to_string(),
-            })?;
+        let path_str = super::str_arg(&arguments, "path", "file_write")?;
+        let content = super::str_arg(&arguments, "content", "file_write")?;
 
         if content.len() as u64 > ctx.max_file_size_bytes {
             return Ok(ToolOutput {
@@ -66,13 +54,9 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let path = if std::path::Path::new(path_str).is_absolute() {
-            std::path::PathBuf::from(path_str)
-        } else {
-            ctx.working_dir.join(path_str)
-        };
+        let path = super::resolve_arg_path(path_str, &ctx.working_dir);
 
-        // Create parent directories if needed
+        // 父目录不存在则创建
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| AgentError::ToolExecution {
                 tool: "file_write".to_string(),

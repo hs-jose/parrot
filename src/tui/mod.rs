@@ -18,8 +18,8 @@ use parrot_protocol::types::ConfirmDecision;
 use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui_textarea::TextArea;
 use tokio::sync::mpsc;
-use tui_textarea::TextArea;
 
 use crate::conn::Connection;
 use crate::tui::app::Mode;
@@ -30,6 +30,7 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = execute!(
             std::io::stdout(),
             crossterm::event::PopKeyboardEnhancementFlags
@@ -43,7 +44,7 @@ pub(crate) async fn run_tui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = app::App::new(session_id);
 
-    // Load prior conversation history for resumed sessions.
+    // resume 的会话要先加载历史对话。
     conn.sender
         .send(ClientMessage::GetHistory { session_id })
         .await?;
@@ -76,6 +77,7 @@ pub(crate) async fn run_tui(
                 | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
     );
+    let _ = execute!(stdout, crossterm::event::EnableBracketedPaste);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -95,11 +97,8 @@ pub(crate) async fn run_tui(
     )
     .await;
 
-    // teardown (best-effort; don't mask run_loop's error)
-    let _ = disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen);
-    let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+    // 终端状态由 `_raw_guard` 的 Drop 统一恢复（尽力而为，
+    // 不掩盖 run_loop 的错误）。
     result
 }
 
@@ -122,10 +121,19 @@ async fn run_loop(
             Some(ev) = ui_rx.recv() => {
                 match ev {
                     UiEvent::Quit => break,
-                    UiEvent::Resize(_, _) => *dirty = true,
+                    UiEvent::Resize => {
+                        let _ = terminal.clear();
+                        *dirty = true;
+                    }
                     UiEvent::Paste(s) => {
-                        for c in s.chars() {
-                            input.insert_char(c);
+                        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+                        for (i, line) in normalized.split('\n').enumerate() {
+                            if i > 0 {
+                                input.insert_newline();
+                            }
+                            for c in line.chars() {
+                                input.insert_char(c);
+                            }
                         }
                         *dirty = true;
                     }
@@ -187,7 +195,7 @@ async fn run_loop(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                // 50ms tick for cursor/refresh even when no events arrive
+                // 50ms 心跳：没有事件也保持光标/刷新
                 *dirty = true;
             }
         }
@@ -267,14 +275,6 @@ async fn handle_key(
                 app.scroll_down((app.view_height / 2).max(1));
                 Ok(None)
             }
-            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.scroll_up((app.view_height / 2).max(1));
-                Ok(None)
-            }
-            KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.scroll_down((app.view_height / 2).max(1));
-                Ok(None)
-            }
             KeyCode::Home if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.scroll_to_top();
                 Ok(None)
@@ -302,8 +302,8 @@ async fn handle_key(
                 Ok(None)
             }
             _ => {
-                // TextArea handles other keys (cursor/backspace/etc.)
-                input.input(tui_textarea::Input::from(k));
+                // 其余按键交给 TextArea（光标/退格等）
+                input.input(ratatui_textarea::Input::from(k));
                 Ok(None)
             }
         },

@@ -20,11 +20,35 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCallInfo>>,
 }
 
+impl ChatMessage {
+    /// 构造不带工具元数据的消息。工具字段需要时用结构体更新语法补上，
+    /// 例如 `ChatMessage { tool_call_id: Some(id), ..ChatMessage::new(ChatRole::Tool, text) }`。
+    pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCallInfo {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+}
+
+impl From<&parrot_protocol::agent_event::ToolCallInfo> for ToolCallInfo {
+    fn from(tc: &parrot_protocol::agent_event::ToolCallInfo) -> Self {
+        Self {
+            id: tc.tool_call_id.clone(),
+            name: tc.tool_name.clone(),
+            arguments: tc.arguments.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -226,3 +226,79 @@ keep_recent_turns = 6
     let cfg: AppConfig = toml::from_str(toml_str).unwrap();
     assert!(cfg.hooks.external.is_empty());
 }
+
+#[test]
+fn session_compaction_defaults() {
+    let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+    let c: AppConfig = toml::from_str(toml).unwrap();
+    assert!(c.session.compaction);
+    assert!((c.session.compaction_threshold - 0.9).abs() < f32::EPSILON);
+    assert_eq!(c.session.keep_recent_tokens, 20000);
+    assert_eq!(c.session.summary_max_tokens, 4096);
+}
+
+#[test]
+fn session_compaction_overrides() {
+    let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+compaction = false
+compaction_threshold = 0.75
+keep_recent_tokens = 8000
+summary_max_tokens = 2048
+"#;
+    let c: AppConfig = toml::from_str(toml).unwrap();
+    assert!(!c.session.compaction);
+    assert!((c.session.compaction_threshold - 0.75).abs() < f32::EPSILON);
+    assert_eq!(c.session.keep_recent_tokens, 8000);
+    assert_eq!(c.session.summary_max_tokens, 2048);
+}

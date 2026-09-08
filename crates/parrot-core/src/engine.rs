@@ -1,3 +1,6 @@
+use crate::compaction::{
+    apply_summary, build_summary_request, plan_compaction, wrap_summary, ContextLimits,
+};
 use crate::context::ContextManager;
 use crate::error::AgentError;
 use crate::event_log::EventLog;
@@ -5,6 +8,7 @@ use crate::hooks::{HookEvent, HookExecution, HookRegistry, HookResult};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
 use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool_output::truncate_tool_content;
 use crate::types::{ChatMessage, ChatRole, GenerateConfig, ToolCallInfo as CoreToolCallInfo};
 use parrot_protocol::agent_event::{
     AgentEndReason, AgentEvent, IntegrityIssue, MessageDeltaPayload, MessageStopReason,
@@ -17,7 +21,14 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-pub const MAX_REACT_ITERATIONS: u32 = 20;
+const MAX_REACT_ITERATIONS: u32 = 20;
+
+/// 实际生效的上下文裁剪预算：`[session] max_history_tokens` 配置值，
+/// 当 provider 上报模型 context window 时再取二者较小值。配置是主旋钮，
+/// 模型窗口只能收紧。
+fn context_budget(max_history_tokens: u32, model_window: Option<u32>) -> u32 {
+    max_history_tokens.min(model_window.unwrap_or(u32::MAX))
+}
 
 pub struct ReActEngine {
     session_id: Uuid,
@@ -29,19 +40,24 @@ pub struct ReActEngine {
     working_dir: std::path::PathBuf,
     confirm_config: ConfirmConfig,
     initial_context: Vec<ChatMessage>,
-    /// SHA-256 of system_prompt (first 16 bytes hex). Empty when no prompt.
+    /// SHA-256(system_prompt) 前 16 字节的 hex。无 prompt 时为空串。
     system_prompt_hash: String,
-    /// `Some(n)` when this engine was created by a resume that replayed up
-    /// to seq `n`. Emitted in `AgentStart` for client visibility.
+    /// 引擎由 resume 创建、回放到 seq `n` 时为 `Some(n)`。
+    /// 随 `AgentStart` 发给客户端以便观察。
     resumed_from_seq: Option<u64>,
-    /// Set by `with_pending_integrity_warning` when a resume detected
-    /// corruption. Emitted once as `ReplayIntegrityWarning` after
-    /// `AgentStart`, then cleared.
+    /// resume 检测到损坏时由 `with_pending_integrity_warning` 设置。
+    /// 在 `AgentStart` 之后发一次 `ReplayIntegrityWarning` 即清空。
     pending_integrity_warning: Option<IntegrityIssue>,
-    /// The seq the EventLog was at after the resume replay. Used to keep
-    /// `current_seq` continuous when appending new events post-resume.
+    /// resume 回放结束后 EventLog 所在的 seq。resume 后追加新事件时
+    /// 用来保持 `current_seq` 连续。
     resume_seq_offset: u64,
+    /// 上下文限额（`[session]` + 压缩，由 daemon 接线）。
+    context_limits: ContextLimits,
     hooks: Arc<HookRegistry>,
+    /// 与 `SessionManager`（经 `with_end_reason`）共享，未来的
+    /// `shutdown_all` 可在触发干净退出路径前把原因改成 `DaemonShutdown`。
+    /// 默认 `ClientDisconnect`；`run()` 的 `None` 分支在通道正常关闭时重置。
+    end_reason: Arc<Mutex<AgentEndReason>>,
 }
 
 impl ReActEngine {
@@ -54,15 +70,10 @@ impl ReActEngine {
         data_dir: std::path::PathBuf,
         working_dir: std::path::PathBuf,
     ) -> Self {
-        let system_prompt_hash = match &system_prompt {
-            Some(p) => {
-                let mut hasher = Sha256::new();
-                hasher.update(p.as_bytes());
-                let full = hasher.finalize();
-                hex::encode(&full[..16])
-            }
-            None => String::new(),
-        };
+        let system_prompt_hash = system_prompt
+            .as_deref()
+            .map(system_prompt_hash)
+            .unwrap_or_default();
         Self {
             session_id,
             tool_registry,
@@ -77,7 +88,9 @@ impl ReActEngine {
             resumed_from_seq: None,
             pending_integrity_warning: None,
             resume_seq_offset: 0,
+            context_limits: ContextLimits::default(),
             hooks: Arc::new(HookRegistry::empty()),
+            end_reason: Arc::new(Mutex::new(AgentEndReason::ClientDisconnect)),
         }
     }
 
@@ -91,9 +104,8 @@ impl ReActEngine {
         self
     }
 
-    /// Mark this engine as resumed: `resumed_from_seq` is the seq the
-    /// EventLog was at after replay (the next appended event will be seq
-    /// `resumed_from_seq`).
+    /// 标记引擎来自 resume：`resumed_from_seq` 是回放结束后 EventLog 的
+    /// seq（下一个追加的事件编号即此值）。
     pub fn with_resumed_from(mut self, seq: u64) -> Self {
         self.resumed_from_seq = Some(seq);
         self.resume_seq_offset = seq;
@@ -110,6 +122,21 @@ impl ReActEngine {
         self
     }
 
+    /// 覆盖上下文限额。daemon 把 parrot.toml 的 `[session]` 值传进来。
+    pub fn with_context_limits(mut self, limits: ContextLimits) -> Self {
+        self.context_limits = limits;
+        self
+    }
+
+    /// 把引擎的 `end_reason` 槽位与调用方（`SessionManager`）共享。
+    /// `AgentEndGuard` 发 `AgentEnd` 时读的是同一个 `Arc`，因此外部
+    /// （如设置 `DaemonShutdown`）在干净退出路径之前的修改能决定发出的
+    /// 原因。未设置时默认 `ClientDisconnect`。
+    pub fn with_end_reason(mut self, reason: Arc<Mutex<AgentEndReason>>) -> Self {
+        self.end_reason = reason;
+        self
+    }
+
     pub async fn run(
         mut self,
         mut cmd_rx: mpsc::Receiver<SessionCmd>,
@@ -120,16 +147,7 @@ impl ReActEngine {
         let mut context: Vec<ChatMessage> = std::mem::take(&mut self.initial_context);
 
         if let Some(prompt) = &self.system_prompt {
-            context.insert(
-                0,
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: prompt.clone(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: None,
-                },
-            );
+            context.insert(0, ChatMessage::new(ChatRole::System, prompt.clone()));
         }
 
         let mut event_log = EventLog::new(self.data_dir.clone());
@@ -146,10 +164,7 @@ impl ReActEngine {
             system_prompt_hash: self.system_prompt_hash.clone(),
             resumed_from_seq: self.resumed_from_seq,
         };
-        let _ = event_tx.send(agent_start.clone()).await;
-        if let Err(e) = event_log.append(agent_start) {
-            tracing::warn!(error = ?e, "failed to persist AgentStart");
-        }
+        emit_and_persist(&event_tx, &mut event_log, agent_start).await;
 
         let (_result, execs) = self
             .hooks
@@ -171,27 +186,26 @@ impl ReActEngine {
                 session_id,
                 issue: issue.clone(),
             };
-            let _ = event_tx.send(warning.clone()).await;
-            if let Err(e) = event_log.append(warning) {
-                tracing::warn!(error = ?e, "failed to persist ReplayIntegrityWarning");
-            }
+            emit_and_persist(&event_tx, &mut event_log, warning).await;
             tracing::warn!(session_id = %session_id, kind = ?issue.kind, "replay integrity warning emitted");
         }
 
-        let context_manager = ContextManager::new(100_000, 10);
+        // 预算 = min([session] max_history_tokens, 模型 context_window)。
+        // 配置值是主旋钮，模型窗口只能进一步收紧。
+        let model_window = self.resolve_model_context_window().await;
+        let budget = context_budget(self.context_limits.max_history_tokens, model_window);
+        let context_manager = ContextManager::new(budget, self.context_limits.keep_recent_turns);
 
         // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
         // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
         let total_usage: Arc<Mutex<Usage>> = Arc::new(Mutex::new(Usage::default()));
-        let end_reason: Arc<Mutex<AgentEndReason>> =
-            Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
         let event_tx_for_guard = event_tx.clone();
         let guard = AgentEndGuard {
             session_id,
             event_tx: event_tx_for_guard,
             fired: false,
             total_usage: Arc::clone(&total_usage),
-            reason: Arc::clone(&end_reason),
+            reason: Arc::clone(&self.end_reason),
             hooks: Arc::clone(&self.hooks),
             working_dir: self.working_dir.clone(),
         };
@@ -220,26 +234,22 @@ impl ReActEngine {
                                 stop_reason: TurnStopReason::BlockedHook(reason.clone()),
                                 usage: Usage::default(),
                             };
-                            let _ = event_tx.send(turn_end.clone()).await.ok();
-                            let _ = event_log.append(turn_end);
+                            emit_and_persist(&event_tx, &mut event_log, turn_end).await;
                             continue;
                         }
                         HookResult::Inject { messages } => context.extend(messages),
                         _ => {}
                     }
-                    let _ = event_tx
-                        .send(AgentEvent::TurnStart {
-                            session_id,
-                            turn_id,
-                            user_message: message.clone(),
-                        })
-                        .await
-                        .ok();
-                    let _ = event_log.append(AgentEvent::TurnStart {
+                    // 压缩检查在 TurnStart 事件之前(spec §3.1):避免
+                    // CompactionSummary 落入半成品 turn 被 resume 截断丢弃。
+                    self.maybe_compact(&mut context, turn_id, budget, &event_tx, &mut event_log)
+                        .await;
+                    let turn_start = AgentEvent::TurnStart {
                         session_id,
                         turn_id,
                         user_message: message.clone(),
-                    });
+                    };
+                    emit_and_persist(&event_tx, &mut event_log, turn_start).await;
 
                     let turn_result = self
                         .handle_turn(
@@ -274,20 +284,23 @@ impl ReActEngine {
                         stop_reason: stop_reason.clone(),
                         usage: turn_usage.clone(),
                     };
-                    let _ = event_tx.send(turn_end.clone()).await.ok();
-                    let _ = event_log.append(turn_end);
+                    emit_and_persist(&event_tx, &mut event_log, turn_end).await;
                 }
                 Some(SessionCmd::Abort) => {
                     // Top-level abort with no active turn — ignore.
                 }
                 None => {
-                    *end_reason.lock().unwrap() = AgentEndReason::ClientDisconnect;
+                    let mut reason = self.end_reason.lock().unwrap();
+                    if !matches!(*reason, AgentEndReason::DaemonShutdown) {
+                        *reason = AgentEndReason::ClientDisconnect;
+                    }
+                    drop(reason);
                     break;
                 }
             }
         }
 
-        guard.fire_and_drop(&event_tx, &mut event_log).await;
+        guard.fire_and_drop(&mut event_log).await;
     }
 
     async fn resolve_provider_id(&self) -> String {
@@ -296,6 +309,80 @@ impl ReActEngine {
             .await
             .map(|p| p.provider_id().to_string())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// 模型的 context window（由其 provider 上报），未知时为 None。
+    /// provider 未收录的模型保持配置预算不变。
+    async fn resolve_model_context_window(&self) -> Option<u32> {
+        let provider = self.provider_registry.resolve(&self.config.model).await?;
+        let models = provider.list_models().await.ok()?;
+        models
+            .iter()
+            .find(|m| m.id == self.config.model)
+            .map(|m| m.context_window)
+    }
+
+    /// Pi 式上下文压缩(spec §3.1):超阈值时把切点前历史交给当前模型
+    /// 生成结构化摘要,近期消息原样保留。失败 fail-open,prune 兜底。
+    async fn maybe_compact(
+        &self,
+        context: &mut Vec<ChatMessage>,
+        turn_id: Uuid,
+        budget: u32,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        event_log: &mut EventLog,
+    ) {
+        let session_id = self.session_id;
+        let cfg = &self.context_limits.compaction;
+        let Some(plan) = plan_compaction(context, budget, cfg) else {
+            return;
+        };
+
+        let region: Vec<ChatMessage> = context[plan.summarize_start..plan.cut_index].to_vec();
+        let request = build_summary_request(&region);
+
+        let Some(provider) = self.provider_registry.resolve(&self.config.model).await else {
+            tracing::warn!(session_id = %session_id, "compaction skipped: provider not found");
+            return;
+        };
+        let _ = event_tx
+            .send(AgentEvent::CompactionStart {
+                session_id,
+                turn_id,
+            })
+            .await
+            .ok();
+        let mut summary_config = self.config.clone();
+        summary_config.max_tokens = Some(cfg.summary_max_tokens);
+        let summary = match provider
+            .chat(&self.config.model, &request, &[], &summary_config)
+            .await
+        {
+            Ok(m) => m.content,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "compaction summary call failed; falling back to prune"
+                );
+                return;
+            }
+        };
+        if summary.trim().is_empty() {
+            tracing::warn!(session_id = %session_id, "compaction summary empty; falling back to prune");
+            return;
+        }
+
+        let (dropped, kept_count) = apply_summary(context, &plan, &summary);
+
+        let event = AgentEvent::CompactionSummary {
+            session_id,
+            turn_id,
+            summary: wrap_summary(&summary),
+            dropped_message_count: dropped,
+            kept_message_count: kept_count,
+        };
+        emit_and_persist(event_tx, event_log, event).await;
     }
 
     /// ReAct 主循环：跑一轮 LLM，把 assistant 消息塞进 context；
@@ -313,13 +400,7 @@ impl ReActEngine {
         event_log: &mut EventLog,
         cmd_rx: &mut mpsc::Receiver<SessionCmd>,
     ) -> Result<(TurnStopReason, Usage), AgentError> {
-        context.push(ChatMessage {
-            role: ChatRole::User,
-            content: user_msg.to_string(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-        });
+        context.push(ChatMessage::new(ChatRole::User, user_msg));
 
         let mut turn_usage = Usage::default();
         let tool_defs = self.tool_registry.list_definitions().await;
@@ -375,15 +456,8 @@ impl ReActEngine {
                 })
                 .collect();
             context.push(ChatMessage {
-                role: ChatRole::Assistant,
-                content: msg.accumulated_text.clone(),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: if core_tcs.is_empty() {
-                    None
-                } else {
-                    Some(core_tcs)
-                },
+                tool_calls: (!core_tcs.is_empty()).then_some(core_tcs),
+                ..ChatMessage::new(ChatRole::Assistant, msg.accumulated_text.clone())
             });
 
             if msg.msg_stop == MessageStopReason::EndTurn || msg.tool_calls.is_empty() {
@@ -448,8 +522,7 @@ impl ReActEngine {
             turn_id,
             message_id,
         };
-        let _ = event_tx.send(message_start.clone()).await.ok();
-        let _ = event_log.append(message_start);
+        emit_and_persist(event_tx, event_log, message_start).await;
 
         let mut accumulated_text = String::new();
         let mut tool_calls: Vec<PendingToolCall> = Vec::new();
@@ -553,8 +626,7 @@ impl ReActEngine {
             stop_reason: msg_stop.clone(),
             usage: msg_usage.clone(),
         };
-        let _ = event_tx.send(message_end.clone()).await.ok();
-        let _ = event_log.append(message_end);
+        emit_and_persist(event_tx, event_log, message_end).await;
 
         Ok(StreamedMessage {
             message_id,
@@ -590,8 +662,7 @@ impl ReActEngine {
             tool_name: tc.name.clone(),
             arguments: args.clone(),
         };
-        let _ = event_tx.send(tool_start.clone()).await.ok();
-        let _ = event_log.append(tool_start);
+        emit_and_persist(event_tx, event_log, tool_start).await;
 
         let (tool_call_outcome, execs) = self
             .hooks
@@ -610,24 +681,13 @@ impl ReActEngine {
         emit_hook_executions(&execs, session_id, event_tx);
         if let HookResult::Block { reason, .. } = tool_call_outcome {
             let result = parrot_protocol::types::ToolOutput {
-                content: format!("blocked: {reason}"),
+                content: truncate_tool_content(&format!("blocked: {reason}")),
                 is_error: true,
             };
-            let tool_end = AgentEvent::ToolEnd {
-                session_id,
-                turn_id,
-                tool_call_id: tc.id.clone(),
-                result: result.clone(),
-            };
-            let _ = event_tx.send(tool_end.clone()).await.ok();
-            let _ = event_log.append(tool_end);
-            context.push(ChatMessage {
-                role: ChatRole::Tool,
-                content: result.content,
-                tool_call_id: Some(tc.id.clone()),
-                tool_name: Some(tc.name.clone()),
-                tool_calls: None,
-            });
+            finish_tool_call(
+                session_id, turn_id, &tc.id, &tc.name, result, event_tx, event_log, context,
+            )
+            .await;
             return Ok(());
         }
 
@@ -667,21 +727,29 @@ impl ReActEngine {
                 )
                 .await;
             emit_hook_executions(&execs, session_id, event_tx);
-            match race_with_abort(cmd_rx, self.execute_tool(&tc.name, args.clone(), &tool_ctx))
-                .await
+            match race_with_abort(
+                cmd_rx,
+                self.tool_registry
+                    .execute(&tc.name, args.clone(), &tool_ctx),
+            )
+            .await
             {
                 Abortable::Completed(r) => {
                     r.unwrap_or_else(|e| parrot_protocol::types::ToolOutput {
-                        content: format!("Error: {}", e),
+                        content: truncate_tool_content(&format!("Error: {}", e)),
                         is_error: true,
                     })
                 }
                 Abortable::Aborted => {
-                    emit_aborted_tool_end(
+                    finish_tool_call(
                         session_id,
                         turn_id,
-                        tc.id.clone(),
-                        tc.name.clone(),
+                        &tc.id,
+                        &tc.name,
+                        parrot_protocol::types::ToolOutput {
+                            content: "aborted before execution".to_string(),
+                            is_error: true,
+                        },
                         event_tx,
                         event_log,
                         context,
@@ -717,29 +785,22 @@ impl ReActEngine {
             )
             .await;
         emit_hook_executions(&execs, session_id, event_tx);
+        // 用户 hook Replace 可注入无界内容,截断必须在它之后收口
+        // (TruncateHook 在管道外再兜一次)。
         let result = match tool_result_decision {
             HookResult::Replace {
                 content, is_error, ..
-            } => parrot_protocol::types::ToolOutput { content, is_error },
+            } => parrot_protocol::types::ToolOutput {
+                content: truncate_tool_content(&content),
+                is_error,
+            },
             _ => result,
         };
 
-        let tool_end = AgentEvent::ToolEnd {
-            session_id,
-            turn_id,
-            tool_call_id: tc.id.clone(),
-            result: result.clone(),
-        };
-        let _ = event_tx.send(tool_end.clone()).await.ok();
-        let _ = event_log.append(tool_end);
-
-        context.push(ChatMessage {
-            role: ChatRole::Tool,
-            content: result.content,
-            tool_call_id: Some(tc.id.clone()),
-            tool_name: Some(tc.name.clone()),
-            tool_calls: None,
-        });
+        finish_tool_call(
+            session_id, turn_id, &tc.id, &tc.name, result, event_tx, event_log, context,
+        )
+        .await;
 
         Ok(())
     }
@@ -790,11 +851,15 @@ impl ReActEngine {
             Abortable::Completed(d) => d,
             Abortable::Aborted => {
                 router.unregister(&self.session_id, tool_id).await;
-                emit_aborted_tool_end(
+                finish_tool_call(
                     session_id,
                     turn_id,
-                    tool_id.to_string(),
-                    tool_name.to_string(),
+                    tool_id,
+                    tool_name,
+                    parrot_protocol::types::ToolOutput {
+                        content: "aborted before execution".to_string(),
+                        is_error: true,
+                    },
                     event_tx,
                     event_log,
                     context,
@@ -806,21 +871,6 @@ impl ReActEngine {
 
         router.unregister(&self.session_id, tool_id).await;
         Ok(decision)
-    }
-
-    async fn execute_tool(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<parrot_protocol::types::ToolOutput, AgentError> {
-        match self.tool_registry.get(name).await {
-            Some(tool) => tool.call(args, ctx).await,
-            None => Err(AgentError::ToolExecution {
-                tool: name.to_string(),
-                message: "Tool not found".to_string(),
-            }),
-        }
     }
 }
 
@@ -869,10 +919,10 @@ where
     }
 }
 
-/// Forward per-hook telemetry records (`Vec<HookExecution>`) from
-/// `HookRegistry::run` to the wire as `AgentEvent::HookFired`. Non-blocking:
-/// `try_send` silently drops on full channel (buffer is 64; losing a
-/// `HookFired{noop}` is acceptable observability telemetry).
+/// 把 `HookRegistry::run` 产生的 per-hook 遥测记录
+/// （`Vec<HookExecution>`）转成 `AgentEvent::HookFired` 发到线上。
+/// 非阻塞：`try_send` 在通道满时静默丢弃（缓冲 64；丢一条
+/// `HookFired{noop}` 属可接受的观测性损耗）。
 fn emit_hook_executions(
     executions: &[HookExecution],
     session_id: Uuid,
@@ -889,41 +939,48 @@ fn emit_hook_executions(
     }
 }
 
-/// 发"aborted before execution" ToolEnd 并把 Tool 消息塞进 context。
-/// confirm 等待与工具执行两条中断路径共用这份清理。
+/// 发送事件到线上并落盘。先发 clone 再 append 原件；落盘失败只 warn
+/// （磁盘故障不应中断在线流）。
+async fn emit_and_persist(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    event_log: &mut EventLog,
+    event: AgentEvent,
+) {
+    let _ = event_tx.send(event.clone()).await.ok();
+    if let Err(e) = event_log.append(event) {
+        tracing::warn!(error = ?e, "event persistence failed");
+    }
+}
+
+/// 发 ToolEnd 并把 Tool 消息塞进 context。hook 拦截、正常完成、
+/// 执行前中断三条路径共用这份收尾。
 #[allow(clippy::too_many_arguments)]
-async fn emit_aborted_tool_end(
+async fn finish_tool_call(
     session_id: Uuid,
     turn_id: Uuid,
-    tool_call_id: String,
-    tool_name: String,
+    tool_call_id: &str,
+    tool_name: &str,
+    result: parrot_protocol::types::ToolOutput,
     event_tx: &mpsc::Sender<AgentEvent>,
     event_log: &mut EventLog,
     context: &mut Vec<ChatMessage>,
 ) {
-    let result = parrot_protocol::types::ToolOutput {
-        content: "aborted before execution".to_string(),
-        is_error: true,
-    };
     let tool_end = AgentEvent::ToolEnd {
         session_id,
         turn_id,
-        tool_call_id: tool_call_id.clone(),
+        tool_call_id: tool_call_id.to_string(),
         result: result.clone(),
     };
-    let _ = event_tx.send(tool_end.clone()).await.ok();
-    let _ = event_log.append(tool_end);
+    emit_and_persist(event_tx, event_log, tool_end).await;
     context.push(ChatMessage {
-        role: ChatRole::Tool,
-        content: result.content,
-        tool_call_id: Some(tool_call_id),
-        tool_name: Some(tool_name),
-        tool_calls: None,
+        tool_call_id: Some(tool_call_id.to_string()),
+        tool_name: Some(tool_name.to_string()),
+        ..ChatMessage::new(ChatRole::Tool, result.content)
     });
 }
 
-/// RAII guard that emits `AgentEnd` on drop unless already fired. Ensures
-/// `AgentEnd` is always sent even on panic or task abort.
+/// RAII 守卫：drop 时发 `AgentEnd`（除非已触发）。保证 panic 或任务
+/// abort 时 `AgentEnd` 也一定发出。
 struct AgentEndGuard {
     session_id: Uuid,
     event_tx: mpsc::Sender<AgentEvent>,
@@ -937,7 +994,7 @@ struct AgentEndGuard {
 impl AgentEndGuard {
     /// 显式触发 AgentEnd（正常退出路径调用，避免 Drop 不可控）。
     /// 先落盘再发送：resume 时靠读 events.log 区分"会话已结束"和"daemon 崩溃"。
-    async fn fire_and_drop(mut self, _tx: &mpsc::Sender<AgentEvent>, event_log: &mut EventLog) {
+    async fn fire_and_drop(mut self, event_log: &mut EventLog) {
         if self.fired {
             return;
         }
@@ -981,11 +1038,23 @@ impl Drop for AgentEndGuard {
     }
 }
 
-/// Compute the SHA-256 hash (first 16 bytes hex) of a system prompt.
-/// Exposed for tests / daemon use.
-pub fn system_prompt_hash(prompt: &str) -> String {
+/// 计算 system prompt 的 SHA-256（前 16 字节 hex）。
+fn system_prompt_hash(prompt: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prompt.as_bytes());
     let full = hasher.finalize();
     hex::encode(&full[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_budget_takes_min_of_config_and_model_window() {
+        assert_eq!(context_budget(100_000, None), 100_000);
+        assert_eq!(context_budget(100_000, Some(200_000)), 100_000);
+        assert_eq!(context_budget(2_000_000, Some(200_000)), 200_000);
+        assert_eq!(context_budget(50, Some(200_000)), 50);
+    }
 }

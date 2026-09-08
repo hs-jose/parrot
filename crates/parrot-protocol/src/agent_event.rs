@@ -115,6 +115,26 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+
+    /// Context compaction starting: a summary LLM call is in flight. UI-only
+    /// notification (not persisted); `CompactionSummary` follows on success.
+    CompactionStart {
+        session_id: SessionId,
+        turn_id: Uuid,
+    },
+
+    /// Context compaction applied: pre-cut-point history was replaced by a
+    /// structured summary (marker-prefixed). Emitted BEFORE the triggering
+    /// turn's `TurnStart`. Replayed by `rebuild_context` with message-count
+    /// semantics: keep the last `kept_message_count` rebuilt messages, then
+    /// push this summary as a User message.
+    CompactionSummary {
+        session_id: SessionId,
+        turn_id: Uuid,
+        summary: String,
+        dropped_message_count: u32,
+        kept_message_count: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,7 +224,10 @@ impl AgentEvent {
     pub fn is_persistent(&self) -> bool {
         !matches!(
             self,
-            Self::MessageDelta { .. } | Self::ToolUpdate { .. } | Self::HookFired { .. }
+            Self::MessageDelta { .. }
+                | Self::ToolUpdate { .. }
+                | Self::HookFired { .. }
+                | Self::CompactionStart { .. }
         )
     }
 
@@ -222,7 +245,9 @@ impl AgentEvent {
             | Self::ToolEnd { session_id, .. }
             | Self::ToolConfirmRequired { session_id, .. }
             | Self::ReplayIntegrityWarning { session_id, .. }
-            | Self::HookFired { session_id, .. } => *session_id,
+            | Self::HookFired { session_id, .. }
+            | Self::CompactionStart { session_id, .. }
+            | Self::CompactionSummary { session_id, .. } => *session_id,
         }
     }
 }

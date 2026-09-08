@@ -1,3 +1,4 @@
+pub mod compaction;
 pub mod confirm;
 pub mod context;
 pub mod engine;
@@ -7,6 +8,7 @@ pub mod hooks;
 pub mod provider;
 pub mod session;
 pub mod tool;
+pub mod tool_output;
 pub mod types;
 
 pub use confirm::ConfirmRouter;
@@ -17,5 +19,5 @@ pub use provider::{
     ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
 };
 pub use session::{SessionCmd, SessionHandle, SessionManager};
-pub use tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry, ToolResult};
+pub use tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry};
 pub use types::*;

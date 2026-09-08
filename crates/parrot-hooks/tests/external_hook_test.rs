@@ -1,12 +1,10 @@
-// Integration tests for ExternalHook::handle invoking real child processes
-// (the mock_hook_* bins declared in Cargo.toml). Validates spawn / stdin /
-// stdout / timeout / stderr / exit-code paths against the fail-open matrix
-// in spec §6.1.
+// ExternalHook::handle 集成测试：调用真实子进程（Cargo.toml 里声明的
+// mock_hook_* bin）。对照 spec §6.1 的 fail-open 矩阵验证 spawn / stdin /
+// stdout / timeout / stderr / 退出码各路径。
 //
-// Mock bins are built as separate [[bin]] targets in the parrot-hooks
-// package; CARGO_BIN_EXE_<name> is the canonical cargo path for locating
-// them. They're declared with test=false so cargo doesn't try to run them
-// as test binaries.
+// mock bin 作为 parrot-hooks 包里的独立 [[bin]] 目标构建；
+// CARGO_BIN_EXE_<name> 是 cargo 定位它们的规范路径。它们声明为
+// test=false，避免 cargo 把它们当测试二进制跑。
 
 use parrot_config::ExternalHookConfig;
 use parrot_core::error::AgentError;
@@ -24,11 +22,11 @@ fn make_hook_with_timeout(command: Vec<String>, timeout: Option<u64>) -> Externa
         timeout_seconds: timeout,
         config: toml::Value::Table(toml::value::Table::new()),
     };
-    ExternalHook::new(&cfg, Duration::from_secs(5)).unwrap()
+    ExternalHook::new(&cfg).unwrap()
 }
 
 fn ctx_with_timeout(timeout: Duration) -> HookCtx<'static> {
-    // leak a small Path so the HookCtx can borrow 'static — acceptable in tests.
+    // leak 一个小 Path 让 HookCtx 能借 'static —— 测试里可接受。
     let working_dir: &'static Path = Box::leak(Path::new(".").to_path_buf().into_boxed_path());
     HookCtx {
         session_id: Uuid::nil(),
@@ -104,7 +102,7 @@ async fn mock_exit1_failopen_err() {
 
 #[tokio::test]
 async fn mock_timeout_failopen_err() {
-    // Use the ctx timeout (no override) so the test controls the budget.
+    // 用 ctx 的超时（无 override），让测试自己控制预算。
     let cmd = vec![env!("CARGO_BIN_EXE_mock_hook_sleep").to_string()];
     let hook = make_hook_with_timeout(cmd, None);
     let args = serde_json::json!({});

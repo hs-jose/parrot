@@ -17,20 +17,16 @@ impl EventLog {
         }
     }
 
-    /// Set the starting seq counter — used after a resume replay so new
-    /// appends continue from where the replay left off.
+    /// 设置 seq 计数起点——resume 回放后调用，让新追加的事件从
+    /// 回放停止的位置继续编号。
     pub fn with_start_seq(mut self, seq: u64) -> Self {
         self.current_seq = seq;
         self
     }
 
-    pub fn current_seq(&self) -> u64 {
-        self.current_seq
-    }
-
-    /// Append a persistent `AgentEvent` to `events.log`. Non-persistent
-    /// events (`MessageDelta`, `ToolUpdate`) are filtered out by the caller
-    /// — only `is_persistent()` events reach this method.
+    /// 把持久化 `AgentEvent` 追加到 `events.log`。非持久化事件
+    /// （`MessageDelta`、`ToolUpdate`）由调用方过滤——只有
+    /// `is_persistent()` 的事件会到达此方法。
     pub fn append(&mut self, event: AgentEvent) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join("events.log");
@@ -72,10 +68,10 @@ impl EventLog {
         Ok(entries)
     }
 
-    /// Resume-specific replay: reads `events.log`, truncates partial turns,
-    /// writes discarded events to `corrupted.log`, rewrites `events.log` with
-    /// the truncated content, and returns the clean stream plus an optional
-    /// `IntegrityIssue` (caller emits `ReplayIntegrityWarning`).
+    /// resume 专用回放：读 `events.log`，截掉半成品 turn，把丢弃的
+    /// 事件写入 `corrupted.log`，用截断后的内容重写 `events.log`，
+    /// 返回干净流和可选 `IntegrityIssue`（调用方据此发
+    /// `ReplayIntegrityWarning`）。
     pub fn replay_for_resume(
         &mut self,
     ) -> std::io::Result<(Vec<PersistedAgentEvent>, Option<IntegrityIssue>)> {
@@ -150,7 +146,7 @@ impl EventLog {
         Ok(())
     }
 
-    pub fn write_snapshot(&self, snapshot: &str) -> std::io::Result<()> {
+    fn write_snapshot(&self, snapshot: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join("snapshot.json");
         std::fs::write(path, snapshot)
@@ -168,9 +164,8 @@ impl EventLog {
     }
 }
 
-/// Truncate the event stream to "after the last complete TurnEnd".
-/// Returns `(kept, dropped, issue)`. If `issue` is `None`, no truncation
-/// was needed.
+/// 把事件流截断到"最后一个完整 TurnEnd 之后"。返回 `(保留, 丢弃, issue)`。
+/// `issue` 为 `None` 表示无需截断。
 pub fn truncate_to_last_complete_turn(
     events: Vec<PersistedAgentEvent>,
 ) -> (
@@ -178,7 +173,7 @@ pub fn truncate_to_last_complete_turn(
     Vec<PersistedAgentEvent>,
     Option<IntegrityIssue>,
 ) {
-    // Severe corruption: AgentEnd followed by more events.
+    // 严重损坏：AgentEnd 之后还有事件。
     let agent_end_idx = events
         .iter()
         .enumerate()
@@ -199,13 +194,11 @@ pub fn truncate_to_last_complete_turn(
         }
     }
 
-    // Partial turn: find the last complete TurnEnd. Anything after it is the
-    // "tail". Within the tail, lifecycle boundary markers (AgentStart /
-    // AgentEnd / ReplayIntegrityWarning) are NOT turn content — a lone
-    // trailing AgentEnd after a closed turn, or a resume's leading
-    // AgentStart with no turn started yet, are clean and must be kept. The
-    // partial turn begins at the first `TurnStart` in the tail; if there is
-    // none, the tail is clean and we keep everything.
+    // 半成品 turn：找最后一个完整 TurnEnd，其后都是"尾巴"。尾巴里的
+    // 生命周期边界标记（AgentStart / AgentEnd / ReplayIntegrityWarning）
+    // 不算 turn 内容——闭合 turn 之后的孤立 AgentEnd，或 resume 时还没
+    // 开始 turn 的开头 AgentStart，都是干净的，必须保留。半成品 turn
+    // 从尾巴里第一个 `TurnStart` 开始；找不到则尾巴干净，全部保留。
     let last_turn_end_idx = events
         .iter()
         .enumerate()
@@ -221,7 +214,7 @@ pub fn truncate_to_last_complete_turn(
         .find(|i| matches!(&events[*i].event, AgentEvent::TurnStart { .. }));
 
     let Some(partial_start) = partial_start else {
-        // Tail contains only lifecycle markers (or is empty) — clean prefix.
+        // 尾巴里只有生命周期标记（或为空）——干净前缀。
         return (events, Vec::new(), None);
     };
 
@@ -254,46 +247,26 @@ pub fn truncate_to_last_complete_turn(
     (keep.to_vec(), drop, Some(issue))
 }
 
-/// Rebuild a `Vec<ChatMessage>` from a replayed event log. Only
-/// `TurnStart` (user message), `MessageEnd` (assistant message), and
-/// `ToolEnd` (tool result) produce context entries. Start/Delta/AgentStart/
-/// AgentEnd/TurnEnd are skipped.
+/// 从回放的事件日志重建 `Vec<ChatMessage>`。只有 `TurnStart`（用户消息）、
+/// `MessageEnd`（助手消息）和 `ToolEnd`（工具结果）会产生上下文条目。
+/// Start/Delta/AgentStart/AgentEnd/TurnEnd 一律跳过。
 pub fn rebuild_context(events: &[PersistedAgentEvent]) -> Vec<ChatMessage> {
     let mut ctx = Vec::new();
     for ev in events {
         match &ev.event {
             AgentEvent::TurnStart { user_message, .. } => {
-                ctx.push(ChatMessage {
-                    role: ChatRole::User,
-                    content: user_message.clone(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: None,
-                });
+                ctx.push(ChatMessage::new(ChatRole::User, user_message.clone()));
             }
             AgentEvent::MessageEnd {
                 final_content,
                 tool_calls,
                 ..
             } => {
-                let core_tcs: Vec<CoreToolCallInfo> = tool_calls
-                    .iter()
-                    .map(|tc| CoreToolCallInfo {
-                        id: tc.tool_call_id.clone(),
-                        name: tc.tool_name.clone(),
-                        arguments: tc.arguments.clone(),
-                    })
-                    .collect();
+                let core_tcs: Vec<CoreToolCallInfo> =
+                    tool_calls.iter().map(CoreToolCallInfo::from).collect();
                 ctx.push(ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: final_content.clone(),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_calls: if core_tcs.is_empty() {
-                        None
-                    } else {
-                        Some(core_tcs)
-                    },
+                    tool_calls: (!core_tcs.is_empty()).then_some(core_tcs),
+                    ..ChatMessage::new(ChatRole::Assistant, final_content.clone())
                 });
             }
             AgentEvent::ToolEnd {
@@ -302,12 +275,23 @@ pub fn rebuild_context(events: &[PersistedAgentEvent]) -> Vec<ChatMessage> {
                 ..
             } => {
                 ctx.push(ChatMessage {
-                    role: ChatRole::Tool,
-                    content: result.content.clone(),
                     tool_call_id: Some(tool_call_id.clone()),
-                    tool_name: None,
-                    tool_calls: None,
+                    ..ChatMessage::new(ChatRole::Tool, result.content.clone())
                 });
+            }
+            AgentEvent::CompactionSummary {
+                summary,
+                kept_message_count,
+                ..
+            } => {
+                // 消息计数语义(spec §4):当前已重建列表 == 压缩前上下文
+                // (不含 system)。保留末尾 kept_message_count 条,摘要以
+                // User 角色插在最前。
+                let kept = (*kept_message_count as usize).min(ctx.len());
+                let kept_msgs: Vec<ChatMessage> = ctx.split_off(ctx.len() - kept);
+                ctx.clear(); // 丢弃被摘要的前缀
+                ctx.push(ChatMessage::new(ChatRole::User, summary.clone()));
+                ctx.extend(kept_msgs);
             }
             _ => {}
         }
@@ -454,8 +438,8 @@ mod tests {
         assert_eq!(issue.kind, IntegrityIssueKind::EventsAfterAgentEnd);
     }
 
-    /// Regression: a lone trailing `AgentEnd` after a closed turn is a clean
-    /// shutdown marker, not a partial turn. Must be kept, no integrity issue.
+    /// 回归：闭合 turn 之后的孤立 `AgentEnd` 是干净的停机标记，
+    /// 不是半成品 turn。必须保留，不产生完整性问题。
     #[test]
     fn truncate_lone_trailing_agent_end_is_kept() {
         let sid = Uuid::new_v4();
@@ -493,10 +477,10 @@ mod tests {
         assert!(issue.is_none());
     }
 
-    /// Regression: a resume's leading `AgentStart{resumed_from_seq}` that
-    /// arrives before any new turn is a lifecycle marker, not a partial turn.
-    /// Must be kept (matches the user-reported bug where `corrupted.log`
-    /// showed a lone `AgentStart` being dropped as `PartialTurn`).
+    /// 回归：resume 时先于任何新 turn 到达的开头
+    /// `AgentStart{resumed_from_seq}` 是生命周期标记，不是半成品 turn。
+    /// 必须保留（对应用户报告的 bug：`corrupted.log` 里出现了被当作
+    /// `PartialTurn` 丢弃的孤立 `AgentStart`）。
     #[test]
     fn truncate_lone_trailing_resume_agent_start_is_kept() {
         let sid = Uuid::new_v4();
@@ -569,5 +553,161 @@ mod tests {
         assert_eq!(ctx[0].content, "hi");
         assert_eq!(ctx[1].role, ChatRole::Assistant);
         assert_eq!(ctx[1].content, "hello");
+    }
+
+    #[test]
+    fn rebuild_applies_compaction_summary() {
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let m1 = Uuid::new_v4();
+        let m2 = Uuid::new_v4();
+        // Turn 1（将被摘要）、Turn 2（保留），然后压缩。
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t1,
+                    user_message: "old question".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::MessageEnd {
+                    session_id: sid,
+                    turn_id: t1,
+                    message_id: m1,
+                    final_content: "old answer".into(),
+                    tool_calls: vec![],
+                    stop_reason: MessageStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                2,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t2,
+                    user_message: "new question".into(),
+                },
+            ),
+            make_persisted(
+                3,
+                AgentEvent::MessageEnd {
+                    session_id: sid,
+                    turn_id: t2,
+                    message_id: m2,
+                    final_content: "new answer".into(),
+                    tool_calls: vec![],
+                    stop_reason: MessageStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                4,
+                AgentEvent::CompactionSummary {
+                    session_id: sid,
+                    turn_id: t2,
+                    summary: "[CONVERSATION SUMMARY]\n## 目标\n...".into(),
+                    dropped_message_count: 2,
+                    kept_message_count: 2,
+                },
+            ),
+        ];
+        let ctx = rebuild_context(&events);
+        assert_eq!(ctx.len(), 3, "summary + kept 2 messages");
+        assert_eq!(ctx[0].role, ChatRole::User);
+        assert!(ctx[0].content.starts_with("[CONVERSATION SUMMARY]"));
+        assert_eq!(ctx[1].content, "new question");
+        assert_eq!(ctx[2].content, "new answer");
+        assert!(
+            !ctx.iter().any(|m| m.content == "old question"),
+            "summarized messages must be dropped"
+        );
+    }
+
+    #[test]
+    fn rebuild_compaction_keeps_all_when_count_exceeds() {
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t1,
+                    user_message: "q".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::CompactionSummary {
+                    session_id: sid,
+                    turn_id: t1,
+                    summary: "[CONVERSATION SUMMARY]\n...".into(),
+                    dropped_message_count: 0,
+                    kept_message_count: 99, // more than rebuilt
+                },
+            ),
+        ];
+        let ctx = rebuild_context(&events);
+        assert_eq!(ctx.len(), 2);
+        assert!(ctx[0].content.starts_with("[CONVERSATION SUMMARY]"));
+        assert_eq!(ctx[1].content, "q");
+    }
+
+    #[test]
+    fn truncate_keeps_compaction_summary_before_partial_turn() {
+        let sid = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let events = vec![
+            make_persisted(
+                0,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: t1,
+                    user_message: "done turn".into(),
+                },
+            ),
+            make_persisted(
+                1,
+                AgentEvent::TurnEnd {
+                    session_id: sid,
+                    turn_id: t1,
+                    stop_reason: TurnStopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ),
+            make_persisted(
+                2,
+                AgentEvent::CompactionSummary {
+                    session_id: sid,
+                    turn_id: Uuid::new_v4(),
+                    summary: "[CONVERSATION SUMMARY]\n...".into(),
+                    dropped_message_count: 1,
+                    kept_message_count: 1,
+                },
+            ),
+            make_persisted(
+                3,
+                AgentEvent::TurnStart {
+                    session_id: sid,
+                    turn_id: Uuid::new_v4(),
+                    user_message: "partial turn".into(),
+                },
+            ),
+        ];
+        let (keep, drop, issue) = truncate_to_last_complete_turn(events);
+        assert!(issue.is_some(), "partial turn must be detected");
+        assert_eq!(keep.len(), 3, "CompactionSummary must survive truncation");
+        assert!(
+            matches!(
+                keep.last().map(|e| &e.event),
+                Some(AgentEvent::CompactionSummary { .. })
+            ),
+            "last kept event is the CompactionSummary"
+        );
+        assert_eq!(drop.len(), 1);
     }
 }

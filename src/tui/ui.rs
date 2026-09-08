@@ -26,7 +26,11 @@ mod palette {
     pub const INPUT_BORDER: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
 }
 
-pub(crate) fn draw(f: &mut ratatui::Frame<'_>, app: &mut App, input: &tui_textarea::TextArea<'_>) {
+pub(crate) fn draw(
+    f: &mut ratatui::Frame<'_>,
+    app: &mut App,
+    input: &ratatui_textarea::TextArea<'_>,
+) {
     let area = f.area();
     // 输入区按内容行数动态增长，+2 为上下边框；上限不超过终端高度的 1/3，
     // 避免长输入把对话区挤没。
@@ -109,6 +113,20 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     ]);
     let bar = Paragraph::new(line).style(Style::default().bg(palette::STATUS_BG));
     f.render_widget(bar, area);
+    if let Some(label) = activity_label(app) {
+        let right = Line::from(vec![
+            Span::styled(
+                format!("{}, ", spinner_frame()),
+                Style::default().fg(palette::AI_FG),
+            ),
+            Span::styled(label, Style::default().fg(palette::STATUS_FG)),
+            Span::raw(" "),
+        ]);
+        let right_para = Paragraph::new(right)
+            .style(Style::default().bg(palette::STATUS_BG))
+            .alignment(Alignment::Right);
+        f.render_widget(right_para, area);
+    }
 }
 
 fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -136,50 +154,13 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         }
     }
 
-    let blink = blink_cursor();
-
-    // 流式输出中的 assistant 消息：单独渲染，末尾带闪烁光标。复用
-    // push_body_styled 的空行压缩逻辑，避免 markdown 段落空行在流式阶段
-    // 刷屏；光标贴在最后一行行尾（正在输入的位置）。
+    // 流式输出中的 assistant 消息：单独渲染。状态指示（Thinking/Working）
+    // 在状态栏右侧固定位置，不再作为聊天行插入，避免底部锚定视图反复位移。
     if let Some(text) = app.streaming_text() {
-        lines.push(header_line("●", palette::AI_FG, None));
-        if text.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                blink,
-                Style::default()
-                    .fg(palette::AI_FG)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            let before = lines.len();
-            push_body_styled(text, &mut lines, Style::default().fg(palette::BODY_FG));
-            // push_body_styled 至少 push 一行（含全空文本），所以 last_mut 必 Some。
-            if lines.len() > before {
-                if let Some(last) = lines.last_mut() {
-                    last.spans.push(Span::styled(
-                        blink,
-                        Style::default()
-                            .fg(palette::AI_FG)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-            }
+        if !text.trim().is_empty() {
+            lines.push(header_line("●", palette::AI_FG, None));
+            push_markdown(text, &mut lines);
         }
-    } else if app.is_thinking() {
-        lines.push(Line::from(Span::styled(
-            "  Thinking…",
-            Style::default()
-                .fg(palette::AI_FG)
-                .add_modifier(Modifier::DIM),
-        )));
-    }
-    if app.is_working() {
-        lines.push(Line::from(Span::styled(
-            "  Working…",
-            Style::default()
-                .fg(palette::AI_FG)
-                .add_modifier(Modifier::DIM),
-        )));
     }
 
     let view_h = inner.height as usize;
@@ -225,7 +206,7 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
         }
         ChatEntry::Assistant { text, time } => {
             lines.push(header_line("●", palette::AI_FG, Some(time)));
-            push_body(text, lines);
+            push_markdown(text, lines);
         }
         ChatEntry::Tool {
             tool_name,
@@ -241,13 +222,10 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
             } else {
                 format!(" {}", truncate_str(&args, 48))
             };
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("▸ {tool_name}{args_str}"),
-                    Style::default().fg(palette::TOOL_FG),
-                ),
-            ];
+            let mut spans = vec![Span::styled(
+                format!("▸ {tool_name}{args_str}"),
+                Style::default().fg(palette::TOOL_FG),
+            )];
             match result {
                 Some(r) if r.is_error => {
                     spans.push(Span::styled(
@@ -266,13 +244,13 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
         }
         ChatEntry::Error(s) => {
             lines.push(Line::from(Span::styled(
-                format!("  [error] {s}"),
+                format!("[error] {s}"),
                 Style::default().fg(palette::ERROR_FG),
             )));
         }
         ChatEntry::Warning(s) => {
             lines.push(Line::from(Span::styled(
-                format!("  [warn] {s}"),
+                format!("[warn] {s}"),
                 Style::default().fg(palette::WARN_FG),
             )));
         }
@@ -282,7 +260,6 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
             exit_code,
         } => {
             lines.push(Line::from(vec![
-                Span::raw("  "),
                 Span::styled(
                     format!("▸ !{command}"),
                     Style::default().fg(palette::TOOL_FG),
@@ -310,7 +287,7 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
                 push_body_styled(&shown, lines, style);
                 if truncated {
                     lines.push(Line::from(Span::styled(
-                        "  …（已截断）",
+                        "…（已截断）",
                         Style::default().fg(palette::DIM),
                     )));
                 }
@@ -318,7 +295,7 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
         }
         ChatEntry::Info(s) => {
             lines.push(Line::from(Span::styled(
-                format!("  {s}"),
+                s.clone(),
                 Style::default().fg(palette::DIM),
             )));
         }
@@ -343,15 +320,73 @@ fn compact_args(args: &Value) -> String {
     serde_json::to_string(args).unwrap_or_default()
 }
 
-/// 将正文按行展开，统一缩进两格 + 柔和正文色。连续空行压缩为一行，
-/// 行首/行尾的空行去掉，避免"空行刷屏"和与消息间空行叠加。
+/// 将正文按行展开 + 柔和正文色。连续空行压缩为一行,行首/行尾的
+/// 空行去掉,避免"空行刷屏"和与消息间空行叠加。
 fn push_body(text: &str, lines: &mut Vec<Line<'_>>) {
     push_body_styled(text, lines, Style::default().fg(palette::BODY_FG));
 }
 
+/// Markdown 渲染:tui-markdown 解析为 styled Lines。
+/// 标题/代码块样式在 Line 级,须 patch 到每个 span;流式中的未闭合
+/// 结构按纯文本呈现,闭合后自动升级为富格式。
+fn push_markdown(text: &str, lines: &mut Vec<Line<'_>>) {
+    let options = tui_markdown::Options::new(ThemeSheet);
+    let md = tui_markdown::from_str_with_options(text, &options);
+    for line in md.lines {
+        let line_style = line.style;
+        let mut spans: Vec<Span<'_>> = line
+            .spans
+            .into_iter()
+            .map(|s| {
+                let st = patch_body(line_style.patch(s.style));
+                Span::styled(s.content.into_owned(), st)
+            })
+            .collect();
+        if spans.is_empty() {
+            spans.push(Span::default());
+        }
+        lines.push(Line::from(spans));
+    }
+}
+
+/// 库默认无样式的 span 视为主题正文色,有样式的保持。
+fn patch_body(st: ratatui::style::Style) -> ratatui::style::Style {
+    if st == ratatui::style::Style::new() {
+        st.fg(palette::BODY_FG)
+    } else {
+        st
+    }
+}
+
+/// tui-markdown 样式表,对齐 Tokyo Night 调色板。
+#[derive(Clone, Copy)]
+struct ThemeSheet;
+
+impl tui_markdown::StyleSheet for ThemeSheet {
+    fn heading(&self, level: u8) -> ratatui::style::Style {
+        match level {
+            1 => Style::default().fg(palette::INPUT_BORDER).bold(),
+            2..=3 => Style::default().fg(palette::USER_FG).bold(),
+            _ => Style::default().fg(palette::USER_FG),
+        }
+    }
+
+    fn code(&self) -> ratatui::style::Style {
+        Style::default().fg(palette::OK_FG)
+    }
+
+    fn link(&self) -> ratatui::style::Style {
+        Style::default().fg(palette::INPUT_BORDER)
+    }
+
+    fn blockquote(&self) -> ratatui::style::Style {
+        Style::default().fg(palette::DIM)
+    }
+}
+
 fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
     if text.trim().is_empty() {
-        lines.push(Line::from(Span::raw("  ")));
+        lines.push(Line::default());
         return;
     }
     let mut pending_blank = false;
@@ -364,18 +399,15 @@ fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
             continue;
         }
         if pending_blank {
-            lines.push(Line::from(Span::raw("  ")));
+            lines.push(Line::default());
             pending_blank = false;
         }
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(l.to_string(), style),
-        ]));
+        lines.push(Line::from(Span::styled(l.to_string(), style)));
         emitted = true;
     }
 }
 
-fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::TextArea<'_>) {
+fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &ratatui_textarea::TextArea<'_>) {
     // 输入卡片：圆角蓝边框标示焦点；快捷键提示收进边框标题，不再占用内容行。
     let block = Block::default()
         .borders(Borders::ALL)
@@ -383,7 +415,7 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
         .border_style(Style::default().fg(palette::INPUT_BORDER))
         .padding(Padding::horizontal(1))
         .title(Span::styled(
-            " Enter 发送 · Shift+Enter 换行 · PgUp/PgDn 翻页 · Ctrl+C 中断 · 双击 Esc 退出 ",
+            " Enter 发送 · Shift+Enter 换行 · 粘贴多行自动换行 · PgUp/PgDn 翻页 · Ctrl+C 中断 · 双击 Esc 退出 ",
             Style::default().fg(palette::DIM),
         ));
     let inner = block.inner(area);
@@ -414,20 +446,32 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &tui_textarea::Text
     f.render_widget(input, text_area);
 }
 
-/// 500ms 周期的闪烁光标块，用于模拟流式打字中。
-fn blink_cursor() -> &'static str {
+/// 状态栏右侧的活动指示：spinner + 状态标签，位置固定不推动聊天内容。
+fn activity_label(app: &App) -> Option<String> {
+    if app.compacting {
+        Some("Compacting…".into())
+    } else if app.is_working() {
+        Some("Working…".into())
+    } else if app.is_thinking() {
+        Some("Thinking…".into())
+    } else if app.is_turn_active() {
+        Some("Streaming…".into())
+    } else {
+        None
+    }
+}
+
+fn spinner_frame() -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if (ms / 500).is_multiple_of(2) {
-        "█"
-    } else {
-        " "
-    }
+    FRAMES[(ms / 100) as usize % FRAMES.len()]
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
+/// 按字符数截断（超出补 `…`）。ui 渲染与 confirm modal 共用。
+pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -459,6 +503,35 @@ fn draw_confirm_modal(f: &mut ratatui::Frame<'_>, area: Rect, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 标题/代码块样式在 Line 级,接线必须 patch 到 span,否则 markdown
+    /// 结构与正文视觉无差别(用户报告的"没渲染")。
+    #[test]
+    fn push_markdown_applies_line_level_styles() {
+        let raw = "## 标题:方案\n\n```\n① dir /s x.txt\n```\n";
+        let mut lines = Vec::new();
+        push_markdown(raw, &mut lines);
+        let heading = &lines[0];
+        assert!(
+            heading
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "heading must be bold, got {:?}",
+            heading.spans
+        );
+        // 代码块内容行(第 3 行)应为 code 样式而非正文。
+        let code_line = &lines[3];
+        assert!(
+            code_line
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(palette::OK_FG)),
+            "code line must use code style, got {:?}",
+            code_line.spans
+        );
+    }
+
     use parrot_protocol::types::ToolOutput;
     use parrot_protocol::SessionId;
     use ratatui::backend::TestBackend;
@@ -514,7 +587,7 @@ mod tests {
                 time: "14:33".into(),
             });
             app.entries.push(ChatEntry::Error("boom".into()));
-            let input = tui_textarea::TextArea::default();
+            let input = ratatui_textarea::TextArea::default();
             terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         }
     }
@@ -524,7 +597,7 @@ mod tests {
     fn draw_renders_rounded_borders_around_chat_and_input() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         let mut app = App::new(SessionId::new_v4());
-        let input = tui_textarea::TextArea::default();
+        let input = ratatui_textarea::TextArea::default();
         terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
         let buf = terminal.backend().buffer();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -550,7 +623,7 @@ mod tests {
         }
         app.scroll_to_top();
         terminal
-            .draw(|f| draw(f, &mut app, &tui_textarea::TextArea::default()))
+            .draw(|f| draw(f, &mut app, &ratatui_textarea::TextArea::default()))
             .unwrap();
         assert!(
             app.scroll_offset < u16::MAX,
@@ -570,11 +643,7 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec![
-                "  line1".to_string(),
-                "  ".to_string(),
-                "  line2".to_string()
-            ]
+            vec!["line1".to_string(), "".to_string(), "line2".to_string()]
         );
     }
 
@@ -586,6 +655,6 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
-        assert_eq!(rendered, vec!["  line1".to_string()]);
+        assert_eq!(rendered, vec!["line1".to_string()]);
     }
 }
