@@ -1,6 +1,5 @@
-// Built-in hook implementations + registry builder.
-// Hooks live here rather than in parrot-daemon so they can be reused
-// and tested independently of the daemon binary.
+// 内置 hook 实现 + 注册表构建器。
+// hook 放在这里而非 parrot-daemon，以便独立于 daemon 二进制复用与测试。
 
 pub mod dangerous_command_blocker;
 pub mod external;
@@ -8,11 +7,29 @@ pub mod redact_secrets;
 pub mod shell_denylist;
 
 use parrot_config::HooksConfig;
-use parrot_core::hooks::{Hook, HookRegistry};
+use parrot_core::hooks::{Hook, HookEvent, HookRegistry};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// 从 `ToolCall` 事件提取 shell 命令参数：仅对 shell 类工具
+/// （`shell_exec` / `bash` / `shell`）生效，取其 `command` 字符串参数。
+/// 非 ToolCall / 非 shell 工具 / 无 command 参数一律返回 `None`。
+pub(crate) fn extract_shell_command<'a>(ev: &'a HookEvent<'a>) -> Option<&'a str> {
+    let HookEvent::ToolCall {
+        tool_name,
+        arguments,
+        ..
+    } = ev
+    else {
+        return None;
+    };
+    if !matches!(*tool_name, "shell_exec" | "bash" | "shell") {
+        return None;
+    }
+    arguments.get("command").and_then(|v| v.as_str())
+}
 
 pub fn build_registry(cfg: &HooksConfig) -> Arc<HookRegistry> {
     let global_timeout = Duration::from_secs(cfg.timeout_seconds.max(1));
@@ -44,9 +61,9 @@ pub fn build_registry(cfg: &HooksConfig) -> Arc<HookRegistry> {
             ),
         }
     }
-    // External hooks: orthogonal to `enabled`. Listed ⇒ registered.
+    // 外部 hook 与 `enabled` 正交：列出来就注册。
     for ext in &cfg.external {
-        match external::ExternalHook::new(ext, global_timeout) {
+        match external::ExternalHook::new(ext) {
             Ok(h) => {
                 info!(
                     hook_id = %h.id(),
@@ -123,8 +140,8 @@ mod tests {
 
     #[test]
     fn build_registry_unknown_external_event_warns_and_skips() {
-        // Unknown event-kind string in any external entry → Err → warn + skip
-        // (no panic). Other valid externals, if any, still register.
+        // 任一 external 条目里有未知 event-kind 字符串 → Err → warn + 跳过
+        // （不 panic）。其他合法的 external（若有）照常注册。
         let cfg = HooksConfig {
             enabled: vec![],
             timeout_seconds: 5,
@@ -138,13 +155,13 @@ mod tests {
             }],
         };
         let _reg = build_registry(&cfg);
-        // registry created; failed external hook skipped, no panic.
+        // 注册表创建成功；失败的 external hook 被跳过，无 panic。
     }
 
     #[test]
     fn build_registry_external_with_empty_events_ok() {
-        // Empty events vec → HookPoints::empty() (hook never fires) but
-        // construction succeeds and the external is registered.
+        // 空 events 列表 → HookPoints::empty()（永不触发），
+        // 但构造成功且 external 照常注册。
         let cfg = HooksConfig {
             enabled: vec![],
             timeout_seconds: 5,
@@ -162,8 +179,8 @@ mod tests {
 
     #[test]
     fn build_registry_mixed_internal_and_external() {
-        // Built-in shell_denylist + an external hook coexist: `enabled`
-        // governs built-in only; `external` vec independent (spec §1, §8).
+        // 内置 shell_denylist 与外部 hook 共存：`enabled` 只管内置；
+        // `external` 列表相互独立（spec §1, §8）。
         let cfg = HooksConfig {
             enabled: vec!["shell_denylist".into()],
             timeout_seconds: 5,

@@ -1,4 +1,5 @@
 use crate::tui::app::PendingConfirmation;
+use crate::tui::ui::truncate_str;
 
 /// 格式化工具二次确认 modal 文本：
 /// 第 1 行：工具名
@@ -11,16 +12,10 @@ pub(crate) fn format_confirmation(p: &PendingConfirmation) -> String {
         lines.truncate(8);
         lines.push("    ...");
     }
-    let body = lines.join("\n");
-    let truncated_body = if body.chars().count() > 400 {
-        let t: String = body.chars().take(400).collect();
-        format!("{}…", t)
-    } else {
-        body
-    };
     format!(
         "Approve tool call?\n\nTool: {}\nArguments:\n{}",
-        p.tool_name, truncated_body
+        p.tool_name,
+        truncate_str(&lines.join("\n"), 400)
     )
 }
 

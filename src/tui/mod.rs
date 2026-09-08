@@ -44,7 +44,7 @@ pub(crate) async fn run_tui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = app::App::new(session_id);
 
-    // Load prior conversation history for resumed sessions.
+    // resume 的会话要先加载历史对话。
     conn.sender
         .send(ClientMessage::GetHistory { session_id })
         .await?;
@@ -97,12 +97,8 @@ pub(crate) async fn run_tui(
     )
     .await;
 
-    // teardown (best-effort; don't mask run_loop's error)
-    let _ = disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen);
-    let _ = execute!(stdout, crossterm::event::DisableBracketedPaste);
-    let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+    // 终端状态由 `_raw_guard` 的 Drop 统一恢复（尽力而为，
+    // 不掩盖 run_loop 的错误）。
     result
 }
 
@@ -125,7 +121,7 @@ async fn run_loop(
             Some(ev) = ui_rx.recv() => {
                 match ev {
                     UiEvent::Quit => break,
-                    UiEvent::Resize(_, _) => {
+                    UiEvent::Resize => {
                         let _ = terminal.clear();
                         *dirty = true;
                     }
@@ -199,7 +195,7 @@ async fn run_loop(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                // 50ms tick for cursor/refresh even when no events arrive
+                // 50ms 心跳：没有事件也保持光标/刷新
                 *dirty = true;
             }
         }
@@ -306,7 +302,7 @@ async fn handle_key(
                 Ok(None)
             }
             _ => {
-                // TextArea handles other keys (cursor/backspace/etc.)
+                // 其余按键交给 TextArea（光标/退格等）
                 input.input(ratatui_textarea::Input::from(k));
                 Ok(None)
             }

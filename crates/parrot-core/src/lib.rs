@@ -19,5 +19,5 @@ pub use provider::{
     ChatStream, LlmProvider, ProviderRegistry, ProviderStopReason, ProviderStreamEvent,
 };
 pub use session::{SessionCmd, SessionHandle, SessionManager};
-pub use tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry, ToolResult};
+pub use tool::{Tool, ToolContext, ToolDefinition, ToolOutput, ToolRegistry};
 pub use types::*;

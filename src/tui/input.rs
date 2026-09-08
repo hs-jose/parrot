@@ -5,8 +5,7 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub(crate) enum UiEvent {
     Key(KeyEvent),
-    #[allow(dead_code)]
-    Resize(u16, u16),
+    Resize,
     Paste(String),
     /// poll/read 出错时发出，主循环据此退出。
     Quit,
@@ -29,14 +28,14 @@ pub(crate) fn spawn_input_thread(tx: mpsc::Sender<UiEvent>) -> std::thread::Join
                 Event::Key(k) if tx.blocking_send(UiEvent::Key(k)).is_err() => {
                     break;
                 }
-                Event::Resize(w, h) => match tx.blocking_send(UiEvent::Resize(w, h)) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                },
-                Event::Paste(s) => match tx.blocking_send(UiEvent::Paste(s)) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                },
+                Event::Resize(..) if tx.blocking_send(UiEvent::Resize).is_err() => {
+                    break;
+                }
+                Event::Paste(s) => {
+                    if tx.blocking_send(UiEvent::Paste(s)).is_err() {
+                        break;
+                    }
+                }
                 _ => {}
             },
             Err(_) => {

@@ -4,8 +4,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShellDenylistConfig {
-    /// Substring patterns (case-insensitive). A command containing any
-    /// pattern as a substring is blocked.
+    /// 子串模式（不区分大小写）。命令包含任一模式即被拦截。
     #[serde(default = "ShellDenylistConfig::default_patterns")]
     pub patterns: Vec<String>,
 }
@@ -39,12 +38,10 @@ impl ShellDenylist {
 
     fn is_denied(&self, command: &str) -> bool {
         let command_lower = command.to_lowercase();
-        for pattern in &self.cfg.patterns {
-            if command_lower.contains(&pattern.to_lowercase()) {
-                return true;
-            }
-        }
-        false
+        self.cfg
+            .patterns
+            .iter()
+            .any(|p| command_lower.contains(&p.to_lowercase()))
     }
 }
 
@@ -61,20 +58,11 @@ impl Hook for ShellDenylist {
         ev: HookEvent<'_>,
         _ctx: &HookCtx<'_>,
     ) -> Result<HookAction, parrot_core::AgentError> {
-        if let HookEvent::ToolCall {
-            tool_name,
-            arguments,
-            ..
-        } = ev
-        {
-            if matches!(tool_name, "shell_exec" | "bash" | "shell") {
-                if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
-                    if self.is_denied(cmd) {
-                        return Ok(HookAction::Block {
-                            reason: format!("command denied by shell_denylist: {}", cmd),
-                        });
-                    }
-                }
+        if let Some(cmd) = crate::extract_shell_command(&ev) {
+            if self.is_denied(cmd) {
+                return Ok(HookAction::Block {
+                    reason: format!("command denied by shell_denylist: {}", cmd),
+                });
             }
         }
         Ok(HookAction::NoOp)

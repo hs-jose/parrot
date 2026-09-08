@@ -16,11 +16,12 @@ pub(crate) struct DaemonChild {
 impl DaemonChild {
     /// 终止子进程。幂等，可多次调用。
     pub fn kill(&self) {
-        if let Some(child) = self.inner.lock().unwrap().as_mut() {
+        let mut slot = self.inner.lock().unwrap();
+        if let Some(child) = slot.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        *self.inner.lock().unwrap() = None;
+        *slot = None;
     }
 }
 
@@ -82,7 +83,7 @@ pub(crate) async fn ensure_running(
     let wait_result = timeout(DAEMON_START_TIMEOUT, async {
         loop {
             if probe_port(&addr).await {
-                return Ok(());
+                return;
             }
             sleep(DAEMON_POLL_INTERVAL).await;
         }
@@ -90,8 +91,7 @@ pub(crate) async fn ensure_running(
     .await;
 
     match wait_result {
-        Ok(Ok(())) => Ok((connect_url, guard)),
-        Ok(Err(e)) => Err(e),
+        Ok(()) => Ok((connect_url, guard)),
         Err(_) => Err(format!(
             "parrotd did not become reachable within {:?}. Check log: {}",
             DAEMON_START_TIMEOUT,
@@ -107,12 +107,12 @@ fn pick_free_port() -> Result<u16, std::io::Error> {
     Ok(listener.local_addr()?.port())
 }
 
-/// TCP probe to check if the daemon port is open.
+/// TCP 探测 daemon 端口是否已开。
 async fn probe_port(addr: &str) -> bool {
     TcpStream::connect(addr).await.is_ok()
 }
 
-/// Returns the path to the parrotd executable next to the current parrot binary.
+/// 返回与当前 parrot 二进制同目录的 parrotd 可执行文件路径。
 pub fn daemon_binary_path() -> Option<PathBuf> {
     let mut exe = std::env::current_exe().ok()?;
     exe.pop();

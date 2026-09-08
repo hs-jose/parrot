@@ -46,8 +46,8 @@ fn built_in_patterns() -> &'static [SecretPattern] {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RedactSecretsConfig {
-    /// User-defined regex patterns. Matched content is replaced with
-    /// `[REDACTED]`. Invalid regex is warn-logged and skipped.
+    /// 用户自定义 regex 模式。命中内容替换为 `[REDACTED]`。
+    /// 非法 regex 记 warn 并跳过。
     #[serde(default)]
     pub extra_patterns: Vec<String>,
 }
@@ -65,38 +65,33 @@ impl RedactSecrets {
         let mut buf = content.to_string();
         let mut changed = false;
 
-        for SecretPattern { re, repl } in built_in_patterns() {
-            let next = re.replace_all(&buf, *repl).to_string();
+        // 内置模式与用户 extra_patterns 统一走同一套 replace_all 流程。
+        let mut apply = |re: &Regex, repl: &str| {
+            let next = re.replace_all(&buf, repl).to_string();
             if next != buf {
                 changed = true;
                 buf = next;
             }
+        };
+
+        for SecretPattern { re, repl } in built_in_patterns() {
+            apply(re, repl);
         }
 
         for pattern_str in &self.cfg.extra_patterns {
-            let re = match Regex::new(pattern_str) {
-                Ok(re) => re,
+            match Regex::new(pattern_str) {
+                Ok(re) => apply(&re, "[REDACTED]"),
                 Err(e) => {
                     tracing::warn!(
                         pattern = pattern_str,
                         error = %e,
                         "invalid regex in [hooks.redact_secrets].extra_patterns; skipping"
                     );
-                    continue;
                 }
-            };
-            let next = re.replace_all(&buf, "[REDACTED]").to_string();
-            if next != buf {
-                changed = true;
-                buf = next;
             }
         }
 
-        if changed {
-            Some(buf)
-        } else {
-            None
-        }
+        changed.then_some(buf)
     }
 }
 

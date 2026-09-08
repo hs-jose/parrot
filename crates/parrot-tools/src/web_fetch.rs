@@ -3,14 +3,9 @@ use parrot_core::error::AgentError;
 use parrot_core::tool::{Tool, ToolContext, ToolOutput};
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct WebFetchTool {
     client: reqwest::Client,
-}
-
-impl Default for WebFetchTool {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl WebFetchTool {
@@ -48,13 +43,7 @@ impl Tool for WebFetchTool {
     }
 
     async fn call(&self, arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let url = arguments
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::ToolExecution {
-                tool: "web_fetch".to_string(),
-                message: "Missing 'url' argument".to_string(),
-            })?;
+        let url = super::str_arg(&arguments, "url", "web_fetch")?;
 
         let response =
             self.client
@@ -75,11 +64,15 @@ impl Tool for WebFetchTool {
                 message: format!("Failed to read response body: {}", e),
             })?;
 
-        // Truncate very large responses
+        // 超大响应截断（按字符边界切，避免 panic）
         let content = if content.len() > 100_000 {
+            let mut end = 100_000;
+            while !content.is_char_boundary(end) {
+                end -= 1;
+            }
             format!(
                 "{}... (truncated, total {} bytes)",
-                &content[..100_000],
+                &content[..end],
                 content.len()
             )
         } else {

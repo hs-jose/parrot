@@ -3,10 +3,11 @@ use parrot_core::error::AgentError;
 use parrot_core::tool::{Tool, ToolContext, ToolOutput};
 use serde_json::Value;
 
+#[derive(Default)]
 pub struct FileGlobTool;
 
 impl FileGlobTool {
-    pub fn new(_working_dir: std::path::PathBuf) -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -39,52 +40,40 @@ impl Tool for FileGlobTool {
     }
 
     async fn call(&self, arguments: Value, ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
-        let pattern = arguments
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AgentError::ToolExecution {
-                tool: "file_glob".to_string(),
-                message: "Missing 'pattern' argument".to_string(),
-            })?;
+        let pattern = super::str_arg(&arguments, "pattern", "file_glob")?;
 
         let base_path = arguments
             .get("path")
             .and_then(|v| v.as_str())
-            .map(|p| {
-                if std::path::Path::new(p).is_absolute() {
-                    std::path::PathBuf::from(p)
-                } else {
-                    ctx.working_dir.join(p)
-                }
-            })
+            .map(|p| super::resolve_arg_path(p, &ctx.working_dir))
             .unwrap_or_else(|| ctx.working_dir.clone());
 
         let glob_pattern = base_path.join(pattern);
         let glob_str = glob_pattern.to_string_lossy().to_string();
 
-        let mut matches = Vec::new();
-        match glob::glob(&glob_str) {
-            Ok(paths) => {
-                for entry in paths {
-                    match entry {
-                        Ok(path) => {
-                            let relative = path.strip_prefix(&base_path).unwrap_or(&path);
-                            matches.push(relative.to_string_lossy().to_string());
-                        }
-                        Err(e) => {
-                            return Ok(ToolOutput {
-                                content: format!("Glob error: {}", e),
-                                is_error: true,
-                            });
-                        }
-                    }
-                }
-            }
+        let paths = match glob::glob(&glob_str) {
+            Ok(paths) => paths,
             Err(e) => {
                 return Ok(ToolOutput {
                     content: format!("Invalid glob pattern '{}': {}", pattern, e),
                     is_error: true,
                 });
+            }
+        };
+
+        let mut matches = Vec::new();
+        for entry in paths {
+            match entry {
+                Ok(path) => {
+                    let relative = path.strip_prefix(&base_path).unwrap_or(&path);
+                    matches.push(relative.to_string_lossy().to_string());
+                }
+                Err(e) => {
+                    return Ok(ToolOutput {
+                        content: format!("Glob error: {}", e),
+                        is_error: true,
+                    });
+                }
             }
         }
 

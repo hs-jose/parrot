@@ -48,6 +48,11 @@ pub struct CompactionPlan {
     /// 保留区起点下标(指向某个 User 消息,tool 配对安全)。
     pub cut_index: usize,
 }
+/// 摘要消息正文：标记行 + 摘要内容。
+pub fn wrap_summary(summary: &str) -> String {
+    format!("{SUMMARY_MARKER}\n{summary}")
+}
+
 pub fn is_summary_message(msg: &ChatMessage) -> bool {
     msg.role == ChatRole::User && msg.content.starts_with(SUMMARY_MARKER)
 }
@@ -133,26 +138,14 @@ pub fn plan_compaction(
     })
 }
 
-fn user_msg(content: String) -> ChatMessage {
-    ChatMessage {
-        role: ChatRole::User,
-        content,
-        tool_call_id: None,
-        tool_name: None,
-        tool_calls: None,
-    }
+fn user_msg(content: impl Into<String>) -> ChatMessage {
+    ChatMessage::new(ChatRole::User, content)
 }
 
 /// 摘要请求体:[System(压缩指令), User(待摘要对话)]。
 pub fn build_summary_request(region: &[ChatMessage]) -> Vec<ChatMessage> {
     vec![
-        ChatMessage {
-            role: ChatRole::System,
-            content: SUMMARIZATION_PROMPT.to_string(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-        },
+        ChatMessage::new(ChatRole::System, SUMMARIZATION_PROMPT),
         user_msg(serialize_conversation(region)),
     ]
 }
@@ -164,7 +157,7 @@ pub fn apply_summary(
     plan: &CompactionPlan,
     summary: &str,
 ) -> (u32, u32) {
-    let summary_content = format!("{SUMMARY_MARKER}\n{summary}");
+    let summary_content = wrap_summary(summary);
     let kept: Vec<ChatMessage> = context[plan.cut_index..].to_vec();
     let head: Vec<ChatMessage> = context[..plan.summarize_start].to_vec();
     let dropped = (plan.cut_index - plan.summarize_start) as u32;
@@ -181,13 +174,7 @@ mod tests {
     use super::*;
 
     fn msg(role: ChatRole, content: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: content.to_string(),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-        }
+        ChatMessage::new(role, content)
     }
 
     /// [sys, u1, a1, u2, a2, ...] 每条 turn 的 user 消息 chars_each 字符。
@@ -307,7 +294,7 @@ mod tests {
 
     #[test]
     fn plan_cut_never_lands_on_tool_message() {
-        // turn with tool calls: User, Assistant(tool_calls), Tool, Assistant
+        // 带工具调用的 turn：User, Assistant(tool_calls), Tool, Assistant
         let mut ctx = vec![msg(ChatRole::System, "sys")];
         for i in 0..4 {
             ctx.push(msg(ChatRole::User, &format!("q{}{}", i, "x".repeat(4000))));

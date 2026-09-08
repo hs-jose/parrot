@@ -470,7 +470,8 @@ fn spinner_frame() -> &'static str {
     FRAMES[(ms / 100) as usize % FRAMES.len()]
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
+/// 按字符数截断（超出补 `…`）。ui 渲染与 confirm modal 共用。
+pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

@@ -26,9 +26,8 @@ pub struct SessionHandle {
     pub end_reason: Arc<Mutex<AgentEndReason>>,
 }
 
-/// What the engine should inject as the system prompt when the client didn't
-/// supply one in `SessionConfig`. Daemon supplies this so `parrot-core` stays
-/// policy-free (the engine only emits whatever prompt it's handed).
+/// 客户端未在 `SessionConfig` 里带 system prompt 时，引擎注入的默认提示词。
+/// 由 daemon 提供以此保证 `parrot-core` 不带策略（引擎只转发拿到的 prompt）。
 pub fn default_system_prompt() -> String {
     "You are Parrot, a helpful coding assistant. Use the available tools when \
      they help you answer the user's request. Reason step by step about which \
@@ -37,21 +36,20 @@ pub fn default_system_prompt() -> String {
         .to_string()
 }
 
-/// Phase 1.5: tool-call confirmation configuration. Lives in core so the
-/// engine can read it without a boundary crossing each tool call. Populated
-/// by the daemon from `config.tools.sandbox.require_confirmation` plus the
-/// shared `ConfirmRouter` handle. Cloned cheaply into each engine instance.
+/// Phase 1.5：工具调用确认配置。放在 core 里让引擎读取时不必跨边界。
+/// 由 daemon 根据 `config.tools.sandbox.require_confirmation` 与共享的
+/// `ConfirmRouter` 句柄填充，再以低开销 clone 进每个引擎实例。
 #[derive(Clone)]
 pub struct ConfirmConfig {
-    /// Tool-name prefixes that require client confirmation before execution.
-    /// Simple `starts_with` match (see `2026-06-21-parrot-phase-1.5.md` §4.3).
+    /// 需要客户端确认后才执行的工具名前缀。简单 `starts_with` 匹配
+    /// （见 `2026-06-21-parrot-phase-1.5.md` §4.3）。
     pub require_confirmation: Vec<String>,
-    /// How long to wait for `ClientMessage::ConfirmToolCall` before treating
-    /// it as `ConfirmDecision::Timeout`. Default 60s; tests use a small value.
+    /// 等待 `ClientMessage::ConfirmToolCall` 的时长，超时按
+    /// `ConfirmDecision::Timeout` 处理。默认 60s；测试用小值。
     pub timeout: Duration,
-    /// The daemon-side router that bridges client responses to waiting
-    /// session tasks. `None` disables confirmation entirely (engine never
-    /// blocks on a confirm). Set by the daemon when constructing the engine.
+    /// daemon 侧路由器，把客户端响应桥接到等待中的会话任务。
+    /// `None` 表示完全禁用确认（引擎不会因确认阻塞）。
+    /// 由 daemon 构造引擎时设置。
     pub router: Option<Arc<ConfirmRouter>>,
 }
 
@@ -74,8 +72,8 @@ pub struct SessionManager {
     working_dir: std::path::PathBuf,
     confirm_config: ConfirmConfig,
     hooks: Option<Arc<HookRegistry>>,
-    /// Context limits (`[session]` from parrot.toml), inherited by
-    /// every engine this manager spawns.
+    /// 上下文限额（parrot.toml 的 `[session]`），由本管理器 spawn 的
+    /// 每个引擎继承。
     context_limits: ContextLimits,
 }
 
@@ -100,9 +98,8 @@ impl SessionManager {
         }
     }
 
-    /// Set the confirmation config. Daemon calls this once at startup, after
-    /// `new()`, before any session is created. Each engine instance gets a
-    /// clone of this config.
+    /// 设置确认配置。daemon 在启动时调用一次，位于 `new()` 之后、
+    /// 创建任何会话之前。每个引擎实例拿到它的 clone。
     pub fn with_confirm_config(mut self, config: ConfirmConfig) -> Self {
         self.confirm_config = config;
         self
@@ -113,8 +110,8 @@ impl SessionManager {
         self
     }
 
-    /// Set context limits (`[session]` from parrot.toml). Every engine
-    /// spawned afterwards inherits them.
+    /// 设置上下文限额（parrot.toml 的 `[session]`）。之后 spawn 的
+    /// 每个引擎都会继承。
     pub fn with_context_limits(mut self, limits: ContextLimits) -> Self {
         self.context_limits = limits;
         self
@@ -134,11 +131,9 @@ impl SessionManager {
                     max_tokens: self.default_config.max_tokens,
                     stop_sequences: self.default_config.stop_sequences.clone(),
                 };
-                // If the client supplied a system_prompt use it; otherwise fall
-                // back to the daemon default (kept here in core's `session`
-                // module purely so the engine doesn't need to know the
-                // default — the daemon is free to override before constructing
-                // the engine if it wants a different default).
+                // 客户端带 system_prompt 就用；否则回退到 daemon 默认值。
+                // 默认值放在 core 的 session 模块纯粹是为了让引擎不必知道
+                // 默认内容——daemon 构造引擎前想换默认随时可以覆盖。
                 let prompt = Some(c.system_prompt.unwrap_or_else(default_system_prompt));
                 (gen, prompt)
             }
@@ -148,33 +143,14 @@ impl SessionManager {
             }
         };
 
-        self.spawn_session(id, gen_config, system_prompt, Vec::new())
+        self.spawn_session(id, gen_config, system_prompt, Vec::new(), None)
             .await?;
         Ok(id)
     }
 
-    /// Phase 1.5: create a session with a pre-built context. Used by
-    /// `ResumeSession` to reconstruct the in-memory state from a replayed
-    /// event log. The `replayed_context` should NOT include the system
-    /// prompt — the engine injects `system_prompt` at the head itself
-    /// (matching `create_session`'s behavior), so callers should pass only
-    /// user/assistant/tool messages.
-    pub async fn create_session_with_context(
-        &mut self,
-        id: Uuid,
-        config: GenerateConfig,
-        system_prompt: Option<String>,
-        replayed_context: Vec<ChatMessage>,
-    ) -> Result<Uuid, crate::error::AgentError> {
-        self.spawn_session(id, config, system_prompt, replayed_context)
-            .await?;
-        Ok(id)
-    }
-
-    /// Resume variant: spawn an engine with the replayed context plus
-    /// resume-specific metadata (`resumed_from_seq`, optional integrity
-    /// warning). The daemon's `resume_session` calls this after running
-    /// `EventLog::replay_for_resume` and `rebuild_context`.
+    /// Resume 变体：用回放出的上下文加 resume 专属元数据（`resumed_from_seq`、
+    /// 可选完整性告警）spawn 引擎。daemon 的 `resume_session` 在跑完
+    /// `EventLog::replay_for_resume` 与 `rebuild_context` 后调用这里。
     pub async fn create_resumed_session(
         &mut self,
         id: Uuid,
@@ -184,6 +160,29 @@ impl SessionManager {
         resumed_from_seq: u64,
         integrity_warning: Option<parrot_protocol::agent_event::IntegrityIssue>,
     ) -> Result<Uuid, crate::error::AgentError> {
+        self.spawn_session(
+            id,
+            config,
+            system_prompt,
+            replayed_context,
+            Some((resumed_from_seq, integrity_warning)),
+        )
+        .await?;
+        Ok(id)
+    }
+
+    /// 内部共享：构造引擎、spawn 其任务、注册句柄。
+    /// `initial_context` 喂给引擎的 run 循环，让它能从会话中段续跑
+    /// （全新会话传空）。`resume` 携带 resume 回放元数据（seq 起点 +
+    /// 可选完整性告警），全新会话传 `None`。
+    async fn spawn_session(
+        &mut self,
+        id: Uuid,
+        gen_config: GenerateConfig,
+        system_prompt: Option<String>,
+        initial_context: Vec<ChatMessage>,
+        resume: Option<(u64, Option<parrot_protocol::agent_event::IntegrityIssue>)>,
+    ) -> Result<(), crate::error::AgentError> {
         let session_dir = self.data_dir.join(id.to_string());
         std::fs::create_dir_all(&session_dir)?;
 
@@ -197,68 +196,6 @@ impl SessionManager {
             id,
             Arc::clone(&self.tool_registry),
             Arc::clone(&self.provider_registry),
-            config,
-            system_prompt,
-            session_dir,
-            self.working_dir.clone(),
-        )
-        .with_confirm_config(self.confirm_config.clone())
-        .with_initial_context(replayed_context)
-        .with_resumed_from(resumed_from_seq)
-        .with_context_limits(self.context_limits.clone())
-        .with_end_reason(Arc::clone(&end_reason));
-
-        if let Some(issue) = integrity_warning {
-            engine = engine.with_pending_integrity_warning(issue);
-        }
-
-        let engine = if let Some(h) = self.hooks.clone() {
-            engine.with_hooks(h)
-        } else {
-            engine
-        };
-
-        let join_handle = tokio::spawn(async move {
-            engine.run(cmd_rx, event_tx).await;
-        });
-
-        self.sessions.insert(
-            id,
-            SessionHandle {
-                id,
-                cmd_tx,
-                event_rx: Some(event_rx),
-                join_handle,
-                end_reason,
-            },
-        );
-
-        Ok(id)
-    }
-
-    /// Shared inner: build the engine, spawn its task, register the handle.
-    /// `initial_context` is fed to the engine's run loop so it can resume
-    /// mid-conversation (empty for fresh sessions).
-    async fn spawn_session(
-        &mut self,
-        id: Uuid,
-        gen_config: GenerateConfig,
-        system_prompt: Option<String>,
-        initial_context: Vec<ChatMessage>,
-    ) -> Result<(), crate::error::AgentError> {
-        let session_dir = self.data_dir.join(id.to_string());
-        std::fs::create_dir_all(&session_dir)?;
-
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCmd>(32);
-        let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(64);
-
-        let end_reason: Arc<Mutex<AgentEndReason>> =
-            Arc::new(Mutex::new(AgentEndReason::ClientDisconnect));
-
-        let engine = ReActEngine::new(
-            id,
-            Arc::clone(&self.tool_registry),
-            Arc::clone(&self.provider_registry),
             gen_config,
             system_prompt,
             session_dir,
@@ -268,6 +205,14 @@ impl SessionManager {
         .with_initial_context(initial_context)
         .with_context_limits(self.context_limits.clone())
         .with_end_reason(Arc::clone(&end_reason));
+
+        if let Some((resumed_from_seq, integrity_warning)) = resume {
+            engine = engine.with_resumed_from(resumed_from_seq);
+            if let Some(issue) = integrity_warning {
+                engine = engine.with_pending_integrity_warning(issue);
+            }
+        }
+
         let engine = if let Some(h) = self.hooks.clone() {
             engine.with_hooks(h)
         } else {
@@ -296,72 +241,36 @@ impl SessionManager {
         self.sessions.get(id)
     }
 
-    pub fn get_handle_mut(&mut self, id: &Uuid) -> Option<&mut SessionHandle> {
-        self.sessions.get_mut(id)
-    }
-
-    /// Takes the event receiver for a session. Returns None if already taken or session not found.
+    /// 取走某会话的事件接收端。已被取走或会话不存在时返回 None。
     pub fn take_event_receiver(&mut self, id: &Uuid) -> Option<mpsc::Receiver<AgentEvent>> {
         self.sessions.get_mut(id)?.event_rx.take()
     }
 
-    /// Get tool definitions from the tool registry
+    /// 取工具注册表里的工具定义列表
     pub async fn list_tool_definitions(&self) -> Vec<crate::tool::ToolDefinition> {
         self.tool_registry.list_definitions().await
     }
 
-    /// Enumerate all known session ids (used by the daemon to implement
-    /// `ListSessions` in Phase 1.5 — kept here so the session manager is the
-    /// single source of truth for the in-memory session set).
-    pub fn session_ids(&self) -> Vec<Uuid> {
-        self.sessions.keys().copied().collect()
-    }
-
-    /// Whether a session with the given id is currently live in this manager.
-    /// `ResumeSession` uses this to short-circuit: if the session is already
-    /// in memory (e.g. resumed by another connection), just acknowledge.
+    /// 某会话是否仍在本管理器内活跃。`ResumeSession` 用它短路：
+    /// 会话已在内存（比如被另一条连接 resume 过）时直接确认即可。
     pub fn contains(&self, id: &Uuid) -> bool {
         self.sessions.contains_key(id)
     }
 
-    /// Check if a session is healthy: engine still running (cmd_tx open) and
-    /// event receiver still available (not taken by a relay task). Used by
-    /// the daemon's `resume_session` to decide whether to short-circuit or
-    /// clean up and re-resume from disk.
-    pub fn is_healthy(&self, id: &Uuid) -> bool {
-        match self.sessions.get(id) {
-            Some(h) => !h.cmd_tx.is_closed() && h.event_rx.is_some(),
-            None => false,
-        }
-    }
-
-    /// Remove a session from the manager and abort its engine task. Used by
-    /// the daemon's `resume_session` to clean up stale handles (engine exited
-    /// or event receiver already taken) before re-spawning from disk.
-    pub fn remove(&mut self, id: &Uuid) -> bool {
-        if let Some(handle) = self.sessions.remove(id) {
-            handle.join_handle.abort();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Cooperative daemon graceful-shutdown: set `end_reason` to
-    /// `DaemonShutdown` on every live session, send `Abort` to interrupt
-    /// in-flight work, drop the command senders (taking the handles) so
-    /// idle engines exit via their `None` branch, then await each
-    /// `JoinHandle` up to `deadline`. Sessions that don't exit in time are
-    /// force-aborted (their `AgentEndGuard` Drop fires a best-effort
-    /// `AgentEnd`). The `DaemonShutdown` reason is preserved because the
-    /// engine's `None` branch leaves a pre-set `DaemonShutdown` untouched.
+    /// 协作式优雅停机：把所有活跃会话的 `end_reason` 置为
+    /// `DaemonShutdown`，发送 `Abort` 打断在途工作，丢掉命令发送端
+    /// （顺带取走句柄）让空闲引擎走 `None` 分支退出，然后在 `deadline`
+    /// 内逐个 await `JoinHandle`。超时未退出的会话被强制 abort
+    /// （其 `AgentEndGuard` 的 Drop 会尽力补发 `AgentEnd`）。
+    /// `DaemonShutdown` 原因得以保留，因为引擎的 `None` 分支不会
+    /// 覆盖已设置的 `DaemonShutdown`。
     pub async fn shutdown_all(&mut self, deadline: Duration) {
         for handle in self.sessions.values() {
             *handle.end_reason.lock().unwrap() = AgentEndReason::DaemonShutdown;
             let _ = handle.cmd_tx.send(SessionCmd::Abort).await;
         }
-        // A second Abort in case the first was consumed mid-turn and the
-        // engine is now awaiting the next command.
+        // 第二次 Abort：防止第一次恰好在 turn 中途被消费、引擎此刻
+        // 正在等下一条命令的情况。
         for handle in self.sessions.values() {
             let _ = handle.cmd_tx.send(SessionCmd::Abort).await;
         }

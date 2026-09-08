@@ -11,9 +11,7 @@ use parrot_protocol::types::{SessionMeta, ToolDefinitionWire};
 use parrot_protocol::{ClientMessage, ServerMessage, SessionId};
 use std::io::IsTerminal;
 
-use crate::conn::{
-    connect as connect_with_token, create_session, wait_hello, wait_session_resumed, Connection,
-};
+use crate::conn::{create_session, expect_msg, open_conn, wait_session_resumed, Connection};
 use crate::stream::print_stream;
 
 #[derive(Parser)]
@@ -62,8 +60,8 @@ enum SessionsAction {
     Resume {
         session_id: String,
     },
-    /// Export a session's event log as JSON (Vec<PersistedAgentEvent>).
-    /// Output can be saved to a file for TUI replay tests:
+    /// 导出某会话的事件日志为 JSON（`Vec<PersistedAgentEvent>`）。
+    /// 输出可存盘供 TUI 回放测试使用：
     ///   parrot sessions export <id> > tests/tui_replay/my_fixture.json
     Export {
         session_id: String,
@@ -267,10 +265,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Resolve the daemon connect URL. If `--connect` is provided, use it
-/// verbatim (caller is responsible for that daemon running). Otherwise
-/// spawn a fresh parrotd child on a random local port and keep the
-/// kill-on-drop guard alive in the returned `DaemonChild`.
+/// 解析 daemon 连接 URL。给了 `--connect` 就原样使用（调用方自行保证
+/// daemon 已在运行）；否则在随机本地端口 spawn 一个全新的 parrotd 子
+/// 进程，由返回的 `DaemonChild` 的 kill-on-drop 守卫负责清理。
 async fn resolve_connect(
     cli: &Cli,
     config: &AppConfig,
@@ -286,13 +283,7 @@ async fn resolve_connect(
 
 async fn run_default(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let (connect_url, _guard) = resolve_connect(&cli, config).await?;
-    let token_path = cli
-        .token_file
-        .clone()
-        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
-    let mut conn = connect_with_token(&connect_url, &token_path).await?;
-    let server_version = wait_hello(&mut conn.receiver).await?;
-    eprintln!("Connected to server v{}", server_version);
+    let mut conn = open_conn(&cli, config, &connect_url).await?;
 
     let session_id = if let Some(sid_str) = &cli.session {
         let id: SessionId = sid_str
@@ -331,61 +322,39 @@ async fn run_sessions(
     config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (connect_url, _guard) = resolve_connect(&cli, config).await?;
-    let token_path = cli
-        .token_file
-        .clone()
-        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
     match action {
         SessionsAction::List => {
-            let mut conn = connect_with_token(&connect_url, &token_path).await?;
-            let server_version = wait_hello(&mut conn.receiver).await?;
-            eprintln!("Connected to server v{}", server_version);
+            let mut conn = open_conn(&cli, config, &connect_url).await?;
             conn.sender.send(ClientMessage::ListSessions).await?;
-            loop {
-                match conn.receiver.recv().await {
-                    Some(ServerMessage::SessionList { sessions }) => {
-                        print_session_table(&sessions);
-                        return Ok(());
-                    }
-                    Some(ServerMessage::Error { message, .. }) => {
-                        return Err(format!("Server error: {}", message).into());
-                    }
-                    Some(msg) => eprintln!("Unexpected message: {:?}", msg),
-                    None => return Err("Connection closed".into()),
-                }
-            }
+            let sessions = expect_msg(&mut conn.receiver, "listing sessions", |m| match m {
+                ServerMessage::SessionList { sessions } => Some(sessions.clone()),
+                _ => None,
+            })
+            .await?;
+            print_session_table(&sessions);
+            Ok(())
         }
         SessionsAction::Show { session_id } => {
             let id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect_with_token(&connect_url, &token_path).await?;
-            let server_version = wait_hello(&mut conn.receiver).await?;
-            eprintln!("Connected to server v{}", server_version);
+            let mut conn = open_conn(&cli, config, &connect_url).await?;
             conn.sender
                 .send(ClientMessage::GetHistory { session_id: id })
                 .await?;
-            loop {
-                match conn.receiver.recv().await {
-                    Some(ServerMessage::History { events, .. }) => {
-                        print_history(&events);
-                        return Ok(());
-                    }
-                    Some(ServerMessage::Error { message, .. }) => {
-                        return Err(format!("Server error: {}", message).into());
-                    }
-                    Some(msg) => eprintln!("Unexpected message: {:?}", msg),
-                    None => return Err("Connection closed".into()),
-                }
-            }
+            let events = expect_msg(&mut conn.receiver, "reading history", |m| match m {
+                ServerMessage::History { events, .. } => Some(events.clone()),
+                _ => None,
+            })
+            .await?;
+            print_history(&events);
+            Ok(())
         }
         SessionsAction::Resume { session_id } => {
             let session_id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect_with_token(&connect_url, &token_path).await?;
-            let server_version = wait_hello(&mut conn.receiver).await?;
-            eprintln!("Connected to server v{}", server_version);
+            let mut conn = open_conn(&cli, config, &connect_url).await?;
             conn.sender
                 .send(ClientMessage::ResumeSession { session_id })
                 .await?;
@@ -398,79 +367,47 @@ async fn run_sessions(
             let id: SessionId = session_id
                 .parse()
                 .map_err(|e: uuid::Error| format!("invalid session id '{}': {}", session_id, e))?;
-            let mut conn = connect_with_token(&connect_url, &token_path).await?;
-            let server_version = wait_hello(&mut conn.receiver).await?;
-            eprintln!("Connected to server v{}", server_version);
+            let mut conn = open_conn(&cli, config, &connect_url).await?;
             conn.sender
                 .send(ClientMessage::GetHistory { session_id: id })
                 .await?;
-            loop {
-                match conn.receiver.recv().await {
-                    Some(ServerMessage::History { events, .. }) => {
-                        let json = serde_json::to_string_pretty(&events)?;
-                        println!("{}", json);
-                        return Ok(());
-                    }
-                    Some(ServerMessage::Error { message, .. }) => {
-                        return Err(format!("Server error: {}", message).into());
-                    }
-                    Some(msg) => eprintln!("Unexpected message: {:?}", msg),
-                    None => return Err("Connection closed".into()),
-                }
-            }
+            let events = expect_msg(&mut conn.receiver, "exporting history", |m| match m {
+                ServerMessage::History { events, .. } => Some(events.clone()),
+                _ => None,
+            })
+            .await?;
+            let json = serde_json::to_string_pretty(&events)?;
+            println!("{}", json);
+            Ok(())
         }
     }
 }
 
 async fn run_models(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let (connect_url, _guard) = resolve_connect(&cli, config).await?;
-    let token_path = cli
-        .token_file
-        .clone()
-        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
-    let mut conn = connect_with_token(&connect_url, &token_path).await?;
-    let server_version = wait_hello(&mut conn.receiver).await?;
-    eprintln!("Connected to server v{}", server_version);
+    let mut conn = open_conn(&cli, config, &connect_url).await?;
     conn.sender.send(ClientMessage::ListModels).await?;
-    loop {
-        match conn.receiver.recv().await {
-            Some(ServerMessage::ModelList { models }) => {
-                print_model_list(&models);
-                return Ok(());
-            }
-            Some(ServerMessage::Error { message, .. }) => {
-                return Err(format!("Server error: {}", message).into());
-            }
-            Some(msg) => eprintln!("Unexpected message: {:?}", msg),
-            None => return Err("Connection closed".into()),
-        }
-    }
+    let models = expect_msg(&mut conn.receiver, "listing models", |m| match m {
+        ServerMessage::ModelList { models } => Some(models.clone()),
+        _ => None,
+    })
+    .await?;
+    print_model_list(&models);
+    Ok(())
 }
 
 async fn run_tools(cli: Cli, config: &AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let (connect_url, _guard) = resolve_connect(&cli, config).await?;
-    let token_path = cli
-        .token_file
-        .clone()
-        .unwrap_or_else(|| config.daemon.auth_token_file.clone());
-    let mut conn = connect_with_token(&connect_url, &token_path).await?;
-    let server_version = wait_hello(&mut conn.receiver).await?;
-    eprintln!("Connected to server v{}", server_version);
+    let mut conn = open_conn(&cli, config, &connect_url).await?;
     let session_id = create_session(&conn.sender, &mut conn.receiver).await?;
     conn.sender
         .send(ClientMessage::ListTools { session_id })
         .await?;
-    loop {
-        match conn.receiver.recv().await {
-            Some(ServerMessage::ToolList { tools, .. }) => {
-                print_tool_list(&tools);
-                return Ok(());
-            }
-            Some(ServerMessage::Error { message, .. }) => {
-                return Err(format!("Server error: {}", message).into());
-            }
-            Some(msg) => eprintln!("Unexpected message: {:?}", msg),
-            None => return Err("Connection closed".into()),
-        }
-    }
+    let tools = expect_msg(&mut conn.receiver, "listing tools", |m| match m {
+        ServerMessage::ToolList { tools, .. } => Some(tools.clone()),
+        _ => None,
+    })
+    .await?;
+    print_tool_list(&tools);
+    Ok(())
 }

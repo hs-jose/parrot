@@ -32,7 +32,7 @@ struct AnthropicRequest {
     stop_sequences: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize)]
 struct AnthropicMessage {
     role: String,
     content: serde_json::Value,
@@ -48,18 +48,6 @@ struct AnthropicTool {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
-    #[allow(dead_code)]
-    stop_reason: Option<String>,
-    #[allow(dead_code)]
-    usage: AnthropicUsage,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicUsage {
-    #[allow(dead_code)]
-    input_tokens: u32,
-    #[allow(dead_code)]
-    output_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,7 +89,7 @@ impl AnthropicProvider {
                 }
                 ChatRole::Assistant => {
                     if let Some(tool_calls) = &msg.tool_calls {
-                        // Assistant message with tool_use blocks
+                        // 带 tool_use 块的助手消息
                         let mut blocks = Vec::new();
                         if !msg.content.is_empty() {
                             blocks.push(serde_json::json!({
@@ -130,7 +118,7 @@ impl AnthropicProvider {
                     i += 1;
                 }
                 ChatRole::Tool => {
-                    // Collect consecutive tool results into a single user message
+                    // 把连续的工具结果合并进一条 user 消息
                     let mut tool_results = Vec::new();
                     while i < messages.len() && messages[i].role == ChatRole::Tool {
                         tool_results.push(serde_json::json!({
@@ -162,22 +150,43 @@ impl AnthropicProvider {
     }
 
     fn extract_system_prompt(messages: &[ChatMessage]) -> Option<String> {
-        messages
+        let joined = messages
             .iter()
             .filter(|m| m.role == ChatRole::System)
-            .map(|m| m.content.clone())
-            .reduce(|a, b| format!("{}\n{}", a, b))
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!joined.is_empty()).then_some(joined)
+    }
+
+    /// 组装 `AnthropicRequest`；`chat` 与 `chat_stream` 仅 stream 标志不同。
+    fn build_request(
+        model: &str,
+        messages: Vec<AnthropicMessage>,
+        tools: Vec<AnthropicTool>,
+        system: Option<String>,
+        config: &GenerateConfig,
+        stream: Option<bool>,
+    ) -> AnthropicRequest {
+        AnthropicRequest {
+            model: model.to_string(),
+            messages,
+            max_tokens: config.max_tokens.unwrap_or(8192),
+            system,
+            tools,
+            stream,
+            temperature: config.temperature,
+            stop_sequences: config.stop_sequences.clone(),
+        }
     }
 
     async fn send_request(
         &self,
         request: &AnthropicRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        // Wrap the single HTTP attempt in the retry/backoff policy (§4.8).
-        // The closure captures `self` and `request` by reference; each retry
-        // builds a fresh future and re-issues the same POST. Stream-phase
-        // errors don't go through this path (we only retry up to the point
-        // where the response body starts streaming).
+        // 把单次 HTTP 尝试包进重试/退避策略（§4.8）。闭包按引用捕获
+        // `self` 与 `request`；每次重试构造新的 future 重发同一个 POST。
+        // 流式阶段的错误不走这条路（只在响应体开始流式传输之前重试）。
         crate::retry::with_retry(|| self.send_request_once(request)).await
     }
 
@@ -285,16 +294,14 @@ impl LlmProvider for AnthropicProvider {
             tracing::info!("  msg[{}] role={} preview={:?}", i, m.role, preview);
         }
 
-        let request = AnthropicRequest {
-            model: model.to_string(),
-            messages: anthropic_messages,
-            max_tokens: config.max_tokens.unwrap_or(8192),
+        let request = Self::build_request(
+            model,
+            anthropic_messages,
+            anthropic_tools,
             system,
-            tools: anthropic_tools,
-            stream: Some(true),
-            temperature: config.temperature,
-            stop_sequences: config.stop_sequences.clone(),
-        };
+            config,
+            Some(true),
+        );
 
         let response = self.send_request(&request).await?;
 
@@ -320,16 +327,14 @@ impl LlmProvider for AnthropicProvider {
         let anthropic_messages = Self::convert_messages(messages);
         let anthropic_tools = Self::convert_tools(tools);
 
-        let request = AnthropicRequest {
-            model: model.to_string(),
-            messages: anthropic_messages,
-            max_tokens: config.max_tokens.unwrap_or(8192),
+        let request = Self::build_request(
+            model,
+            anthropic_messages,
+            anthropic_tools,
             system,
-            tools: anthropic_tools,
-            stream: None,
-            temperature: config.temperature,
-            stop_sequences: config.stop_sequences.clone(),
-        };
+            config,
+            None,
+        );
 
         let response = self.send_request(&request).await?;
         let body: AnthropicResponse = response
@@ -363,21 +368,10 @@ impl LlmProvider for AnthropicProvider {
         }
 
         Ok(ChatMessage {
-            role: ChatRole::Assistant,
-            content: text_content,
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls)
-            },
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            ..ChatMessage::new(ChatRole::Assistant, text_content)
         })
     }
-}
-
-fn parse_stop_reason(reason: &str) -> ProviderStopReason {
-    ProviderStopReason::from_anthropic(reason)
 }
 
 async fn parse_sse_stream(
@@ -399,7 +393,7 @@ async fn parse_sse_stream(
         let chunk = chunk_result.map_err(|e| ProviderError::StreamError(e.to_string()))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process complete SSE events (separated by blank lines)
+        // 处理完整的 SSE 事件（以空行分隔）
         while let Some(event_end) = buffer.find("\n\n") {
             let event_text = buffer[..event_end].to_string();
             buffer = buffer[event_end + 2..].to_string();
@@ -534,7 +528,7 @@ async fn parse_sse_stream(
                             .unwrap_or("end_turn");
                         let _ = tx
                             .send(ProviderStreamEvent::Finish {
-                                stop_reason: parse_stop_reason(stop_reason),
+                                stop_reason: ProviderStopReason::from_anthropic(stop_reason),
                                 usage: current_usage.clone(),
                             })
                             .await;

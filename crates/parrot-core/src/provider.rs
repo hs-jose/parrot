@@ -32,14 +32,11 @@ pub struct ChatStream {
     pub inner: tokio::sync::mpsc::Receiver<ProviderStreamEvent>,
 }
 
-/// Sub-events emitted by a provider adapter while parsing the provider's
-/// streaming response (e.g. Anthropic SSE). Consumed only by the engine,
-/// which wraps them in `AgentEvent` lifecycle envelopes before forwarding.
+/// provider 适配器解析流式响应（如 Anthropic SSE）时发出的子事件。
+/// 只被引擎消费，由引擎包上 `AgentEvent` 生命周期信封后再转发。
 ///
-/// Note: `ToolResult` and `ToolCallConfirmationRequired` are NOT here —
-/// the former is produced by the engine after executing a tool, the latter
-/// is a strategy decision made by the engine when a tool matches
-/// `require_confirmation`.
+/// 注意：工具结果与工具确认请求不在这里——前者由引擎执行工具后产生，
+/// 后者是引擎针对命中 `require_confirmation` 的工具做出的策略决策。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProviderStreamEvent {
     TextDelta {
@@ -130,8 +127,8 @@ impl ProviderRegistry {
         }
         None
     }
-    /// Enumerate the ids of all registered providers. Used by the daemon to
-    /// aggregate `list_models()` across providers for `ClientMessage::ListModels`.
+    /// 枚举所有已注册 provider 的 id。daemon 聚合各 provider 的
+    /// `list_models()` 响应 `ClientMessage::ListModels` 时使用。
     pub async fn provider_ids(&self) -> Vec<String> {
         self.providers.read().await.keys().cloned().collect()
     }

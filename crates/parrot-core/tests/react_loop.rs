@@ -17,7 +17,7 @@ use parrot_core::types::GenerateConfig;
 use parrot_protocol::agent_event::{AgentEndReason, AgentEvent, MessageStopReason, TurnStopReason};
 use parrot_protocol::types::Usage;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -1139,4 +1139,236 @@ async fn none_branch_preserves_daemon_shutdown() {
         AgentEndReason::DaemonShutdown,
         "AgentEnd must carry DaemonShutdown when shutdown_all pre-set it"
     );
+}
+
+/// 永远挂起的工具：模拟执行中的长任务，供"工具执行中 Abort"测试使用。
+struct HangingTool {
+    started: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for HangingTool {
+    fn name(&self) -> &str {
+        "hang"
+    }
+
+    fn description(&self) -> &str {
+        "Blocks forever once started."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    async fn call(&self, _arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+        self.started.store(true, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        unreachable!("future 被取消，永不返回")
+    }
+}
+
+/// 回归：工具执行中收到 Abort 时，事件流、磁盘日志与上下文都必须保持
+/// 成对，且会话在 abort 后可继续对话：
+///   1. ToolStart ↔ ToolEnd 成对，ToolEnd 补发 "aborted before execution"；
+///   2. TurnStart ↔ TurnEnd{Aborted} 成对——events.log 是完整 turn 序列，
+///      resume 时无需截断（不产生完整性问题）；
+///   3. 上下文里 assistant(tool_calls) 后紧跟配对的 tool_result，
+///      下一轮 LLM 调用不会因孤儿 tool_use 被拒。
+#[tokio::test]
+async fn abort_during_tool_execution_keeps_pairs_intact() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let started = Arc::new(AtomicBool::new(false));
+    let tool_registry = Arc::new(ToolRegistry::new());
+    tool_registry
+        .register(Arc::new(HangingTool {
+            started: Arc::clone(&started),
+        }))
+        .await;
+
+    let mock = Arc::new(MockProvider::new().with_first_tool("hang", json!({})));
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("You are a test assistant.".to_string()),
+        data_dir.clone(),
+        working_dir,
+    );
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    let mut events = Vec::new();
+
+    // Turn 1：等 ToolStart（确认工具已进入执行）再发 Abort。
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "run the hanging tool".to_string(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let ev = event_rx.recv().await.expect("工具挂起期间引擎必须存活");
+        let is_tool_start = matches!(&ev, AgentEvent::ToolStart { .. });
+        events.push(ev);
+        if is_tool_start {
+            break;
+        }
+    }
+    cmd_tx.send(SessionCmd::Abort).await.unwrap();
+    events.extend(collect_until_turn_end(&mut event_rx).await);
+
+    assert!(
+        started.load(Ordering::SeqCst),
+        "工具必须真的开始执行过，否则本测试没测到目标路径"
+    );
+
+    // 1) ToolStart ↔ ToolEnd 成对，且 ToolEnd 是 aborted 输出。
+    let tool_start_ids: Vec<String> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            AgentEvent::ToolStart { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let tool_end_ids: Vec<String> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            AgentEvent::ToolEnd { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_start_ids,
+        vec!["tc_mock_1".to_string()],
+        "恰好一个 ToolStart"
+    );
+    assert_eq!(
+        tool_end_ids,
+        vec!["tc_mock_1".to_string()],
+        "abort 必须补发配对的 ToolEnd"
+    );
+    let aborted_end = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::ToolEnd { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("ToolEnd present");
+    assert_eq!(aborted_end.content, "aborted before execution");
+    assert!(aborted_end.is_error);
+
+    // 2) TurnEnd{Aborted} 闭合 turn。
+    let stop = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::TurnEnd { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("TurnEnd present");
+    assert_eq!(stop, TurnStopReason::Aborted);
+
+    // Turn 2：abort 后会话继续可用，下一轮正常 EndTurn。
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "continue".to_string(),
+        })
+        .await
+        .unwrap();
+    let second = collect_until_turn_end(&mut event_rx).await;
+    let second_stop = second
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::TurnEnd { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("second TurnEnd present");
+    assert_eq!(second_stop, TurnStopReason::EndTurn);
+
+    drop(cmd_tx);
+    let trailing = drain_until_agent_end(&mut event_rx).await;
+    events.extend(trailing.clone());
+    let _ = engine_task.await;
+    assert_eq!(
+        trailing.last().map(variant_name),
+        Some("AgentEnd"),
+        "AgentEnd 收尾"
+    );
+
+    // 3) 上下文配对：最后一次 provider 调用（turn 2 首个主调用）里，
+    //    assistant(tool_calls 含 tc_mock_1) 的下一条必须是配对 tool_result。
+    let last_call = mock.captured_messages().await;
+    let mut pair_found = false;
+    for i in 0..last_call.len().saturating_sub(1) {
+        if let Some(tcs) = &last_call[i].tool_calls {
+            if tcs.iter().any(|tc| tc.id == "tc_mock_1")
+                && last_call[i + 1].role == parrot_core::types::ChatRole::Tool
+                && last_call[i + 1].tool_call_id.as_deref() == Some("tc_mock_1")
+            {
+                pair_found = true;
+                assert_eq!(
+                    last_call[i + 1].content,
+                    "aborted before execution",
+                    "上下文里的 tool_result 必须是 abort 补发的那条"
+                );
+                break;
+            }
+        }
+    }
+    assert!(
+        pair_found,
+        "被中断的 tool_use 必须在上下文中有配对 tool_result: {:?}",
+        last_call
+            .iter()
+            .map(|m| format!(
+                "{:?}: {}",
+                m.role,
+                m.content.chars().take(40).collect::<String>()
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    // 4) events.log 同样成对，且整条日志都是完整 turn（resume 无需截断）。
+    let log = parrot_core::event_log::EventLog::new(data_dir);
+    let entries = log.replay().unwrap();
+    let log_starts: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::ToolStart { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let log_ends: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| match &e.event {
+            AgentEvent::ToolEnd { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(log_starts, vec!["tc_mock_1"]);
+    assert_eq!(log_ends, vec!["tc_mock_1"]);
+
+    let total = entries.len();
+    let (keep, dropped, issue) = parrot_core::event_log::truncate_to_last_complete_turn(entries);
+    assert!(
+        issue.is_none(),
+        "abort 后日志必须是完整 turn 序列，不得触发截断: {issue:?}"
+    );
+    assert!(dropped.is_empty());
+    assert_eq!(keep.len(), total, "不得丢弃任何事件");
 }

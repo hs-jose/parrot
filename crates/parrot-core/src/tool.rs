@@ -10,13 +10,6 @@ use tokio::sync::RwLock;
 pub use parrot_protocol::types::ToolOutput;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolResult {
-    pub tool_name: String,
-    pub tool_call_id: String,
-    pub output: ToolOutput,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -43,14 +36,9 @@ pub trait Tool: Send + Sync {
     async fn after_call(&self, _output: &mut ToolOutput) {}
 }
 
+#[derive(Default)]
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
-}
-
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl ToolRegistry {
