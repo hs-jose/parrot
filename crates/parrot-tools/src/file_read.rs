@@ -69,6 +69,10 @@ impl Tool for FileReadTool {
             message: format!("Cannot read file {:?}: {}", path, e),
         })?;
 
+        // 标记为已读：file_edit 的 read-before-edit 护栏依赖此集合。
+        // 部分读取（offset/limit）同样计入——模型至少见过该文件的内容。
+        ctx.files_read.lock().unwrap().insert(path.clone());
+
         let offset = arguments
             .get("offset")
             .and_then(|v| v.as_u64())
@@ -103,5 +107,42 @@ impl Tool for FileReadTool {
             content: result.join("\n"),
             is_error: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn successful_read_marks_file_as_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        std::fs::write(&path, "line1\nline2\n").unwrap();
+
+        let ctx = ToolContext::new(dir.path().to_path_buf(), 10 * 1024 * 1024);
+        let out = FileReadTool
+            .call(json!({"path": "sample.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+
+        assert!(
+            ctx.files_read.lock().unwrap().contains(&path),
+            "file_read 成功后应把解析后的绝对路径标记为已读"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_read_does_not_mark_file_as_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf(), 10 * 1024 * 1024);
+        // 当前契约：I/O 失败时 call 返回 Err(AgentError)，而非 is_error=true 的 ToolOutput。
+        let out = FileReadTool
+            .call(json!({"path": "missing.txt"}), &ctx)
+            .await;
+        assert!(out.is_err());
+        assert!(ctx.files_read.lock().unwrap().is_empty());
     }
 }
