@@ -691,10 +691,7 @@ impl ReActEngine {
             return Ok(());
         }
 
-        let tool_ctx = ToolContext {
-            working_dir: self.working_dir.clone(),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let tool_ctx = ToolContext::new(self.working_dir.clone(), 10 * 1024 * 1024);
 
         let needs_confirm = self
             .confirm_config

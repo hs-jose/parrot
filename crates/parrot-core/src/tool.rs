@@ -4,10 +4,16 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 pub use parrot_protocol::types::ToolOutput;
+
+/// 会话级"已读文件"集合的共享句柄。file_read 写入、file_edit 检查。
+/// 纯内存状态，core 保持 zero-IO。
+pub type SharedFilesRead = Arc<Mutex<HashSet<PathBuf>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolDefinition {
@@ -19,6 +25,25 @@ pub struct ToolDefinition {
 pub struct ToolContext {
     pub working_dir: std::path::PathBuf,
     pub max_file_size_bytes: u64,
+    /// 本会话已成功读取过的文件（`resolve_arg_path` 解析后的路径）。
+    /// file_edit 的 read-before-edit 护栏数据源。
+    pub files_read: SharedFilesRead,
+}
+
+impl ToolContext {
+    pub fn new(working_dir: std::path::PathBuf, max_file_size_bytes: u64) -> Self {
+        Self {
+            working_dir,
+            max_file_size_bytes,
+            files_read: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// 注入外部共享的已读集合（engine 每会话持有一份）。
+    pub fn with_files_read(mut self, files_read: SharedFilesRead) -> Self {
+        self.files_read = files_read;
+        self
+    }
 }
 
 #[async_trait]
@@ -163,10 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool() {
-        let ctx = ToolContext {
-            working_dir: std::path::PathBuf::from("."),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let tool = EchoTool;
         let result = tool.call(json!({"message": "hello"}), &ctx).await.unwrap();
         assert_eq!(result.content, "hello");
@@ -177,10 +199,7 @@ mod tests {
     async fn execute_truncates_oversized_output() {
         let registry = ToolRegistry::new();
         registry.register(Arc::new(BigTool)).await;
-        let ctx = ToolContext {
-            working_dir: std::path::PathBuf::from("."),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let out = registry.execute("big", json!({}), &ctx).await.unwrap();
         assert!(out.content.contains("(truncated, total"));
         assert!(out.content.len() <= crate::tool_output::MAX_TOOL_OUTPUT_BYTES + 64);
@@ -190,10 +209,7 @@ mod tests {
     async fn execute_converts_call_error_to_error_output() {
         let registry = ToolRegistry::new();
         registry.register(Arc::new(FailTool)).await;
-        let ctx = ToolContext {
-            working_dir: std::path::PathBuf::from("."),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let out = registry.execute("fail", json!({}), &ctx).await.unwrap();
         assert!(out.is_error);
         assert!(out.content.starts_with("Error:"));
@@ -202,10 +218,7 @@ mod tests {
     #[tokio::test]
     async fn execute_unknown_tool_still_errs() {
         let registry = ToolRegistry::new();
-        let ctx = ToolContext {
-            working_dir: std::path::PathBuf::from("."),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let err = registry.execute("nope", json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, AgentError::ToolExecution { .. }));
     }
@@ -214,10 +227,7 @@ mod tests {
     async fn before_call_deny_blocks_call() {
         let registry = ToolRegistry::new();
         registry.register(Arc::new(DenyAllTool)).await;
-        let ctx = ToolContext {
-            working_dir: std::path::PathBuf::from("."),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let out = registry.execute("deny_all", json!({}), &ctx).await.unwrap();
         assert!(out.is_error);
         assert_eq!(out.content, "blocked: denied by policy");
@@ -227,10 +237,7 @@ mod tests {
     async fn denied_output_also_truncated() {
         let registry = ToolRegistry::new();
         registry.register(Arc::new(DenyHugeReasonTool)).await;
-        let ctx = ToolContext {
-            working_dir: std::path::PathBuf::from("."),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let out = registry
             .execute("deny_huge", json!({}), &ctx)
             .await
@@ -243,10 +250,7 @@ mod tests {
     async fn after_call_runs_before_truncate() {
         let registry = ToolRegistry::new();
         registry.register(Arc::new(AppendTool)).await;
-        let ctx = ToolContext {
-            working_dir: std::path::PathBuf::from("."),
-            max_file_size_bytes: 10 * 1024 * 1024,
-        };
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let out = registry.execute("append", json!({}), &ctx).await.unwrap();
         assert!(out.content.contains("(truncated"));
     }
@@ -359,5 +363,27 @@ mod tests {
                 .content
                 .push_str(&"y".repeat(crate::tool_output::MAX_TOOL_OUTPUT_BYTES));
         }
+    }
+
+    #[test]
+    fn files_read_set_is_shared_via_builder() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 1024);
+        let shared = std::sync::Arc::clone(&ctx.files_read);
+
+        // with_files_read 注入的是外部集合：往注入集合写，ctx 里可见。
+        let injected: crate::tool::SharedFilesRead = Default::default();
+        injected
+            .lock()
+            .unwrap()
+            .insert(std::path::PathBuf::from("a.rs"));
+        let ctx2 = ToolContext::new(std::path::PathBuf::from("."), 1024)
+            .with_files_read(std::sync::Arc::clone(&injected));
+
+        assert!(ctx2
+            .files_read
+            .lock()
+            .unwrap()
+            .contains(std::path::Path::new("a.rs")));
+        assert!(shared.lock().unwrap().is_empty(), "默认集合独立于注入集合");
     }
 }
