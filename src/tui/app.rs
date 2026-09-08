@@ -31,8 +31,6 @@ pub(crate) enum ChatEntry {
         arguments: Value,
         result: Option<ToolOutput>,
         /// 是否展开显示完整参数与结果（纯 UI 状态，不持久化；replay 默认紧凑）。
-        /// 渲染层（ui.rs）接线前对 bin 目标是 dead code，先压制告警。
-        #[allow(dead_code)]
         expanded: bool,
     },
     Shell {
@@ -84,8 +82,6 @@ pub(crate) struct App {
     /// 上下文压缩摘要调用进行中（`CompactionStart` → `CompactionSummary`/`TurnStart`）。
     pub compacting: bool,
     /// 当前选中的工具条目（tool_call_id）。Tab 循环选中、Enter 展开。
-    /// 键盘处理接线前对 bin 目标是 dead code，先压制告警。
-    #[allow(dead_code)]
     pub selected_tool: Option<String>,
 }
 
@@ -151,8 +147,6 @@ impl App {
     }
 
     /// Tab / Shift+Tab：在工具条目间循环移动选中。
-    /// 键盘处理接线前对 bin 目标是 dead code，先压制告警。
-    #[allow(dead_code)]
     pub fn select_next_tool(&mut self, forward: bool) {
         let ids: Vec<&str> = self
             .entries
@@ -190,8 +184,7 @@ impl App {
     }
 
     /// 展开/收起选中的工具条目。无选中时返回 false（调用方据此让 Enter
-    /// 走发送消息的原路径）。键盘处理接线前先压制 dead code 告警。
-    #[allow(dead_code)]
+    /// 走发送消息的原路径）。
     pub fn toggle_selected_tool(&mut self) -> bool {
         let Some(sel) = self.selected_tool.clone() else {
             return false;
@@ -213,8 +206,6 @@ impl App {
     }
 
     /// 单击 Esc 清除选中（双击 Esc 的中断/退出语义不变）。
-    /// 键盘处理接线前对 bin 目标是 dead code，先压制告警。
-    #[allow(dead_code)]
     pub fn clear_tool_selection(&mut self) {
         self.selected_tool = None;
     }

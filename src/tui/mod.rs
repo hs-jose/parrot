@@ -163,6 +163,7 @@ async fn run_loop(
                                     break;
                                 } else {
                                     last_esc = Some(now);
+                                    app.clear_tool_selection();
                                 }
                             }
                             // Esc 的 Release/Repeat：忽略，不动 last_esc。
@@ -253,6 +254,11 @@ async fn handle_key(
             }
             KeyCode::Enter => {
                 let text = input.lines().join("\n");
+                // 有选中工具且输入框为空时，Enter 优先切换该条目展开/收起。
+                if text.trim().is_empty() && app.selected_tool.is_some() {
+                    app.toggle_selected_tool();
+                    return Ok(None);
+                }
                 if !text.trim().is_empty() {
                     *input = TextArea::default();
                     if let Some(should_quit) = handle_command(app, conn, &text).await? {
@@ -265,6 +271,12 @@ async fn handle_key(
                         })
                         .await?;
                 }
+                Ok(None)
+            }
+            // Tab（+Shift 反向）在工具条目间循环选中；原先落入 `_` 分支会往
+            // 输入框插入制表符，现改作选中导航。
+            KeyCode::Tab => {
+                app.select_next_tool(!k.modifiers.contains(KeyModifiers::SHIFT));
                 Ok(None)
             }
             KeyCode::PageUp => {

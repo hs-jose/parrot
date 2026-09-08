@@ -142,7 +142,7 @@ fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let mut lines: Vec<Line<'_>> = Vec::new();
     let n = app.entries.len();
     for (idx, e) in app.entries.iter().enumerate() {
-        entry_lines(e, &mut lines);
+        entry_lines(e, app.selected_tool.as_deref(), &mut lines);
         // 只在消息之间留空行，最后一条之后不加，避免底部多一行空白把
         // 真实内容顶出可见区。
         let is_last = idx + 1 == n;
@@ -198,7 +198,7 @@ fn header_line(role: &str, fg: Color, time: Option<&str>) -> Line<'static> {
     Line::from(spans)
 }
 
-fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
+fn entry_lines(e: &ChatEntry, selected_tool: Option<&str>, lines: &mut Vec<Line<'_>>) {
     match e {
         ChatEntry::User { text, time } => {
             lines.push(header_line(">", palette::USER_FG, Some(time)));
@@ -209,21 +209,29 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
             push_markdown(text, lines);
         }
         ChatEntry::Tool {
+            tool_call_id,
             tool_name,
             arguments,
             result,
-            ..
+            expanded,
         } => {
             // 单行紧凑展示：`▸ 工具名 关键参数 ✓/✗/…`，避免原始 JSON 和长
-            // 结果内容刷屏。
+            // 结果内容刷屏。选中显示 ❯，展开显示 ▾。
             let args = compact_args(arguments);
             let args_str = if args.is_empty() {
                 String::new()
             } else {
                 format!(" {}", truncate_str(&args, 48))
             };
+            let marker = if *expanded {
+                "▾"
+            } else if selected_tool == Some(tool_call_id.as_str()) {
+                "❯"
+            } else {
+                "▸"
+            };
             let mut spans = vec![Span::styled(
-                format!("▸ {tool_name}{args_str}"),
+                format!("{marker} {tool_name}{args_str}"),
                 Style::default().fg(palette::TOOL_FG),
             )];
             match result {
@@ -241,6 +249,49 @@ fn entry_lines(e: &ChatEntry, lines: &mut Vec<Line<'_>>) {
                 }
             }
             lines.push(Line::from(spans));
+            if *expanded {
+                // 展开块：完整参数（pretty JSON，DIM）→ 分隔线 → 完整结果。
+                let args_json = serde_json::to_string_pretty(arguments).unwrap_or_default();
+                for l in args_json.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        Style::default().fg(palette::DIM),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    "  ────────────────",
+                    Style::default().fg(palette::DIM),
+                )));
+                match result {
+                    Some(r) => {
+                        let fg = if r.is_error {
+                            palette::ERROR_FG
+                        } else {
+                            palette::BODY_FG
+                        };
+                        if r.content.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                "  (empty result)",
+                                Style::default().fg(palette::DIM),
+                            )));
+                        } else {
+                            for l in r.content.lines() {
+                                lines.push(Line::from(Span::styled(
+                                    format!("  {l}"),
+                                    Style::default().fg(fg),
+                                )));
+                            }
+                        }
+                    }
+                    None => {
+                        lines.push(Line::from(Span::styled(
+                            "  (no result yet)",
+                            Style::default().fg(palette::DIM),
+                        )));
+                    }
+                }
+                lines.push(Line::from(""));
+            }
         }
         ChatEntry::Error(s) => {
             lines.push(Line::from(Span::styled(
@@ -657,5 +708,65 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         assert_eq!(rendered, vec!["line1".to_string()]);
+    }
+
+    #[test]
+    fn expanded_tool_entry_renders_args_and_result() {
+        let entry = ChatEntry::Tool {
+            tool_call_id: "t1".into(),
+            tool_name: "file_read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            result: Some(parrot_protocol::types::ToolOutput {
+                content: "1: fn main()".into(),
+                is_error: false,
+            }),
+            expanded: true,
+        };
+        let mut lines = Vec::new();
+        entry_lines(&entry, Some("t1"), &mut lines);
+
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = texts.join("\n");
+        assert!(joined.contains("▾"), "展开后 marker 应为 ▾：{joined}");
+        assert!(
+            joined.contains("\"path\": \"src/lib.rs\""),
+            "应展示完整参数：{joined}"
+        );
+        assert!(joined.contains("1: fn main()"), "应展示完整结果：{joined}");
+    }
+
+    #[test]
+    fn selected_compact_entry_uses_pointer_marker() {
+        let entry = ChatEntry::Tool {
+            tool_call_id: "t1".into(),
+            tool_name: "file_read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            result: None,
+            expanded: false,
+        };
+        let mut lines = Vec::new();
+        entry_lines(&entry, Some("t1"), &mut lines);
+        let joined = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert!(joined.contains("❯"), "选中未展开应为 ❯：{joined}");
+        assert!(
+            !joined.contains("\"path\": \"src/lib.rs\""),
+            "未展开不应显示完整参数（pretty JSON）：{joined}"
+        );
     }
 }
