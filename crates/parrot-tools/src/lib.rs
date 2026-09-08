@@ -3,6 +3,7 @@ use parrot_core::error::AgentError;
 use parrot_core::tool::ToolRegistry;
 use serde_json::Value;
 
+pub mod file_edit;
 pub mod file_glob;
 pub mod file_grep;
 pub mod file_read;
