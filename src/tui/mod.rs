@@ -350,36 +350,9 @@ async fn handle_command(
     let trimmed = text.trim_start();
     if let Some(rest) = trimmed.strip_prefix('/') {
         let cmd = rest.trim();
-        match cmd {
-            "help" => {
-                app.entries.push(app::ChatEntry::Info(
-                    "可用命令: /help /usage /abort /exit\n!<命令> 在 daemon 执行 shell 命令".into(),
-                ));
-                Ok(Some(false))
-            }
-            "usage" => {
-                let u = &app.total_usage;
-                app.entries.push(app::ChatEntry::Info(format!(
-                    "Token 用量: {} in / {} out",
-                    u.input_tokens, u.output_tokens
-                )));
-                Ok(Some(false))
-            }
-            "abort" => {
-                if app.is_turn_active() {
-                    conn.sender
-                        .send(ClientMessage::Abort {
-                            session_id: app.session_id,
-                        })
-                        .await?;
-                } else {
-                    app.entries
-                        .push(app::ChatEntry::Info("当前没有进行中的轮次".into()));
-                }
-                Ok(Some(false))
-            }
-            "exit" => Ok(Some(true)),
-            _ => {
+        match slash::find(cmd) {
+            Some(c) => slash::execute(c, app, conn).await,
+            None => {
                 app.entries.push(app::ChatEntry::Info(format!(
                     "未知命令 /{cmd}，输入 /help 查看可用命令"
                 )));
@@ -470,6 +443,15 @@ mod tests {
         let mut app = app::App::new(SessionId::new_v4());
         let quit = handle_command(&mut app, &mut conn, "/exit").await.unwrap();
         assert_eq!(quit, Some(true));
+    }
+
+    #[tokio::test]
+    async fn handle_command_unknown_pushes_info() {
+        let (mut conn, _server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let quit = handle_command(&mut app, &mut conn, "/nope").await.unwrap();
+        assert_eq!(quit, Some(false));
+        assert!(matches!(app.entries.last(), Some(app::ChatEntry::Info(_))));
     }
 
     #[test]
