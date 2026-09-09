@@ -106,7 +106,11 @@ pub(crate) async fn run_tui(
     .await;
 
     // 终端状态由 `_raw_guard` 的 Drop 统一恢复（尽力而为，
-    // 不掩盖 run_loop 的错误）。
+    // 不掩盖 run_loop 的错误）。先显式恢复终端，退出提示才不会被
+    // 备用屏/裸模式吞掉。
+    drop(_raw_guard);
+    // 退出时打印完整 session id，便于复制（`parrot --session <id>` 续会话）。
+    println!("Session: {session_id}");
     result
 }
 

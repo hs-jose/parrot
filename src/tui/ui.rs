@@ -89,7 +89,8 @@ fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(bar, area);
 }
 
-/// 状态栏：灰色底，显示 模型 / 累计 token / 会话短 id。
+/// 状态栏：灰色底。左侧显示 模型 / 累计 token / 工作状态（活动时追加
+/// spinner + 标签），右侧显示 会话短 id（结束时追加 ended 标记）。
 fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let model = if app.model.is_empty() {
         "model -".to_string()
@@ -99,34 +100,38 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let usage = &app.total_usage;
     let usage_str = format!("{} in / {} out", usage.input_tokens, usage.output_tokens);
     let short_sid: String = app.session_id.to_string().chars().take(8).collect();
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(" ", Style::default()),
         Span::styled(model, Style::default().fg(palette::STATUS_FG)),
         Span::styled("  ·  ", Style::default().fg(palette::DIM)),
         Span::styled(usage_str, Style::default().fg(palette::STATUS_FG)),
-        Span::styled("  ·  ", Style::default().fg(palette::DIM)),
+    ];
+    if let Some(label) = activity_label(app) {
+        spans.push(Span::styled("  ·  ", Style::default().fg(palette::DIM)));
+        spans.push(Span::styled(
+            format!("{} ", spinner_frame()),
+            Style::default().fg(palette::AI_FG),
+        ));
+        spans.push(Span::styled(label, Style::default().fg(palette::STATUS_FG)));
+    }
+    let line = Line::from(spans);
+    let bar = Paragraph::new(line).style(Style::default().bg(palette::STATUS_BG));
+    f.render_widget(bar, area);
+    let right = Line::from(vec![
         Span::styled(
             format!("session {short_sid}"),
             Style::default().fg(palette::DIM),
         ),
-        Span::raw(if app.ended { "  · ended" } else { "" }),
+        Span::styled(
+            if app.ended { "  ·  ended" } else { "" },
+            Style::default().fg(palette::DIM),
+        ),
+        Span::raw(" "),
     ]);
-    let bar = Paragraph::new(line).style(Style::default().bg(palette::STATUS_BG));
-    f.render_widget(bar, area);
-    if let Some(label) = activity_label(app) {
-        let right = Line::from(vec![
-            Span::styled(
-                format!("{}, ", spinner_frame()),
-                Style::default().fg(palette::AI_FG),
-            ),
-            Span::styled(label, Style::default().fg(palette::STATUS_FG)),
-            Span::raw(" "),
-        ]);
-        let right_para = Paragraph::new(right)
-            .style(Style::default().bg(palette::STATUS_BG))
-            .alignment(Alignment::Right);
-        f.render_widget(right_para, area);
-    }
+    let right_para = Paragraph::new(right)
+        .style(Style::default().bg(palette::STATUS_BG))
+        .alignment(Alignment::Right);
+    f.render_widget(right_para, area);
 }
 
 fn draw_entries(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
