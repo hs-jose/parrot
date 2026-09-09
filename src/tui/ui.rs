@@ -526,7 +526,12 @@ fn draw_slash_popup(f: &mut ratatui::Frame<'_>, area: Rect, input_area: Rect, po
         .max(3);
     let height = (visible as u16 + 2).min(input_area.y.max(3)); // 含上下边框
 
-    let popup_area = Rect::new(input_area.x, input_area.y - height, total_w, height);
+    let popup_area = Rect::new(
+        input_area.x,
+        input_area.y.saturating_sub(height),
+        total_w,
+        height,
+    );
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -949,5 +954,17 @@ mod tests {
             popup_row < 14,
             "弹窗行 {popup_row} 应在输入框顶（y=16）上方"
         );
+    }
+
+    #[test]
+    fn slash_popup_no_panic_on_tiny_terminal() {
+        for (w, h) in [(30u16, 3u16), (30, 5), (20, 4), (30, 2), (20, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut app = App::new(SessionId::new_v4());
+            app.slash_popup = Some(SlashPopup::filtered(""));
+            let mut input = ratatui_textarea::TextArea::default();
+            input.insert_char('/');
+            terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
+        }
     }
 }
