@@ -7,23 +7,23 @@ use crate::tool_display::{compact_args, truncate_str};
 use crate::tui::app::{App, ChatEntry, Mode};
 use crate::tui::confirm::format_confirmation;
 
-/// Tokyo Night 风格调色板。所有 UI 颜色集中管理，方便整体调整。
+/// Nord 冷灰蓝配色（低饱和、素雅耐看，https://www.nordtheme.com）
 mod palette {
     use ratatui::style::Color;
 
-    pub const TITLE_BG: Color = Color::Rgb(36, 58, 100); // 标题栏底：深蓝
-    pub const TITLE_FG: Color = Color::Rgb(192, 202, 245); // #c0caf5
-    pub const STATUS_BG: Color = Color::Rgb(36, 40, 59); // #24283b
-    pub const STATUS_FG: Color = Color::Rgb(169, 177, 214); // 较暗文本
-    pub const USER_FG: Color = Color::Rgb(125, 207, 255); // 青 #7dcfff
-    pub const AI_FG: Color = Color::Rgb(255, 158, 100); // 暖橙 #ff9e64
-    pub const TOOL_FG: Color = Color::Rgb(224, 175, 104); // 黄 #e0af68
-    pub const OK_FG: Color = Color::Rgb(158, 206, 106); // 绿 #9ece6a
-    pub const ERROR_FG: Color = Color::Rgb(247, 118, 142); // 红 #f7768e
-    pub const WARN_FG: Color = Color::Rgb(187, 154, 247); // 紫 #bb9af7
-    pub const BODY_FG: Color = Color::Rgb(171, 178, 191); // 柔和正文
-    pub const DIM: Color = Color::Rgb(86, 95, 137); // 注释灰 #565f89
-    pub const INPUT_BORDER: Color = Color::Rgb(122, 162, 247); // 蓝 #7aa2f7
+    pub const TITLE_BG: Color = Color::Rgb(67, 76, 94); // 标题栏底：nord2 #434C5E
+    pub const TITLE_FG: Color = Color::Rgb(236, 239, 244); // nord6 #ECEFF4
+    pub const STATUS_BG: Color = Color::Rgb(59, 66, 82); // 状态栏底：nord1 #3B4252
+    pub const STATUS_FG: Color = Color::Rgb(216, 222, 233); // 状态栏文本：nord4 #D8DEE9
+    pub const USER_FG: Color = Color::Rgb(129, 161, 193); // 用户消息：nord9 #81A1C1
+    pub const AI_FG: Color = Color::Rgb(208, 135, 112); // AI 头/spinner：nord12 #D08770
+    pub const TOOL_FG: Color = Color::Rgb(235, 203, 139); // 工具调用：nord13 #EBCB8B
+    pub const OK_FG: Color = Color::Rgb(163, 190, 140); // 成功：nord14 #A3BE8C
+    pub const ERROR_FG: Color = Color::Rgb(191, 97, 106); // 错误：nord11 #BF616A
+    pub const WARN_FG: Color = Color::Rgb(180, 142, 173); // 警告：nord15 #B48EAD
+    pub const BODY_FG: Color = Color::Rgb(216, 222, 233); // 正文：nord4 #D8DEE9
+    pub const DIM: Color = Color::Rgb(76, 86, 106); // 弱化文本：nord3 #4C566A
+    pub const INPUT_BORDER: Color = Color::Rgb(94, 129, 172); // 输入框边框：nord10 #5E81AC
 }
 
 pub(crate) fn draw(
