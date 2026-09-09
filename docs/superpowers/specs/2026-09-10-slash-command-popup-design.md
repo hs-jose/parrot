@@ -178,7 +178,7 @@ fn popup_query(text: &str) -> Option<&str>;
 | 无匹配项 | 不画弹窗；弹窗状态仍存活，退格恢复匹配后重新显示 |
 | 粘贴 `/` 开头单行文本 | 走同一 sync 规则，触发弹窗 |
 | turn 进行中 | 弹窗照常可用（`/abort` 正是为此设计） |
-| 输入 `/help `（带空格）| popup_query 返回 None，弹窗关闭；Enter 走原 `handle_command` 路径报未知命令 |
+| 输入 `/help me`（`/` 后含空格）| popup_query 返回 None，弹窗关闭；Enter 走原 `handle_command` 路径报未知命令（注意：`/help ` 尾随空格会被 handle_command trim 成 `help` 而正常执行，这是既有行为） |
 | 多行输入（Shift+Enter 换行后） | popup_query 返回 None，弹窗关闭 |
 | 空输入 `/` | query 为空，显示全量命令 |
 | ConfirmPending 弹出确认 | 弹窗不绘制不响应；期间输入文本不变，弹窗状态原样保留，回到 Normal 后随下一个按键由 sync 校正 |
