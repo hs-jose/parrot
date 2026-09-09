@@ -216,16 +216,21 @@ fn entry_lines(e: &ChatEntry, selected_tool: Option<&str>, lines: &mut Vec<Line<
             expanded,
         } => {
             // 单行紧凑展示：`▸ 工具名 关键参数 ✓/✗/…`，避免原始 JSON 和长
-            // 结果内容刷屏。选中显示 ❯，展开显示 ▾。
+            // 结果内容刷屏。选中显示 ❯，展开显示 ▾，选中且展开显示 ❯▾。
             let args = compact_args(arguments);
             let args_str = if args.is_empty() {
                 String::new()
             } else {
                 format!(" {}", truncate_str(&args, 48))
             };
+            let selected = selected_tool == Some(tool_call_id.as_str());
             let marker = if *expanded {
-                "▾"
-            } else if selected_tool == Some(tool_call_id.as_str()) {
+                if selected {
+                    "❯▾"
+                } else {
+                    "▾"
+                }
+            } else if selected {
                 "❯"
             } else {
                 "▸"
@@ -740,5 +745,28 @@ mod tests {
             !joined.contains("\"path\": \"src/lib.rs\""),
             "未展开不应显示完整参数（pretty JSON）：{joined}"
         );
+    }
+
+    #[test]
+    fn selected_expanded_entry_keeps_pointer_marker() {
+        let entry = ChatEntry::Tool {
+            tool_call_id: "t1".into(),
+            tool_name: "file_read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            result: None,
+            expanded: true,
+        };
+        let mut lines = Vec::new();
+        entry_lines(&entry, Some("t1"), &mut lines);
+        let joined = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert!(joined.contains("❯▾"), "选中且展开应显示 ❯▾：{joined}");
     }
 }
