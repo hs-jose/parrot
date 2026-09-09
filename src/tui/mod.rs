@@ -38,6 +38,14 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// 键盘增强协议 / Windows 下一次物理按键会连发 Press + Release（Repeat 为
+/// 长按连发）。Release 必须整路忽略，否则自定义按键分支会双触发：Enter
+/// 展开闪烁、Tab 跳两格、Shift+Enter 双换行。与 ratatui-textarea
+/// `Input::from`（上游 #14）的处理一致：只放行 Press / Repeat。
+fn key_actionable(kind: KeyEventKind) -> bool {
+    kind != KeyEventKind::Release
+}
+
 pub(crate) async fn run_tui(
     mut conn: Connection,
     session_id: SessionId,
@@ -138,6 +146,11 @@ async fn run_loop(
                         *dirty = true;
                     }
                     UiEvent::Key(k) => {
+                        // Release 一律忽略（见 key_actionable 注释）；Esc 的
+                        // 双击计数因此在下方只需处理 Press / Repeat。
+                        if !key_actionable(k.kind) {
+                            continue;
+                        }
                         // 双击 Esc（仅 Normal 模式，500ms 窗口）：模型输出中中断消息
                         // (Abort)，空闲时退出 TUI。键盘增强协议 (CSI-u) 下一次物理按下
                         // 会连发 Press + Release 两个事件，因此必须只对 Press 计数双击，
@@ -255,7 +268,11 @@ async fn handle_key(
             KeyCode::Enter => {
                 let text = input.lines().join("\n");
                 // 有选中工具且输入框为空时，Enter 优先切换该条目展开/收起。
-                if text.trim().is_empty() && app.selected_tool.is_some() {
+                // Repeat 长按会连发，切换展开必须只认物理按下。
+                if k.kind == KeyEventKind::Press
+                    && text.trim().is_empty()
+                    && app.selected_tool.is_some()
+                {
                     app.toggle_selected_tool();
                     return Ok(None);
                 }
@@ -456,6 +473,14 @@ mod tests {
         let mut app = app::App::new(SessionId::new_v4());
         let quit = handle_command(&mut app, &mut conn, "/exit").await.unwrap();
         assert_eq!(quit, Some(true));
+    }
+
+    #[test]
+    fn key_actionable_ignores_only_release() {
+        use crossterm::event::KeyEventKind;
+        assert!(key_actionable(KeyEventKind::Press));
+        assert!(key_actionable(KeyEventKind::Repeat));
+        assert!(!key_actionable(KeyEventKind::Release));
     }
 
     #[tokio::test]
