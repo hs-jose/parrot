@@ -43,3 +43,6 @@
 
 ## 选型
 - [ ] rust版本升级
+
+## TUI
+- [ ] p2 多行粘贴体验。Windows 下 crossterm 事件源不产出 `Event::Paste`（走 Console API，ConPTY 把粘贴合成为逐字符按键事件），`EnableBracketedPaste` 形同虚设。单行粘贴逐字符可用；多行粘贴的换行会被合成为 Enter 按键 → 命中 `handle_key` 提交分支，消息在粘贴中途被提前发送。可选解：启发式粘贴风暴防护（短时间窗内大量 Char 事件后的 Enter 视为换行插入而非提交）；根治依赖 crossterm 支持 Windows bracketed paste。2026-09-09 按用户决定保持现状，仅记录。
