@@ -1,6 +1,9 @@
 pub(crate) mod app;
 pub(crate) mod confirm;
 pub(crate) mod input;
+// 注册表先于弹窗接线落地，接线上层调用前暂时只有测试在用。
+#[allow(dead_code)]
+pub(crate) mod slash;
 pub(crate) mod ui;
 
 #[cfg(test)]
