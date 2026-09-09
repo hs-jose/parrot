@@ -100,6 +100,75 @@ pub(crate) async fn execute(
     }
 }
 
+/// 输入文本 → 弹窗过滤词：以 `/` 开头、不含空白（换行/空格都算）时返回
+/// `/` 之后的子串，否则 `None`（弹窗应关闭）。权威规则见设计 §2。
+pub(crate) fn popup_query(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    if rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// 斜杠补全弹窗状态：过滤后的命令列表 + 选中索引。
+pub(crate) struct SlashPopup {
+    items: Vec<&'static SlashCommand>,
+    selected: usize,
+}
+
+impl SlashPopup {
+    pub(crate) fn new() -> Self {
+        Self {
+            items: REGISTRY.iter().collect(),
+            selected: 0,
+        }
+    }
+
+    /// 按 query 过滤后直接构造（sync 复活弹窗用）。
+    pub(crate) fn filtered(query: &str) -> Self {
+        let mut p = Self::new();
+        p.filter(query);
+        p
+    }
+
+    /// 重新过滤；选中归 0（列表内容变化后旧选中位不再有意义）。
+    pub(crate) fn filter(&mut self, query: &str) {
+        self.items = filter(query);
+        self.selected = 0;
+    }
+
+    pub(crate) fn move_up(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + self.items.len() - 1) % self.items.len();
+    }
+
+    pub(crate) fn move_down(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.items.len();
+    }
+
+    pub(crate) fn selected_cmd(&self) -> Option<&'static SlashCommand> {
+        self.items.get(self.selected).copied()
+    }
+
+    /// items 为空时 UI 不画弹窗，但状态仍存活（退格可恢复匹配）。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub(crate) fn items(&self) -> &[&'static SlashCommand] {
+        &self.items
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +296,59 @@ mod tests {
             ClientMessage::Abort { .. } => {}
             other => panic!("expected Abort, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn popup_query_basic() {
+        assert_eq!(popup_query("/us"), Some("us"));
+        assert_eq!(popup_query("/"), Some(""));
+    }
+
+    #[test]
+    fn popup_query_rejects_whitespace_multiline_and_non_slash() {
+        assert_eq!(popup_query("/he llo"), None);
+        assert_eq!(popup_query("/ab\ncd"), None);
+        assert_eq!(popup_query(" /us"), None);
+        assert_eq!(popup_query("hello"), None);
+        assert_eq!(popup_query(""), None);
+    }
+
+    #[test]
+    fn popup_moves_wrap_around() {
+        let mut p = SlashPopup::new();
+        p.move_down();
+        assert_eq!(p.selected(), 1);
+        p.move_up();
+        assert_eq!(p.selected(), 0);
+        p.move_up();
+        assert_eq!(p.selected(), REGISTRY.len() - 1, "向上应环绕到末尾");
+        p.move_down();
+        assert_eq!(p.selected(), 0, "从末尾向下应环绕回开头");
+    }
+
+    #[test]
+    fn popup_empty_items_move_is_noop() {
+        let mut p = SlashPopup::filtered("zzz");
+        assert!(p.is_empty());
+        p.move_up();
+        p.move_down();
+        assert!(p.selected_cmd().is_none());
+    }
+
+    #[test]
+    fn popup_filter_resets_selection() {
+        let mut p = SlashPopup::new();
+        p.move_down();
+        p.filter("us");
+        assert_eq!(p.selected(), 0);
+        assert_eq!(p.items().len(), 1);
+        assert_eq!(p.selected_cmd().map(|c| c.name), Some("usage"));
+    }
+
+    #[test]
+    fn popup_filtered_constructs_filtered() {
+        let p = SlashPopup::filtered("ex");
+        assert_eq!(p.items().len(), 1);
+        assert_eq!(p.selected_cmd().map(|c| c.name), Some("exit"));
     }
 }
