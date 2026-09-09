@@ -164,7 +164,10 @@ fn print_history(events: &[PersistedAgentEvent]) {
                 )
             }
             AgentEvent::TurnStart { user_message, .. } => {
-                format!("TurnStart({})", crate::stream::truncate(user_message, 60))
+                format!(
+                    "TurnStart({})",
+                    crate::tool_display::truncate_str(user_message, 60)
+                )
             }
             AgentEvent::TurnEnd {
                 stop_reason, usage, ..
@@ -186,7 +189,7 @@ fn print_history(events: &[PersistedAgentEvent]) {
                     "MessageEnd({:?} tools={} {})",
                     stop_reason,
                     tool_calls.len(),
-                    crate::stream::truncate(final_content, 60)
+                    crate::tool_display::truncate_str(final_content, 60)
                 )
             }
             AgentEvent::ToolStart { tool_name, .. } => format!("ToolStart({})", tool_name),
@@ -199,7 +202,7 @@ fn print_history(events: &[PersistedAgentEvent]) {
                 "ToolEnd(id={} err={} {})",
                 tool_call_id,
                 result.is_error,
-                crate::stream::truncate(&result.content, 60)
+                crate::tool_display::truncate_str(&result.content, 60)
             ),
             AgentEvent::ToolConfirmRequired { tool_name, .. } => {
                 format!("ToolConfirmRequired({})", tool_name)

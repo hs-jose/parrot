@@ -54,7 +54,7 @@ pub(crate) async fn print_stream(
                     let args_str = if args.is_empty() {
                         String::new()
                     } else {
-                        format!(" {}", truncate(&args, 96))
+                        format!(" {}", crate::tool_display::truncate_str(&args, 96))
                     };
                     writeln!(stdout, "\n▸ {tool_name}{args_str}")?;
                     stdout.flush()?;
@@ -137,14 +137,4 @@ fn prompt_confirm(
         "y" | "yes" => ConfirmDecision::Approve,
         _ => ConfirmDecision::Reject,
     })
-}
-
-pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
-    }
 }

@@ -273,9 +273,13 @@ async fn handle_key(
                 }
                 Ok(None)
             }
-            // Tab（+Shift 反向）在工具条目间循环选中；原先落入 `_` 分支会往
-            // 输入框插入制表符，现改作选中导航。
-            KeyCode::Tab => {
+            // Tab / Shift+Tab 在工具条目间循环选中（后移/前移）。crossterm 0.29
+            // 在 Windows 与 Unix 上均把 Shift+Tab 上报为 KeyCode::BackTab 且携带
+            // SHIFT 修饰键，故此处不能只在 Tab 分支里检查 SHIFT（那是死代码，
+            // BackTab 会落入 `_` 分支往输入框插入制表符）。反向选中靠
+            // `!contains(SHIFT)`：BackTab 通常自带 SHIFT；个别终端只上报无修饰
+            // 键的 BackTab 时兜底按正向处理。
+            KeyCode::Tab | KeyCode::BackTab => {
                 app.select_next_tool(!k.modifiers.contains(KeyModifiers::SHIFT));
                 Ok(None)
             }
