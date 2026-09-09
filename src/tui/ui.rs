@@ -2,10 +2,12 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tool_display::{compact_args, truncate_str};
 use crate::tui::app::{App, ChatEntry, Mode};
 use crate::tui::confirm::format_confirmation;
+use crate::tui::slash::SlashPopup;
 
 /// Nord 冷灰蓝配色（低饱和、素雅耐看，https://www.nordtheme.com）
 mod palette {
@@ -52,6 +54,14 @@ pub(crate) fn draw(
     draw_entries(f, chunks[1], &mut *app);
     draw_input(f, chunks[2], input);
     draw_status(f, chunks[3], app);
+    // 斜杠补全弹窗：浮在输入卡片上方（仅 Normal 模式；确认模态优先）。
+    if app.mode == Mode::Normal {
+        if let Some(popup) = app.slash_popup.as_ref() {
+            if !popup.is_empty() {
+                draw_slash_popup(f, area, chunks[2], popup);
+            }
+        }
+    }
     if app.mode == Mode::ConfirmPending {
         if let Some(p) = &app.pending_confirmation {
             draw_confirm_modal(f, area, &format_confirmation(p));
@@ -490,6 +500,76 @@ fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &ratatui_textarea::
     f.render_widget(input, text_area);
 }
 
+const POPUP_MAX_VISIBLE: usize = 8;
+const POPUP_MIN_WIDTH: u16 = 40;
+
+/// 斜杠命令补全弹窗：贴输入卡片上方、左对齐输入卡片，最多显示
+/// `POPUP_MAX_VISIBLE` 项，超出时滚动窗口保证选中项可见。
+fn draw_slash_popup(f: &mut ratatui::Frame<'_>, area: Rect, input_area: Rect, popup: &SlashPopup) {
+    let items = popup.items();
+    let total = items.len();
+    let visible = total.min(POPUP_MAX_VISIBLE);
+    let sel = popup.selected();
+    // 滚动窗口起点：sel 减一屏可保证选中项在窗口内，再夹到合法范围。
+    let start = sel.saturating_sub(visible - 1).min(total - visible);
+
+    // 宽度：最长行内容宽 + 前缀与 padding，且不低于最小宽度。
+    let content_w = items
+        .iter()
+        .map(|c| format!("/{}  {}", c.name, c.description).width() as u16)
+        .max()
+        .unwrap_or(0)
+        + 4; // ❯+空格 前缀 2 列 + 左右 padding 2 列
+    let total_w = content_w
+        .max(POPUP_MIN_WIDTH)
+        .min(area.width.saturating_sub(2))
+        .max(3);
+    let height = (visible as u16 + 2).min(input_area.y.max(3)); // 含上下边框
+
+    let popup_area = Rect::new(input_area.x, input_area.y - height, total_w, height);
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::DIM))
+        .title(Span::styled(
+            " 斜杠命令 ",
+            Style::default().fg(palette::DIM),
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (i, c) in items[start..start + visible].iter().enumerate() {
+        let idx = start + i;
+        if idx == sel {
+            let row_w = 2 + 1 + c.name.len() + 2 + c.description.width();
+            let pad = (inner.width as usize).saturating_sub(row_w);
+            let hi = Style::default().bg(palette::TITLE_BG).fg(palette::TITLE_FG);
+            lines.push(Line::from(vec![
+                Span::styled("❯ ".to_string(), hi),
+                Span::styled(format!("/{}", c.name), hi.add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {}", c.description), hi),
+                Span::styled(" ".repeat(pad), hi),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("/{}", c.name),
+                    Style::default().fg(palette::USER_FG),
+                ),
+                Span::styled(
+                    format!("  {}", c.description),
+                    Style::default().fg(palette::DIM),
+                ),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// 状态栏右侧的活动指示：spinner + 状态标签，位置固定不推动聊天内容。
 fn activity_label(app: &App) -> Option<String> {
     if app.compacting {
@@ -774,5 +854,100 @@ mod tests {
             })
             .collect::<String>();
         assert!(joined.contains("❯▾"), "选中且展开应显示 ❯▾：{joined}");
+    }
+
+    use crate::tui::app::PendingConfirmation;
+    use crate::tui::slash::{sync_slash_popup, SlashPopup};
+
+    fn backend_text(term: &Terminal<TestBackend>) -> String {
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn row_text(term: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area().width as usize;
+        let start = y as usize * w;
+        buf.content()[start..start + w]
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// TestBackend 中宽字符（中文）占两格，第二格符号是空格，收集出的文本
+    /// 会在 CJK 字符间混入空格；压缩空白后才能可靠断言中文描述。
+    fn flat_text(term: &Terminal<TestBackend>) -> String {
+        backend_text(term).split_whitespace().collect()
+    }
+
+    #[test]
+    fn slash_popup_renders_when_active() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut app = App::new(SessionId::new_v4());
+        app.slash_popup = Some(SlashPopup::filtered(""));
+        let mut input = ratatui_textarea::TextArea::default();
+        input.insert_char('/');
+        terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
+        let text = flat_text(&terminal);
+        assert!(text.contains("/help"), "应渲染命令名：{text}");
+        assert!(text.contains("❯"), "应渲染选中标记：{text}");
+        assert!(text.contains("查看本会话"), "应渲染描述：{text}");
+    }
+
+    #[test]
+    fn slash_popup_hidden_when_confirm_pending() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut app = App::new(SessionId::new_v4());
+        app.slash_popup = Some(SlashPopup::filtered(""));
+        app.mode = Mode::ConfirmPending;
+        app.pending_confirmation = Some(PendingConfirmation {
+            tool_call_id: "t1".into(),
+            tool_name: "shell_exec".into(),
+            arguments: serde_json::json!({}),
+        });
+        let input = ratatui_textarea::TextArea::default();
+        terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
+        assert!(
+            !flat_text(&terminal).contains("查看本会话"),
+            "ConfirmPending 时弹窗不应绘制"
+        );
+    }
+
+    #[test]
+    fn slash_popup_hidden_when_input_not_slash() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut app = App::new(SessionId::new_v4());
+        let mut input = ratatui_textarea::TextArea::default();
+        for c in "hi".chars() {
+            input.insert_char(c);
+        }
+        sync_slash_popup(&mut app, &input.lines().join("\n"));
+        terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
+        assert!(app.slash_popup.is_none());
+        assert!(!flat_text(&terminal).contains("查看本会话"));
+    }
+
+    #[test]
+    fn slash_popup_sits_above_input_box() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut app = App::new(SessionId::new_v4());
+        app.slash_popup = Some(SlashPopup::filtered(""));
+        let mut input = ratatui_textarea::TextArea::default();
+        input.insert_char('/');
+        terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
+        // 60x20：标题 1 + 对话区 + 输入框（顶边 y=16）+ 状态栏。弹窗自身的
+        // 顶边框也是 ╭，y>8 启发式会先命中它，故按简报备注改为断言弹窗行
+        // y < 14（弹窗底部不得越过输入框顶边）。
+        let popup_row = (0u16..20)
+            .find(|&y| row_text(&terminal, y).contains("/help"))
+            .expect("弹窗行存在");
+        assert!(
+            popup_row < 14,
+            "弹窗行 {popup_row} 应在输入框顶（y=16）上方"
+        );
     }
 }

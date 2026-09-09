@@ -15,8 +15,6 @@ pub(crate) struct SlashCommand {
     /// 命令名（不含 `/` 前缀），如 "help"。
     pub name: &'static str,
     /// 弹窗里显示的一行说明。
-    // 渲染层（Task 6）才消费，届时移除 allow。
-    #[allow(dead_code)]
     pub description: &'static str,
     pub action: SlashAction,
 }
@@ -158,18 +156,14 @@ impl SlashPopup {
     }
 
     /// items 为空时 UI 不画弹窗，但状态仍存活（退格可恢复匹配）。
-    // 以下三个 getter 的消费方在 Task 6 渲染层，届时移除 allow。
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn items(&self) -> &[&'static SlashCommand] {
         &self.items
     }
 
-    #[allow(dead_code)]
     pub(crate) fn selected(&self) -> usize {
         self.selected
     }
