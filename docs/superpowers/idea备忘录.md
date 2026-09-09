@@ -45,4 +45,4 @@
 - [ ] rust版本升级
 
 ## TUI
-- [ ] p2 多行粘贴体验。Windows 下 crossterm 事件源不产出 `Event::Paste`（走 Console API，ConPTY 把粘贴合成为逐字符按键事件），`EnableBracketedPaste` 形同虚设。单行粘贴逐字符可用；多行粘贴的换行会被合成为 Enter 按键 → 命中 `handle_key` 提交分支，消息在粘贴中途被提前发送。可选解：启发式粘贴风暴防护（短时间窗内大量 Char 事件后的 Enter 视为换行插入而非提交）；根治依赖 crossterm 支持 Windows bracketed paste。2026-09-09 按用户决定保持现状，仅记录。
+- [ ] p2 多行粘贴体验与机制确认。Windows 下 crossterm 事件源不产出 `Event::Paste`（走 Console API，`sys/windows/parse.rs` 无任何 bracketed paste 解析），`EnableBracketedPaste` 形同虚设，粘贴合成为逐字符按键事件。2026-09-09 实测：单行/多行粘贴在输入框中均正常显示、不会提前发送——推测 ConPTY 把粘贴的换行合成为带修饰键的 Enter（`\n` 惯例映射 Ctrl+J 类），恰好命中 TUI 的 Shift+Enter/Ctrl+Enter/Ctrl+J 换行分支而非裸 Enter 提交分支（属巧合性正确，机制未经按键日志确证）。可选改进：加临时按键日志确证机制；根治依赖 crossterm 支持 Windows bracketed paste。当前按用户决定保持现状。
