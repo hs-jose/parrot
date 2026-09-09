@@ -1,8 +1,6 @@
 pub(crate) mod app;
 pub(crate) mod confirm;
 pub(crate) mod input;
-// 注册表先于弹窗接线落地，接线上层调用前暂时只有测试在用。
-#[allow(dead_code)]
 pub(crate) mod slash;
 pub(crate) mod ui;
 
@@ -150,6 +148,7 @@ async fn run_loop(
                                 input.insert_char(c);
                             }
                         }
+                        slash::sync_slash_popup(app, &input.lines().join("\n"));
                         *dirty = true;
                     }
                     UiEvent::Key(k) => {
@@ -195,6 +194,7 @@ async fn run_loop(
                                 break;
                             }
                         }
+                        slash::sync_slash_popup(app, &input.lines().join("\n"));
                         *dirty = true;
                     }
                 }
@@ -258,85 +258,122 @@ async fn handle_key(
             }
             _ => Ok(None),
         },
-        Mode::Normal => match k.code {
-            // Shift+Enter / Ctrl+Enter / Ctrl+J 插入换行（不同终端对
-            // 组合键的上报不一致，三种都接住）。必须放在裸 Enter 分支之前。
-            KeyCode::Enter
-                if k.modifiers.contains(KeyModifiers::SHIFT)
-                    || k.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                input.insert_newline();
-                Ok(None)
-            }
-            KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.insert_newline();
-                Ok(None)
-            }
-            KeyCode::Enter => {
-                let text = input.lines().join("\n");
-                // 有选中工具且输入框为空时，Enter 优先切换该条目展开/收起。
-                // Repeat 长按会连发，切换展开必须只认物理按下。
-                if k.kind == KeyEventKind::Press
-                    && text.trim().is_empty()
-                    && app.selected_tool.is_some()
-                {
-                    app.toggle_selected_tool();
-                    return Ok(None);
-                }
-                if !text.trim().is_empty() {
-                    *input = TextArea::default();
-                    if let Some(should_quit) = handle_command(app, conn, &text).await? {
-                        return Ok(Some(should_quit));
+        Mode::Normal => {
+            // 斜杠补全弹窗存活时优先拦截（Shift 组合不拦，聊天滚动照常）。
+            if app.slash_popup.is_some() {
+                match k.code {
+                    KeyCode::Up if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if let Some(p) = app.slash_popup.as_mut() {
+                            p.move_up();
+                        }
+                        return Ok(None);
                     }
-                    conn.sender
-                        .send(ClientMessage::Chat {
-                            session_id: app.session_id,
-                            message: text,
-                        })
-                        .await?;
+                    KeyCode::Down if !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if let Some(p) = app.slash_popup.as_mut() {
+                            p.move_down();
+                        }
+                        return Ok(None);
+                    }
+                    KeyCode::Enter
+                        if !k.modifiers.contains(KeyModifiers::SHIFT)
+                            && !k.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        if let Some(cmd) = app.slash_popup.as_ref().and_then(|p| p.selected_cmd()) {
+                            *input = TextArea::default();
+                            app.slash_popup = None;
+                            app.slash_dismissed_query = None;
+                            return slash::execute(cmd, app, conn).await;
+                        }
+                        // 无选中项（列表空）→ 不拦截，走普通 Enter 路径
+                    }
+                    KeyCode::Esc => {
+                        app.slash_dismissed_query =
+                            slash::popup_query(&input.lines().join("\n")).map(str::to_string);
+                        app.slash_popup = None;
+                        return Ok(None);
+                    }
+                    _ => {}
                 }
-                Ok(None)
             }
-            // Tab / Shift+Tab 在工具条目间循环选中（后移/前移）。crossterm 0.29
-            // 在 Windows 与 Unix 上均把 Shift+Tab 上报为 KeyCode::BackTab 且携带
-            // SHIFT 修饰键，故此处不能只在 Tab 分支里检查 SHIFT（那是死代码，
-            // BackTab 会落入 `_` 分支往输入框插入制表符）。反向选中靠
-            // `!contains(SHIFT)`：BackTab 通常自带 SHIFT；个别终端只上报无修饰
-            // 键的 BackTab 时兜底按正向处理。
-            KeyCode::Tab | KeyCode::BackTab => {
-                app.select_next_tool(!k.modifiers.contains(KeyModifiers::SHIFT));
-                Ok(None)
+            match k.code {
+                // ↓↓↓ 以下为原有分支，原样保留 ↓↓↓
+                KeyCode::Enter
+                    if k.modifiers.contains(KeyModifiers::SHIFT)
+                        || k.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    input.insert_newline();
+                    Ok(None)
+                }
+                KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.insert_newline();
+                    Ok(None)
+                }
+                KeyCode::Enter => {
+                    let text = input.lines().join("\n");
+                    // 有选中工具且输入框为空时，Enter 优先切换该条目展开/收起。
+                    // Repeat 长按会连发，切换展开必须只认物理按下。
+                    if k.kind == KeyEventKind::Press
+                        && text.trim().is_empty()
+                        && app.selected_tool.is_some()
+                    {
+                        app.toggle_selected_tool();
+                        return Ok(None);
+                    }
+                    if !text.trim().is_empty() {
+                        *input = TextArea::default();
+                        if let Some(should_quit) = handle_command(app, conn, &text).await? {
+                            return Ok(Some(should_quit));
+                        }
+                        conn.sender
+                            .send(ClientMessage::Chat {
+                                session_id: app.session_id,
+                                message: text,
+                            })
+                            .await?;
+                    }
+                    Ok(None)
+                }
+                // Tab / Shift+Tab 在工具条目间循环选中（后移/前移）。crossterm 0.29
+                // 在 Windows 与 Unix 上均把 Shift+Tab 上报为 KeyCode::BackTab 且携带
+                // SHIFT 修饰键，故此处不能只在 Tab 分支里检查 SHIFT（那是死代码，
+                // BackTab 会落入 `_` 分支往输入框插入制表符）。反向选中靠
+                // `!contains(SHIFT)`：BackTab 通常自带 SHIFT；个别终端只上报无修饰
+                // 键的 BackTab 时兜底按正向处理。
+                KeyCode::Tab | KeyCode::BackTab => {
+                    app.select_next_tool(!k.modifiers.contains(KeyModifiers::SHIFT));
+                    Ok(None)
+                }
+                KeyCode::PageUp => {
+                    app.scroll_up((app.view_height / 2).max(1));
+                    Ok(None)
+                }
+                KeyCode::PageDown => {
+                    app.scroll_down((app.view_height / 2).max(1));
+                    Ok(None)
+                }
+                KeyCode::Home if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_to_top();
+                    Ok(None)
+                }
+                KeyCode::End if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.scroll_to_bottom();
+                    Ok(None)
+                }
+                KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.scroll_up(1);
+                    Ok(None)
+                }
+                KeyCode::Down if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.scroll_down(1);
+                    Ok(None)
+                }
+                _ => {
+                    // 其余按键交给 TextArea（光标/退格等）
+                    input.input(ratatui_textarea::Input::from(k));
+                    Ok(None)
+                }
             }
-            KeyCode::PageUp => {
-                app.scroll_up((app.view_height / 2).max(1));
-                Ok(None)
-            }
-            KeyCode::PageDown => {
-                app.scroll_down((app.view_height / 2).max(1));
-                Ok(None)
-            }
-            KeyCode::Home if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.scroll_to_top();
-                Ok(None)
-            }
-            KeyCode::End if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.scroll_to_bottom();
-                Ok(None)
-            }
-            KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => {
-                app.scroll_up(1);
-                Ok(None)
-            }
-            KeyCode::Down if k.modifiers.contains(KeyModifiers::SHIFT) => {
-                app.scroll_down(1);
-                Ok(None)
-            }
-            _ => {
-                // 其余按键交给 TextArea（光标/退格等）
-                input.input(ratatui_textarea::Input::from(k));
-                Ok(None)
-            }
-        },
+        }
     }
 }
 
@@ -387,6 +424,7 @@ async fn handle_command(
 mod tests {
     use super::*;
     use crate::conn::Connection;
+    use crate::tui::slash::sync_slash_popup;
     use tokio::sync::mpsc;
 
     fn test_conn() -> (Connection, mpsc::Receiver<ClientMessage>) {
@@ -471,5 +509,106 @@ mod tests {
             .unwrap();
         assert_eq!(result, None);
         assert!(app.entries.is_empty());
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    /// 弹窗激活态的测试环境：输入 "/’" 并 sync。rx 一并返回以保持
+    /// channel 另一端存活（避免 conn.sender.send 失败）。
+    async fn popup_app() -> (
+        app::App,
+        Connection,
+        TextArea<'static>,
+        mpsc::Receiver<ClientMessage>,
+    ) {
+        let (conn, rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let mut input = TextArea::default();
+        for c in "/".chars() {
+            input.insert_char(c);
+        }
+        sync_slash_popup(&mut app, &input.lines().join("\n"));
+        (app, conn, input, rx)
+    }
+
+    #[tokio::test]
+    async fn popup_down_up_move_selection_not_scroll() {
+        let (mut app, mut conn, mut input, _rx) = popup_app().await;
+        handle_key(
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.slash_popup.as_ref().unwrap().selected(), 1);
+        assert_eq!(app.scroll_offset, 0, "弹窗存活时 Down 不应滚动聊天区");
+        handle_key(
+            key(KeyCode::Up, KeyModifiers::NONE),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.slash_popup.as_ref().unwrap().selected(), 0);
+    }
+
+    #[tokio::test]
+    async fn popup_shift_up_still_scrolls_chat() {
+        let (mut app, mut conn, mut input, _rx) = popup_app().await;
+        handle_key(
+            key(KeyCode::Up, KeyModifiers::SHIFT),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.scroll_offset, 1, "Shift+Up 不被弹窗拦截，仍滚动聊天区");
+    }
+
+    #[tokio::test]
+    async fn popup_enter_executes_and_clears_input() {
+        let (mut app, mut conn, mut input, _rx) = popup_app().await;
+        for c in "exit".chars() {
+            input.insert_char(c);
+        }
+        sync_slash_popup(&mut app, &input.lines().join("\n"));
+        let quit = handle_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(quit, Some(true), "/exit 应请求退出");
+        assert!(input.lines()[0].is_empty(), "执行后输入框应清空");
+        assert!(app.slash_popup.is_none());
+        assert!(app.slash_dismissed_query.is_none());
+    }
+
+    #[tokio::test]
+    async fn popup_esc_closes_keeps_text() {
+        let (mut app, mut conn, mut input, _rx) = popup_app().await;
+        for c in "he".chars() {
+            input.insert_char(c);
+        }
+        sync_slash_popup(&mut app, &input.lines().join("\n"));
+        handle_key(
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert!(app.slash_popup.is_none());
+        assert_eq!(app.slash_dismissed_query.as_deref(), Some("he"));
+        assert_eq!(input.lines().join("\n"), "/he", "Esc 不应改动输入文本");
     }
 }
