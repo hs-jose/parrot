@@ -90,7 +90,7 @@ fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 /// 状态栏：灰色底。左侧显示 模型 / 累计 token / 工作状态（活动时追加
-/// spinner + 标签），右侧显示 会话短 id（结束时追加 ended 标记）。
+/// spinner + 标签），右侧显示 会话 id（完整）（结束时追加 ended 标记）。
 fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let model = if app.model.is_empty() {
         "model -".to_string()
@@ -99,7 +99,6 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let usage = &app.total_usage;
     let usage_str = format!("{} in / {} out", usage.input_tokens, usage.output_tokens);
-    let short_sid: String = app.session_id.to_string().chars().take(8).collect();
     let mut spans = vec![
         Span::styled(" ", Style::default()),
         Span::styled(model, Style::default().fg(palette::STATUS_FG)),
@@ -119,7 +118,7 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(bar, area);
     let right = Line::from(vec![
         Span::styled(
-            format!("session {short_sid}"),
+            format!("session {}", app.session_id),
             Style::default().fg(palette::DIM),
         ),
         Span::styled(
