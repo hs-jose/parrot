@@ -1,3 +1,4 @@
+use crate::tui::slash::SlashPopup;
 use chrono::Local;
 use parrot_protocol::agent_event::{
     AgentEndReason, AgentEvent, MessageDeltaPayload, PersistedAgentEvent, TurnStopReason,
@@ -83,6 +84,10 @@ pub(crate) struct App {
     pub compacting: bool,
     /// 当前选中的工具条目（tool_call_id）。Tab 循环选中、Enter 展开。
     pub selected_tool: Option<String>,
+    /// 斜杠命令补全弹窗（存活 = Some）。由 sync_slash_popup 按输入文本校正。
+    pub slash_popup: Option<SlashPopup>,
+    /// Esc 关闭弹窗时的 query；同 query 不复活（防下一帧重新弹出），见设计 §2。
+    pub slash_dismissed_query: Option<String>,
 }
 
 impl App {
@@ -105,6 +110,8 @@ impl App {
             tools_in_flight: 0,
             compacting: false,
             selected_tool: None,
+            slash_popup: None,
+            slash_dismissed_query: None,
         }
     }
 

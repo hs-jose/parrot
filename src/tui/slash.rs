@@ -169,6 +169,25 @@ impl SlashPopup {
     }
 }
 
+/// 每次按键/粘贴后按当前输入文本校正弹窗状态（权威规则见设计 §2）：
+/// query 失效即关闭；弹窗开着就随 query 重新过滤；被 Esc 关闭后同 query
+/// 不复活，query 变化才重新弹出。
+pub(crate) fn sync_slash_popup(app: &mut App, text: &str) {
+    match popup_query(text) {
+        None => {
+            app.slash_popup = None;
+            app.slash_dismissed_query = None;
+        }
+        Some(q) => {
+            if let Some(p) = app.slash_popup.as_mut() {
+                p.filter(q);
+            } else if app.slash_dismissed_query.as_deref() != Some(q) {
+                app.slash_popup = Some(SlashPopup::filtered(q));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +369,45 @@ mod tests {
         let p = SlashPopup::filtered("ex");
         assert_eq!(p.items().len(), 1);
         assert_eq!(p.selected_cmd().map(|c| c.name), Some("exit"));
+    }
+
+    #[test]
+    fn sync_opens_filters_and_closes() {
+        let mut app = App::new(SessionId::new_v4());
+        sync_slash_popup(&mut app, "/");
+        assert!(app.slash_popup.is_some(), "空 query 应显示全量");
+        sync_slash_popup(&mut app, "/us");
+        let p = app.slash_popup.as_ref().unwrap();
+        assert_eq!(p.items().len(), 1, "query 变化应重新过滤");
+        sync_slash_popup(&mut app, "hello");
+        assert!(app.slash_popup.is_none(), "非 / 开头应关闭");
+        assert!(app.slash_dismissed_query.is_none());
+    }
+
+    #[test]
+    fn sync_dismissed_same_query_stays_closed() {
+        let mut app = App::new(SessionId::new_v4());
+        sync_slash_popup(&mut app, "/he");
+        // 模拟 Esc 关闭（Task 5 的 handle_key 会做同样的事）：
+        app.slash_dismissed_query = Some("he".into());
+        app.slash_popup = None;
+        sync_slash_popup(&mut app, "/he");
+        assert!(app.slash_popup.is_none(), "同 query 不复活");
+        sync_slash_popup(&mut app, "/hel");
+        assert!(app.slash_popup.is_some(), "query 变化应复活");
+    }
+
+    #[test]
+    fn sync_invalid_query_clears_dismissed() {
+        let mut app = App::new(SessionId::new_v4());
+        sync_slash_popup(&mut app, "/he");
+        app.slash_dismissed_query = Some("he".into());
+        app.slash_popup = None;
+        sync_slash_popup(&mut app, "text");
+        assert!(app.slash_popup.is_none());
+        assert!(
+            app.slash_dismissed_query.is_none(),
+            "失效 query 应清 dismissed"
+        );
     }
 }
