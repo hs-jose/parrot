@@ -328,16 +328,6 @@ async fn handle_key(
                 app.scroll_down(1);
                 Ok(None)
             }
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                if app.is_turn_active() {
-                    conn.sender
-                        .send(ClientMessage::Abort {
-                            session_id: app.session_id,
-                        })
-                        .await?;
-                }
-                Ok(None)
-            }
             _ => {
                 // 其余按键交给 TextArea（光标/退格等）
                 input.input(ratatui_textarea::Input::from(k));

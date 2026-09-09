@@ -90,7 +90,8 @@ fn draw_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 /// 状态栏：灰色底。左侧显示 模型 / 累计 token / 工作状态（活动时追加
-/// spinner + 标签），右侧显示 会话 id（完整）（结束时追加 ended 标记）。
+/// spinner + 标签，其后附“双击Esc 中断”提示），右侧显示 会话 id（完整）
+/// （结束时追加 ended 标记）。
 fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let model = if app.model.is_empty() {
         "model -".to_string()
@@ -112,6 +113,11 @@ fn draw_status(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(palette::AI_FG),
         ));
         spans.push(Span::styled(label, Style::default().fg(palette::STATUS_FG)));
+        spans.push(Span::styled("  ·  ", Style::default().fg(palette::DIM)));
+        spans.push(Span::styled(
+            "双击Esc 中断",
+            Style::default().fg(palette::DIM),
+        ));
     }
     let line = Line::from(spans);
     let bar = Paragraph::new(line).style(Style::default().bg(palette::STATUS_BG));
@@ -450,16 +456,12 @@ fn push_body_styled(text: &str, lines: &mut Vec<Line<'_>>, style: Style) {
 }
 
 fn draw_input(f: &mut ratatui::Frame<'_>, area: Rect, input: &ratatui_textarea::TextArea<'_>) {
-    // 输入卡片：圆角蓝边框标示焦点；快捷键提示收进边框标题，不再占用内容行。
+    // 输入卡片：圆角蓝边框标示焦点；快捷键提示已移除（中断提示在状态栏）。
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(palette::INPUT_BORDER))
-        .padding(Padding::horizontal(1))
-        .title(Span::styled(
-            " Enter 发送 · Shift+Enter 换行 · 粘贴多行自动换行 · PgUp/PgDn 翻页 · Ctrl+C 中断 · 双击 Esc 退出 ",
-            Style::default().fg(palette::DIM),
-        ));
+        .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
