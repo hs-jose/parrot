@@ -105,6 +105,21 @@ ToolOutput 为 String):
 annotations(readOnlyHint 等)本期忽略——规范明确其为不可信输入,
 不作放行依据;确认策略走 server 级开关。
 
+**错误信息保真原则**:adapter 层不做泛化/吞并/转述,`ToolOutput`
+一律携带底层原始错误信息,让用户与模型都能看到"到底错在哪":
+
+| 错误来源 | ToolOutput 内容(保真要求) |
+|---|---|
+| JSON-RPC error `{code, message, data}` | `MCP 协议错误 code=<code>: <message>`;`data` 存在时附原始 JSON |
+| rmcp `ServiceError`(响应解码失败/意外响应等) | 错误 Display 直出(thiserror 原文),不转述 |
+| 传输断开 / server 进程退出 | `MCP server <id> 连接已断开(进程可能已退出)`;能取到 exit code 则附上 |
+| spawn 失败 | `io::Error` 原样(kind + message,如 program not found) |
+| 调用超时 | `MCP 调用超时(超过 <N>s,server 未响应)` |
+| `result.isError == true` | content 全文原样保留回喂模型(server 自己写的错误详情,不加工) |
+
+同时 `tracing::warn!` 记录完整链路细节(server id、tool 名、耗时、
+底层错误),日志与 UI 各司其职。引擎层 64KB 截断兜底超长错误。
+
 ### 3.5 确认策略合并
 
 `require_confirmation == true`(默认)→ daemon 把 `"mcp__<id>__"`
