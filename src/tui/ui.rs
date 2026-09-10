@@ -370,10 +370,14 @@ fn entry_lines(e: &ChatEntry, selected_tool: Option<&str>, lines: &mut Vec<Line<
             }
         }
         ChatEntry::Info(s) => {
-            lines.push(Line::from(Span::styled(
-                s.clone(),
-                Style::default().fg(palette::DIM),
-            )));
+            // Info 文本可含多行（如 /help 快捷键说明）；单条 Line 里的 \n
+            // 不会折行，必须拆成独立 Line 才是真实换行。
+            for l in s.lines() {
+                lines.push(Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(palette::DIM),
+                )));
+            }
         }
     }
 }
@@ -776,6 +780,13 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         assert_eq!(rendered, vec!["line1".to_string()]);
+    }
+
+    #[test]
+    fn info_entry_splits_embedded_newlines_into_lines() {
+        let mut lines = Vec::new();
+        entry_lines(&ChatEntry::Info("a\nb".into()), None, &mut lines);
+        assert_eq!(lines.len(), 2, "嵌入 \\n 必须拆成独立 Line");
     }
 
     #[test]
