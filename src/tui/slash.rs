@@ -65,14 +65,12 @@ pub(crate) async fn execute(
 ) -> Result<Option<bool>, Box<dyn std::error::Error>> {
     match cmd.action {
         SlashAction::Help => {
-            let names = REGISTRY
-                .iter()
-                .map(|c| format!("/{}", c.name))
-                .collect::<Vec<_>>()
-                .join(" ");
-            app.entries.push(ChatEntry::Info(format!(
-                "可用命令: {names}\n!<命令> 在 daemon 执行 shell 命令"
-            )));
+            // 斜杠命令列表由输入 "/" 时的补全弹窗展示，help 不再重复枚举；
+            // 这里只补弹窗覆盖不到的信息：`!` shell 命令与快捷键。
+            app.entries.push(ChatEntry::Info(
+                "输入 / 弹出命令补全；!<命令> 在 daemon 执行 shell 命令\n\n快捷键:\n· Shift+Enter / Ctrl+J  换行\n· Tab / Shift+Tab  在工具条目间选中，Enter 展开/收起\n· PgUp / PgDn  半页滚动；Shift+↑/↓  逐行滚动；Ctrl+Home / Ctrl+End  到顶部/底部\n· Esc  关闭命令弹窗 / 清除选中；双击 Esc  中断进行中轮次或退出"
+                    .into(),
+            ));
             Ok(Some(false))
         }
         SlashAction::Usage => {
@@ -270,7 +268,15 @@ mod tests {
             execute(cmd, &mut app, &mut conn).await.unwrap(),
             Some(false)
         );
-        assert!(matches!(app.entries.last(), Some(ChatEntry::Info(_))));
+        match app.entries.last() {
+            Some(ChatEntry::Info(s)) => {
+                // help 不再枚举斜杠命令（弹窗负责展示），只保留 `!` 与快捷键说明。
+                assert!(s.contains("!<命令>"), "应说明 ! shell 命令：{s}");
+                assert!(s.contains("快捷键"), "应列出快捷键：{s}");
+                assert!(!s.contains("/usage"), "不应枚举斜杠命令：{s}");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
         assert!(server_rx.try_recv().is_err());
     }
 
