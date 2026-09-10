@@ -517,12 +517,14 @@ fn draw_slash_popup(f: &mut ratatui::Frame<'_>, area: Rect, input_area: Rect, po
     // 滚动窗口起点：sel 减一屏可保证选中项在窗口内，再夹到合法范围。
     let start = sel.saturating_sub(visible - 1).min(total - visible);
 
-    // 宽度：最长行内容宽 + 前缀与 padding，且不低于最小宽度。
+    // 宽度：名字列统一填充到最宽命令名（描述起始列对齐），取最长行内容宽
+    // + 前缀与 padding，且不低于最小宽度。
+    let name_w = items.iter().map(|c| c.name.width()).max().unwrap_or(0);
     let content_w = items
         .iter()
-        .map(|c| format!("/{}  {}", c.name, c.description).width() as u16)
+        .map(|c| 1 + name_w + 2 + c.description.width())
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0) as u16
         + 4; // ❯+空格 前缀 2 列 + 左右 padding 2 列
     let total_w = content_w
         .max(POPUP_MIN_WIDTH)
@@ -548,23 +550,27 @@ fn draw_slash_popup(f: &mut ratatui::Frame<'_>, area: Rect, input_area: Rect, po
     let mut lines: Vec<Line<'_>> = Vec::new();
     for (i, c) in items[start..start + visible].iter().enumerate() {
         let idx = start + i;
+        // 名字列填充到最宽命令名，保证所有行的描述起始列对齐。
+        // 手动按显示宽补空格（format! 的宽度填充按字符数，非显示宽）。
+        let name_col = format!(
+            "/{}{}",
+            c.name,
+            " ".repeat(name_w.saturating_sub(c.name.width()))
+        );
         if idx == sel {
-            let row_w = 2 + 1 + c.name.width() + 2 + c.description.width();
+            let row_w = 2 + 1 + name_w + 2 + c.description.width();
             let pad = (inner.width as usize).saturating_sub(row_w);
             let hi = Style::default().bg(palette::TITLE_BG).fg(palette::TITLE_FG);
             lines.push(Line::from(vec![
                 Span::styled("❯ ".to_string(), hi),
-                Span::styled(format!("/{}", c.name), hi.add_modifier(Modifier::BOLD)),
+                Span::styled(name_col, hi.add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  {}", c.description), hi),
                 Span::styled(" ".repeat(pad), hi),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("/{}", c.name),
-                    Style::default().fg(palette::USER_FG),
-                ),
+                Span::styled(name_col, Style::default().fg(palette::USER_FG)),
                 Span::styled(
                     format!("  {}", c.description),
                     Style::default().fg(palette::DIM),
@@ -908,6 +914,29 @@ mod tests {
         assert!(text.contains("/help"), "应渲染命令名：{text}");
         assert!(text.contains("❯"), "应渲染选中标记：{text}");
         assert!(text.contains("查看本会话"), "应渲染描述：{text}");
+    }
+
+    #[test]
+    fn slash_popup_descriptions_start_aligned() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut app = App::new(SessionId::new_v4());
+        app.slash_popup = Some(SlashPopup::filtered(""));
+        let mut input = ratatui_textarea::TextArea::default();
+        input.insert_char('/');
+        terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
+        // 60x20 下行 11=/help（选中）、行 12=/usage：描述首字必须同列。
+        // CJK 宽字符的续格单元是空符号，所以只按首字定位列。
+        let desc_col = |needle: char, y: u16| {
+            row_text(&terminal, y)
+                .chars()
+                .position(|c| c == needle)
+                .expect("描述首字应存在于该行")
+        };
+        assert_eq!(
+            desc_col('显', 11),
+            desc_col('查', 12),
+            "不同命令行的描述起始列应对齐"
+        );
     }
 
     #[test]
