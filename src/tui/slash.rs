@@ -114,6 +114,7 @@ pub(crate) fn popup_query(text: &str) -> Option<&str> {
 pub(crate) struct SlashPopup {
     items: Vec<&'static SlashCommand>,
     selected: usize,
+    query: String,
 }
 
 impl SlashPopup {
@@ -121,6 +122,7 @@ impl SlashPopup {
         Self {
             items: REGISTRY.iter().collect(),
             selected: 0,
+            query: String::new(),
         }
     }
 
@@ -131,8 +133,15 @@ impl SlashPopup {
         p
     }
 
-    /// 重新过滤；选中归 0（列表内容变化后旧选中位不再有意义）。
+    /// 重新过滤；query 未变时早退保持选中位——run_loop 在每个按键后都会
+    /// 用当前文本调 sync → filter，若不早退，Up/Down 移动的选中会被立即
+    /// 重置回 0（用户报告的"上下键无效"根因）。query 变化时选中归 0
+    /// （列表内容变化后旧选中位不再有意义）。
     pub(crate) fn filter(&mut self, query: &str) {
+        if self.query == query {
+            return;
+        }
+        self.query = query.to_string();
         self.items = filter(query);
         self.selected = 0;
     }
@@ -362,6 +371,14 @@ mod tests {
         assert_eq!(p.selected(), 0);
         assert_eq!(p.items().len(), 1);
         assert_eq!(p.selected_cmd().map(|c| c.name), Some("usage"));
+    }
+
+    #[test]
+    fn filter_same_query_preserves_selection() {
+        let mut p = SlashPopup::filtered(""); // 空 query 全量 4 条
+        p.move_down();
+        p.filter(""); // run_loop 每键后 sync 会以同 query 重入 filter
+        assert_eq!(p.selected(), 1, "同 query 重入 filter 不得重置选中位");
     }
 
     #[test]

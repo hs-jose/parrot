@@ -560,6 +560,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn popup_down_then_sync_keeps_selection() {
+        let (mut app, mut conn, mut input, _rx) = popup_app().await;
+        handle_key(
+            key(KeyCode::Down, KeyModifiers::NONE),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        // 复刻 run_loop Key 分支的真实顺序：按键后 sync 同文本
+        sync_slash_popup(&mut app, &input.lines().join("\n"));
+        assert_eq!(
+            app.slash_popup.as_ref().unwrap().selected(),
+            1,
+            "真实循环中 Down 移动后 sync 不得重置选中"
+        );
+    }
+
+    #[tokio::test]
     async fn popup_shift_up_still_scrolls_chat() {
         let (mut app, mut conn, mut input, _rx) = popup_app().await;
         handle_key(
