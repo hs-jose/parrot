@@ -541,11 +541,7 @@ fn draw_slash_popup(f: &mut ratatui::Frame<'_>, area: Rect, input_area: Rect, po
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(palette::DIM))
-        .title(Span::styled(
-            " 斜杠命令 ",
-            Style::default().fg(palette::DIM),
-        ));
+        .border_style(Style::default().fg(palette::DIM));
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
