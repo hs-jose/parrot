@@ -48,4 +48,6 @@ pub enum ClientMessage {
         session_id: SessionId,
         command: String,
     },
+    /// 查询 MCP server 状态。Response: `ServerMessage::McpServers`。
+    ListMcpServers,
 }

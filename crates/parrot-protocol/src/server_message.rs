@@ -35,6 +35,18 @@ pub enum ServerMessage {
         exit_code: i32,
     },
 
+    /// MCP server 状态变更（daemon 主动推送，broadcast 转发）。
+    McpNotice {
+        id: String,
+        state: McpServerState,
+        detail: String,
+        tool_count: u32,
+    },
+    /// `ClientMessage::ListMcpServers` 的应答。
+    McpServers {
+        entries: Vec<McpServerStatusWire>,
+    },
+
     AgentEvent {
         event: AgentEvent,
     },

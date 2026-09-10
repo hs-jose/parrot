@@ -3,7 +3,7 @@ use parrot_protocol::agent_event::{
     MessageStopReason, PersistedAgentEvent, ToolCallInfo, ToolPartial, TurnStopReason,
 };
 use parrot_protocol::types::{
-    ConfirmDecision, ModelInfo, SessionMeta, ToolDefinitionWire, ToolOutput, Usage,
+    ConfirmDecision, McpServerState, ModelInfo, SessionMeta, ToolDefinitionWire, ToolOutput, Usage,
 };
 use parrot_protocol::*;
 
@@ -578,4 +578,48 @@ fn compaction_summary_roundtrip() {
         serde_json::to_value(&msg).unwrap()["type"],
         serde_json::json!("CompactionSummary")
     );
+}
+
+#[test]
+fn mcp_notice_roundtrip() {
+    let msg = ServerMessage::McpNotice {
+        id: "playwright".into(),
+        state: McpServerState::Failed,
+        detail: "spawn 失败: program not found".into(),
+        tool_count: 0,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+    assert!(
+        json.contains(r#""type":"McpNotice""#),
+        "tagged enum: {json}"
+    );
+    assert!(
+        json.contains("\"failed\""),
+        "state 序列化为 snake_case: {json}"
+    );
+}
+
+#[test]
+fn mcp_servers_roundtrip() {
+    let msg = ServerMessage::McpServers {
+        entries: vec![parrot_protocol::types::McpServerStatusWire {
+            id: "mock".into(),
+            state: McpServerState::Connected,
+            detail: String::new(),
+            tool_count: 3,
+        }],
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn client_list_mcp_servers_roundtrip() {
+    let msg = ClientMessage::ListMcpServers;
+    let json = serde_json::to_string(&msg).unwrap();
+    let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
 }

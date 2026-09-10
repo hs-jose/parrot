@@ -32,6 +32,25 @@ pub struct ToolOutput {
     pub is_error: bool,
 }
 
+/// MCP server 运行状态（`McpNotice` / `McpServers` 使用）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerState {
+    Starting,
+    Connected,
+    Failed,
+    Stopped,
+}
+
+/// 单个 MCP server 的当前状态快照。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServerStatusWire {
+    pub id: String,
+    pub state: McpServerState,
+    pub detail: String,
+    pub tool_count: u32,
+}
+
 /// Wire-format model descriptor, returned by `ListModels` and embedded in
 /// `ServerMessage::ModelList`. Mirrors `parrot_core::types::ModelInfo` (the
 /// canonical trait return type) field-for-field; daemon converts at the

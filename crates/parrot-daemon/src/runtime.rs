@@ -516,6 +516,15 @@ async fn handle_connection(
                     );
                 }
             }
+            ClientMessage::ListMcpServers => {
+                send_error(
+                    &client.sender,
+                    None,
+                    ErrorCode::InvalidRequest,
+                    "MCP server support is not yet available",
+                )
+                .await;
+            }
         }
     }
 
