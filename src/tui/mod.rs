@@ -7,7 +7,6 @@ pub(crate) mod ui;
 #[cfg(test)]
 mod replay_test;
 
-use std::io::Stdout;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -115,14 +114,17 @@ pub(crate) async fn run_tui(
     result
 }
 
-async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+async fn run_loop<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     conn: &mut Connection,
     app: &mut app::App,
     input: &mut TextArea<'_>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
     dirty: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    B::Error: 'static,
+{
     let mut last_esc: Option<Instant> = None;
     loop {
         if *dirty {
@@ -610,5 +612,67 @@ mod tests {
         assert!(app.slash_popup.is_none());
         assert_eq!(app.slash_dismissed_query.as_deref(), Some("he"));
         assert_eq!(input.lines().join("\n"), "/he", "Esc 不应改动输入文本");
+    }
+
+    /// 设计文档 §6：弹窗打开时双击 Esc 的中断/退出语义与既有行为一致——
+    /// 第一次关弹窗并计数，500ms 内第二次触发中断（回合活跃 → Abort）。
+    #[tokio::test]
+    async fn popup_open_double_esc_aborts_active_turn() {
+        use parrot_protocol::agent_event::AgentEvent;
+        use ratatui::backend::TestBackend;
+
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: app.session_id,
+            turn_id: uuid::Uuid::new_v4(),
+            user_message: "hi".into(),
+        });
+        assert!(app.is_turn_active());
+        let mut input = TextArea::default();
+        for c in "/".chars() {
+            input.insert_char(c);
+        }
+        sync_slash_popup(&mut app, &input.lines().join("\n"));
+        assert!(app.slash_popup.is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let (ui_tx, mut ui_rx) = mpsc::channel(16);
+        ui_tx
+            .send(UiEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        ui_tx
+            .send(UiEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        ui_tx.send(UiEvent::Quit).await.unwrap();
+        drop(ui_tx);
+
+        let mut dirty = true;
+        run_loop(
+            &mut terminal,
+            &mut conn,
+            &mut app,
+            &mut input,
+            &mut ui_rx,
+            &mut dirty,
+        )
+        .await
+        .unwrap();
+
+        assert!(app.slash_popup.is_none(), "第一次 Esc 应关闭弹窗");
+        assert_eq!(input.lines().join("\n"), "/", "Esc 不应改动输入文本");
+        match server_rx.try_recv().unwrap() {
+            ClientMessage::Abort { session_id } => assert_eq!(session_id, app.session_id),
+            other => panic!("expected Abort, got {other:?}"),
+        }
+        assert!(server_rx.try_recv().is_err(), "不应有第二条消息");
     }
 }

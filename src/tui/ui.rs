@@ -549,7 +549,7 @@ fn draw_slash_popup(f: &mut ratatui::Frame<'_>, area: Rect, input_area: Rect, po
     for (i, c) in items[start..start + visible].iter().enumerate() {
         let idx = start + i;
         if idx == sel {
-            let row_w = 2 + 1 + c.name.len() + 2 + c.description.width();
+            let row_w = 2 + 1 + c.name.width() + 2 + c.description.width();
             let pad = (inner.width as usize).saturating_sub(row_w);
             let hi = Style::default().bg(palette::TITLE_BG).fg(palette::TITLE_FG);
             lines.push(Line::from(vec![
