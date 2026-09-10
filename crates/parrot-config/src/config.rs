@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(rename = "session")]
     pub session: SessionConfig,
 }
@@ -50,6 +52,12 @@ pub struct SandboxConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_mcp_startup_timeout() -> u64 {
+    30
+}
+fn default_mcp_call_timeout() -> u64 {
+    120
 }
 fn default_compaction_threshold() -> f32 {
     0.9
@@ -133,6 +141,36 @@ pub struct ExternalHookConfig {
 
 fn default_external_config() -> toml::Value {
     toml::Value::Table(toml::value::Table::new())
+}
+
+/// MCP server 接入配置（spec §3.2）。无 `[mcp]` 段时 `servers` 为空 ⇒ 零行为变化。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// One `[[mcp.servers]]` entry: 本地 stdio MCP server 子进程。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// 工具名前缀与日志标识（必填，daemon 内查重）。
+    pub id: String,
+    /// 可执行文件或 PATH 上的命令名（如 `npx`）。
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 附加环境变量（子进程继承 daemon 环境 + 此项）。
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// spawn+握手+枚举工具 总超时。
+    #[serde(default = "default_mcp_startup_timeout")]
+    pub startup_timeout_seconds: u64,
+    /// 单次 tools/call 超时。
+    #[serde(default = "default_mcp_call_timeout")]
+    pub call_timeout_seconds: u64,
+    /// 该 server 的工具调用是否要求用户确认（默认 true，MCP 规范基线）。
+    #[serde(default = "default_true")]
+    pub require_confirmation: bool,
 }
 
 impl AppConfig {
@@ -238,6 +276,7 @@ impl AppConfig {
                 summary_max_tokens: 4096,
             },
             hooks: HooksConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -441,5 +480,106 @@ extra_patterns = ["CUSTOM-\\d+", "MY-TOKEN-[a-z]+"]
             .and_then(|v| v.as_array())
             .unwrap();
         assert_eq!(extra.len(), 2);
+    }
+
+    #[test]
+    fn mcp_servers_parse_from_toml() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "m"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[[mcp.servers]]
+id = "playwright"
+command = "npx"
+args = ["@playwright/mcp@latest"]
+env = { DISPLAY = ":0" }
+startup_timeout_seconds = 10
+call_timeout_seconds = 60
+require_confirmation = false
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.mcp.servers.len(), 1);
+        let s = &c.mcp.servers[0];
+        assert_eq!(s.id, "playwright");
+        assert_eq!(s.command, "npx");
+        assert_eq!(s.args, vec!["@playwright/mcp@latest"]);
+        assert_eq!(s.env.get("DISPLAY").map(String::as_str), Some(":0"));
+        assert_eq!(s.startup_timeout_seconds, 10);
+        assert_eq!(s.call_timeout_seconds, 60);
+        assert!(!s.require_confirmation);
+    }
+
+    #[test]
+    fn mcp_entry_defaults_fill_in() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "p"
+api_key = "x"
+default_model = "m"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+
+[[mcp.servers]]
+id = "mock"
+command = "mock-server"
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        let s = &c.mcp.servers[0];
+        assert!(s.args.is_empty());
+        assert!(s.env.is_empty());
+        assert_eq!(s.startup_timeout_seconds, 30);
+        assert_eq!(s.call_timeout_seconds, 120);
+        assert!(s.require_confirmation, "确认默认开启");
+    }
+
+    #[test]
+    fn missing_mcp_section_defaults_empty() {
+        let c = AppConfig::default_config();
+        assert!(
+            c.mcp.servers.is_empty(),
+            "无 [mcp] 段 ⇒ servers 为空，零行为变化"
+        );
     }
 }
