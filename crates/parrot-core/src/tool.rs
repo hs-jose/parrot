@@ -76,6 +76,11 @@ impl ToolRegistry {
         let name = tool.name().to_string();
         self.tools.write().await.insert(name, tool);
     }
+    /// 移除一个已注册工具（MCP server 崩溃/下线时批量移除其工具用）。
+    /// 不存在时静默 no-op。进行中的调用仍持有 `Arc<dyn Tool>`，不受影响。
+    pub async fn unregister(&self, name: &str) {
+        self.tools.write().await.remove(name);
+    }
     pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.read().await.get(name).cloned()
     }
@@ -253,6 +258,37 @@ mod tests {
         let ctx = ToolContext::new(std::path::PathBuf::from("."), 10 * 1024 * 1024);
         let out = registry.execute("append", json!({}), &ctx).await.unwrap();
         assert!(out.content.contains("(truncated"));
+    }
+
+    #[tokio::test]
+    async fn unregister_removes_tool() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+        registry.unregister("echo").await;
+        assert!(registry.get("echo").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unregister_unknown_tool_is_noop() {
+        let registry = ToolRegistry::new();
+        registry.unregister("nope").await;
+    }
+
+    #[tokio::test]
+    async fn unregister_keeps_in_flight_arc_alive() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+        let held = registry.get("echo").await.expect("held before unregister");
+        registry.unregister("echo").await;
+        assert!(registry.get("echo").await.is_none());
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), 1024);
+        let out = registry.execute("echo", json!({}), &ctx).await;
+        assert!(out.is_err(), "registry 视角下工具已不存在");
+        let r = held.call(json!({"message": "hi"}), &ctx).await.unwrap();
+        assert_eq!(
+            r.content, "hi",
+            "进行中调用持有的 Arc<dyn Tool> 不受 unregister 影响"
+        );
     }
 
     struct BigTool;
