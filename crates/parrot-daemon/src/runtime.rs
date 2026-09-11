@@ -32,7 +32,16 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     parrot_tools::register_all(&tool_registry, &config).await;
     parrot_providers::register_all(&provider_registry, &config).await;
 
-    run_with(config, auth, provider_registry, tool_registry).await
+    let mcp = parrot_mcp::start_all(Arc::clone(&tool_registry), config.mcp.servers.clone()).await;
+    run_with_confirm_timeout(
+        config,
+        auth,
+        provider_registry,
+        tool_registry,
+        Duration::from_secs(60),
+        mcp,
+    )
+    .await
 }
 
 pub async fn run_with(
@@ -41,12 +50,14 @@ pub async fn run_with(
     provider_registry: Arc<ProviderRegistry>,
     tool_registry: Arc<ToolRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mcp = parrot_mcp::start_all(Arc::clone(&tool_registry), config.mcp.servers.clone()).await;
     run_with_confirm_timeout(
         config,
         auth,
         provider_registry,
         tool_registry,
         Duration::from_secs(60),
+        mcp,
     )
     .await
 }
@@ -57,6 +68,7 @@ pub async fn run_with_confirm_timeout(
     provider_registry: Arc<ProviderRegistry>,
     tool_registry: Arc<ToolRegistry>,
     confirm_timeout: Duration,
+    mcp: parrot_mcp::McpManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let default_config = config
         .providers
@@ -84,8 +96,15 @@ pub async fn run_with_confirm_timeout(
     );
 
     let confirm_router = Arc::new(ConfirmRouter::new());
+    let mcp = Arc::new(mcp);
+    let mut require_confirmation = config.tools.sandbox.require_confirmation.clone();
+    for server in &config.mcp.servers {
+        if server.require_confirmation {
+            require_confirmation.push(format!("mcp__{}__", server.id));
+        }
+    }
     let confirm_config = ConfirmConfig {
-        require_confirmation: config.tools.sandbox.require_confirmation.clone(),
+        require_confirmation,
         timeout: confirm_timeout,
         router: Some(Arc::clone(&confirm_router)),
     };
@@ -139,6 +158,7 @@ pub async fn run_with_confirm_timeout(
                     let confirm_router = Arc::clone(&confirm_router);
                     let default_config = Arc::clone(&default_config);
                     let working_dir = Arc::clone(&working_dir);
+                    let mcp = Arc::clone(&mcp);
 
                     tokio::spawn(async move {
                         handle_connection(
@@ -150,6 +170,7 @@ pub async fn run_with_confirm_timeout(
                             confirm_router,
                             default_config,
                             working_dir,
+                            mcp,
                         )
                         .await;
                     });
@@ -167,6 +188,8 @@ pub async fn run_with_confirm_timeout(
         .await
         .shutdown_all(Duration::from_secs(3))
         .await;
+    info!("Shutting down MCP servers...");
+    mcp.shutdown().await;
     info!("All sessions drained, exiting");
     Ok(())
 }
@@ -243,9 +266,27 @@ async fn handle_connection(
     confirm_router: Arc<ConfirmRouter>,
     default_config: Arc<GenerateConfig>,
     working_dir: Arc<std::path::PathBuf>,
+    mcp: Arc<parrot_mcp::McpManager>,
 ) {
     let client_id = client.id;
     info!("Handling connection from client {}", client_id);
+
+    // MCP 状态通知 → 客户端（晚订阅收不到历史通知，可经 ListMcpServers 补查）
+    let mut notice_rx = mcp.subscribe();
+    let notice_sender = client.sender.clone();
+    tokio::spawn(async move {
+        while let Ok(n) = notice_rx.recv().await {
+            let msg = ServerMessage::McpNotice {
+                id: n.id,
+                state: n.state,
+                detail: n.detail,
+                tool_count: n.tool_count,
+            };
+            if notice_sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let mut authenticated = false;
 
@@ -517,13 +558,11 @@ async fn handle_connection(
                 }
             }
             ClientMessage::ListMcpServers => {
-                send_error(
-                    &client.sender,
-                    None,
-                    ErrorCode::InvalidRequest,
-                    "MCP server support is not yet available",
-                )
-                .await;
+                let entries = mcp.status_snapshot().await;
+                let _ = client
+                    .sender
+                    .send(ServerMessage::McpServers { entries })
+                    .await;
             }
         }
     }

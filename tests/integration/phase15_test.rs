@@ -269,12 +269,15 @@ async fn spawn_daemon(
     config.tools.sandbox.require_confirmation = confirm_patterns;
 
     let daemon_handle = tokio::spawn(async move {
+        let mcp =
+            parrot_mcp::start_all(Arc::clone(&tool_registry), config.mcp.servers.clone()).await;
         parrot_daemon::run_with_confirm_timeout(
             config,
             auth,
             provider_registry,
             tool_registry,
             confirm_timeout,
+            mcp,
         )
         .await
         .expect("daemon run_with_confirm_timeout");
