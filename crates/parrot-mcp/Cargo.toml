@@ -1,0 +1,26 @@
+[package]
+name = "parrot-mcp"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "parrot_mcp_mock_server"
+path = "src/bin/mock_server.rs"
+
+[dependencies]
+rmcp = { version = "3.3", features = [
+    "client",
+    "transport-child-process",
+    "which-command",
+    "server",
+    "transport-io",
+    "macros",
+] }
+parrot-core = { path = "../parrot-core" }
+parrot-config = { path = "../parrot-config" }
+parrot-protocol = { path = "../parrot-protocol" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

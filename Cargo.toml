@@ -14,6 +14,7 @@ members = [
     "crates/parrot-tools",
     "crates/parrot-hooks",
     "crates/parrot-daemon",
+    "crates/parrot-mcp",
 ]
 
 [workspace.package]
@@ -83,6 +84,7 @@ tempfile = "3"
 [dependencies]
 # parrotd binary
 parrot-daemon       = { path = "crates/parrot-daemon" }
+parrot-mcp          = { path = "crates/parrot-mcp" }
 parrot-config       = { path = "crates/parrot-config" }
 tracing-subscriber  = { workspace = true }
 
