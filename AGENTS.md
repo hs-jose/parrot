@@ -93,6 +93,7 @@ cargo run --bin parrot -- -m "list files in the current directory"
 - `parrot-protocol` — pure serde WS message types
 - `parrot-transport` — `TransportServer` / `TransportClient` traits + tokio-tungstenite impl
 - `parrot-config` — TOML + `dirs` path resolution
+- `parrot-mcp` — MCP client：stdio server 生命周期（spawn/握手/崩溃热下线）+ `McpTool` 适配器（基于 rmcp）；daemon 侧 IO 组件
 - `src/daemon/` — `parrotd` binary: WS server, Anthropic adapter, built-in tool implementations, auth (token + Origin check)
 - `src/cli/` — `parrot` binary: thin WS client
 
