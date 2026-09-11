@@ -1688,3 +1688,368 @@ async fn e2e_engine_persists_agent_end_on_cmd_channel_close() {
         entry.event
     );
 }
+
+// ---------------------------------------------------------------------------
+// E2E: MCP-qualified tool drives the full engine loop (fake McpTool in registry)
+// ---------------------------------------------------------------------------
+
+struct McpEchoProvider {
+    call_count: AtomicU32,
+}
+
+impl McpEchoProvider {
+    fn new() -> Self {
+        Self {
+            call_count: AtomicU32::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for McpEchoProvider {
+    fn provider_id(&self) -> &str {
+        "mock"
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        Ok(vec![ModelInfo {
+            id: "mock-model".to_string(),
+            name: "Mock Model".to_string(),
+            provider: "mock".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 8192,
+        }])
+    }
+
+    async fn chat_stream(
+        &self,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatStream, ProviderError> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
+        tokio::spawn(async move {
+            if n == 0 {
+                tx.send(ProviderStreamEvent::ToolCallStart {
+                    id: "tc_mcp".to_string(),
+                    name: "mcp__mock__echo".to_string(),
+                })
+                .await
+                .ok();
+                tx.send(ProviderStreamEvent::ToolCallDelta {
+                    id: "tc_mcp".to_string(),
+                    args_delta: r#"{"message":"from-mcp"}"#.to_string(),
+                })
+                .await
+                .ok();
+                tx.send(ProviderStreamEvent::ToolCallEnd {
+                    id: "tc_mcp".to_string(),
+                    arguments: json!({"message": "from-mcp"}),
+                })
+                .await
+                .ok();
+                tx.send(ProviderStreamEvent::Finish {
+                    stop_reason: ProviderStopReason::ToolUse,
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                })
+                .await
+                .ok();
+            } else {
+                tx.send(ProviderStreamEvent::TextDelta {
+                    delta: "done".to_string(),
+                })
+                .await
+                .ok();
+                tx.send(ProviderStreamEvent::Finish {
+                    stop_reason: ProviderStopReason::EndTurn,
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
+                })
+                .await
+                .ok();
+            }
+        });
+        Ok(ChatStream { inner: rx })
+    }
+
+    async fn chat(
+        &self,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatMessage, ProviderError> {
+        unimplemented!()
+    }
+}
+
+struct FakeMcpTool;
+
+#[async_trait]
+impl Tool for FakeMcpTool {
+    fn name(&self) -> &str {
+        "mcp__mock__echo"
+    }
+    fn description(&self) -> &str {
+        "Fake MCP tool (engine-path check)"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {"message": {"type": "string"}}})
+    }
+    async fn call(&self, arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+        Ok(ToolOutput {
+            content: format!(
+                "mcp echo: {}",
+                arguments
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+            ),
+            is_error: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn e2e_mcp_qualified_tool_roundtrip() {
+    let port = free_port();
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("data");
+    let token_path = tmp.path().join("token");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let auth = Arc::new(
+        parrot_daemon::auth::Auth::new(&token_path)
+            .await
+            .expect("auth"),
+    );
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(
+            Arc::new(McpEchoProvider::new()) as Arc<dyn LlmProvider>,
+            vec!["mock-model".to_string()],
+        )
+        .await;
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    tool_registry
+        .register(Arc::new(FakeMcpTool) as Arc<dyn Tool>)
+        .await;
+
+    let config = test_config(port, &data_dir, &token_path);
+    let daemon_handle = tokio::spawn(async move {
+        parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
+            .await
+            .expect("daemon run_with");
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let url = format!("ws://127.0.0.1:{port}");
+    let client = parrot_transport::WsTransportClient::new();
+    let mut conn = client.connect(&url, &token).await.expect("connect");
+
+    expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::HelloAck { .. } = m {
+                Some(())
+            } else {
+                None
+            }
+        },
+        "HelloAck",
+    )
+    .await;
+
+    conn.sender
+        .send(ClientMessage::CreateSession {
+            config: Some(SessionConfig {
+                model: None,
+                provider: None,
+                system_prompt: None,
+            }),
+        })
+        .await
+        .expect("CreateSession");
+    let session_id = expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::SessionCreated { session_id } = m {
+                Some(*session_id)
+            } else {
+                None
+            }
+        },
+        "SessionCreated",
+    )
+    .await;
+
+    conn.sender
+        .send(ClientMessage::Chat {
+            session_id,
+            message: "call the mcp tool".into(),
+        })
+        .await
+        .expect("Chat");
+
+    let (content, is_error) = expect_agent_event(
+        &mut conn.receiver,
+        |ev| {
+            if let AgentEvent::ToolEnd {
+                session_id: sid,
+                result,
+                ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some((result.content.clone(), result.is_error));
+                }
+            }
+            None
+        },
+        "ToolEnd(mcp)",
+    )
+    .await;
+    assert_eq!(content, "mcp echo: from-mcp");
+    assert!(!is_error);
+
+    daemon_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// E2E: bad MCP command ⇒ McpNotice(Failed) broadcast + ListMcpServers shows it
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_bad_mcp_server_surfaces_failure() {
+    let port = free_port();
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("data");
+    let token_path = tmp.path().join("token");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let auth = Arc::new(
+        parrot_daemon::auth::Auth::new(&token_path)
+            .await
+            .expect("auth"),
+    );
+    let token = std::fs::read_to_string(&token_path)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(
+            Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>,
+            vec!["mock-model".to_string()],
+        )
+        .await;
+    let tool_registry = Arc::new(ToolRegistry::new());
+
+    let mut config = test_config(port, &data_dir, &token_path);
+    // 一个启动即挂起的坏 server（永远完不成 MCP 握手），启动超时 2s ⇒ 失败
+    // 广播落在 ~2s，此时客户端（~150ms 时连接）已订阅，McpNotice(Failed) 必达。
+    // 即时失败（如不存在的二进制）在 bind 前就广播完毕，晚订阅的客户端收不到
+    // （broadcast channel 无历史回放，设计上以 ListMcpServers 补查）。
+    #[cfg(windows)]
+    let (command, args): (String, Vec<String>) = (
+        "ping".to_string(),
+        vec!["-n".to_string(), "60".to_string(), "127.0.0.1".to_string()],
+    );
+    #[cfg(not(windows))]
+    let (command, args): (String, Vec<String>) = ("sleep".to_string(), vec!["60".to_string()]);
+    config.mcp.servers.push(parrot_config::McpServerConfig {
+        id: "nope".into(),
+        command,
+        args,
+        env: Default::default(),
+        startup_timeout_seconds: 2,
+        call_timeout_seconds: 30,
+        require_confirmation: false,
+    });
+
+    let daemon_handle = tokio::spawn(async move {
+        parrot_daemon::run_with(config, auth, provider_registry, tool_registry)
+            .await
+            .expect("daemon run_with");
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let url = format!("ws://127.0.0.1:{port}");
+    let client = parrot_transport::WsTransportClient::new();
+    let mut conn = client.connect(&url, &token).await.expect("connect");
+
+    expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::HelloAck { .. } = m {
+                Some(())
+            } else {
+                None
+            }
+        },
+        "HelloAck",
+    )
+    .await;
+
+    // 等失败通知广播（start_all 在后台运行）
+    expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::McpNotice { id, state, .. } = m {
+                if id == "nope" && *state == parrot_protocol::types::McpServerState::Failed {
+                    Some(())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        },
+        "McpNotice(Failed)",
+    )
+    .await;
+
+    conn.sender
+        .send(ClientMessage::ListMcpServers)
+        .await
+        .expect("ListMcpServers");
+    let entries = expect_server_message(
+        &mut conn.receiver,
+        |m| {
+            if let ServerMessage::McpServers { entries } = m {
+                Some(entries.clone())
+            } else {
+                None
+            }
+        },
+        "McpServers",
+    )
+    .await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, "nope");
+    assert_eq!(
+        entries[0].state,
+        parrot_protocol::types::McpServerState::Failed
+    );
+    assert!(
+        !entries[0].detail.is_empty(),
+        "失败详情过线: {:?}",
+        entries[0].detail
+    );
+
+    daemon_handle.abort();
+}
