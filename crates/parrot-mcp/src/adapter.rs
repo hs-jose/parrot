@@ -1,5 +1,15 @@
-use rmcp::model::ContentBlock;
-use rmcp::service::ServiceError;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use parrot_core::error::AgentError;
+use parrot_core::tool::{Tool, ToolContext};
+use parrot_protocol::types::ToolOutput;
+use rmcp::handler::client::ClientHandler;
+use rmcp::model::{CallToolRequestParams, ContentBlock, JsonObject, Tool as McpToolDef};
+use rmcp::service::{NotificationContext, RoleClient, RunningService, ServiceError};
+use serde_json::Value;
+use tokio::sync::{mpsc, RwLock};
 
 /// 工具注册名：`mcp__<server_id>__<tool_name>`（spec §2，Claude Code 同款约定）。
 pub fn qualified_tool_name(server_id: &str, tool_name: &str) -> String {
@@ -54,6 +64,125 @@ pub fn map_service_error(server_id: &str, e: &ServiceError) -> String {
             None => "MCP 调用被取消".to_string(),
         },
         other => format!("MCP 调用失败: {other}"),
+    }
+}
+
+/// server `tools/list_changed` 通知 → 唤醒 manager 重枚举。
+#[derive(Clone)]
+pub struct ListChangeNotify {
+    pub tx: mpsc::Sender<()>,
+}
+
+impl ClientHandler for ListChangeNotify {
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let _ = self.tx.send(()).await;
+    }
+}
+
+/// manager 与各 `McpTool` 共享的 rmcp client 服务句柄。
+/// `call_tool` 只需 `&self`，读锁即可；`close_with_timeout` 需要 `&mut`，manager 用写锁。
+pub type McpService = Arc<RwLock<RunningService<RoleClient, ListChangeNotify>>>;
+
+/// 把单个 MCP 工具映射为 `parrot_core::Tool`（spec §3.4）。
+pub struct McpTool {
+    server_id: String,
+    qualified_name: String,
+    raw_name: String,
+    description: String,
+    input_schema: Value,
+    service: McpService,
+    call_timeout_secs: u64,
+}
+
+impl McpTool {
+    pub fn new(
+        server_id: &str,
+        def: &McpToolDef,
+        service: McpService,
+        call_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            server_id: server_id.to_string(),
+            qualified_name: qualified_tool_name(server_id, &def.name),
+            raw_name: def.name.to_string(),
+            description: def
+                .description
+                .as_ref()
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+            input_schema: def.schema_as_json_value(),
+            service,
+            call_timeout_secs,
+        }
+    }
+
+    /// 无 `ToolContext` 的调用入口（测试/管理用途，与 `Tool::call` 共用核心逻辑）。
+    pub async fn call_for_test(&self, arguments: Value) -> ToolOutput {
+        self.invoke(arguments).await
+    }
+
+    async fn invoke(&self, arguments: Value) -> ToolOutput {
+        let args: JsonObject = arguments.as_object().cloned().unwrap_or_default();
+        let params = CallToolRequestParams::new(self.raw_name.clone()).with_arguments(args);
+        let service = Arc::clone(&self.service);
+        let call = async move {
+            let svc = service.read().await;
+            svc.call_tool(params).await
+        };
+        match tokio::time::timeout(Duration::from_secs(self.call_timeout_secs), call).await {
+            Err(_) => ToolOutput {
+                content: format!(
+                    "MCP 调用超时(超过 {}s, server 未响应)",
+                    self.call_timeout_secs
+                ),
+                is_error: true,
+            },
+            Ok(Err(e)) => {
+                let detail = map_service_error(&self.server_id, &e);
+                tracing::warn!(
+                    server = %self.server_id,
+                    tool = %self.qualified_name,
+                    "MCP tool call failed: {detail}"
+                );
+                ToolOutput {
+                    content: detail,
+                    is_error: true,
+                }
+            }
+            Ok(Ok(result)) => {
+                let is_error = result.is_error.unwrap_or(false);
+                if is_error {
+                    tracing::warn!(
+                        server = %self.server_id,
+                        tool = %self.qualified_name,
+                        "MCP tool reported error"
+                    );
+                }
+                ToolOutput {
+                    content: flatten_content(&result.content),
+                    is_error,
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for McpTool {
+    fn name(&self) -> &str {
+        &self.qualified_name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.input_schema.clone()
+    }
+
+    async fn call(&self, arguments: Value, _ctx: &ToolContext) -> Result<ToolOutput, AgentError> {
+        Ok(self.invoke(arguments).await)
     }
 }
 
