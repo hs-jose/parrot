@@ -271,23 +271,6 @@ async fn handle_connection(
     let client_id = client.id;
     info!("Handling connection from client {}", client_id);
 
-    // MCP 状态通知 → 客户端（晚订阅收不到历史通知，可经 ListMcpServers 补查）
-    let mut notice_rx = mcp.subscribe();
-    let notice_sender = client.sender.clone();
-    tokio::spawn(async move {
-        while let Ok(n) = notice_rx.recv().await {
-            let msg = ServerMessage::McpNotice {
-                id: n.id,
-                state: n.state,
-                detail: n.detail,
-                tool_count: n.tool_count,
-            };
-            if notice_sender.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
     let mut authenticated = false;
 
     while let Some(msg) = client.receiver.recv().await {
@@ -297,6 +280,34 @@ async fn handle_connection(
                 client_version,
             } => {
                 if auth.validate(&token) {
+                    if !authenticated {
+                        // 鉴权通过后才订阅并转发 MCP 状态通知，避免未鉴权对端
+                        // 收到 server id/状态/失败详情（晚订阅收不到历史通知，
+                        // 可经 ListMcpServers 补查）。
+                        let mut notice_rx = mcp.subscribe();
+                        let notice_sender = client.sender.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match notice_rx.recv().await {
+                                    Ok(n) => {
+                                        let msg = ServerMessage::McpNotice {
+                                            id: n.id,
+                                            state: n.state,
+                                            detail: n.detail,
+                                            tool_count: n.tool_count,
+                                        };
+                                        if notice_sender.send(msg).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
                     authenticated = true;
                     info!(
                         "Client {} authenticated (version: {})",

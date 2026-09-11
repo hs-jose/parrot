@@ -46,7 +46,7 @@ async fn spawn_handshake_register_call() {
     let manager = parrot_mcp::start_all(Arc::clone(&registry), vec![mock_config()]).await;
 
     let status = wait_state(&manager, "mock", McpServerState::Connected, 30).await;
-    assert_eq!(status.tool_count, 3, "echo/fail/exit");
+    assert_eq!(status.tool_count, 4, "echo/fail/exit/extend");
 
     let echo = registry
         .get("mcp__mock__echo")
@@ -125,7 +125,7 @@ async fn bad_command_is_isolated_with_failed_notice() {
     );
 
     let ok = wait_state(&manager, "mock", McpServerState::Connected, 30).await;
-    assert_eq!(ok.tool_count, 3, "坏 server 不影响好 server");
+    assert_eq!(ok.tool_count, 4, "坏 server 不影响好 server");
 
     let mut got_failed_notice = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -139,5 +139,92 @@ async fn bad_command_is_isolated_with_failed_notice() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(got_failed_notice, "失败应广播 McpNotice(Failed)");
+    manager.shutdown().await;
+}
+
+/// list_changed 全链路：extend 调用 → server 广播 notifications/tools/list_changed
+/// → client ClientHandler::on_tool_list_changed → manager 重枚举（unregister 全组
+/// → 重新注册 → Connected 状态重新广播）。swap 后旧工具保留、extend 自身下线、
+/// extra 上线。
+#[tokio::test]
+async fn list_changed_adds_and_swaps_tools() {
+    let registry = Arc::new(ToolRegistry::new());
+    let manager = parrot_mcp::start_all(Arc::clone(&registry), vec![mock_config()]).await;
+    let mut rx = manager.subscribe();
+    wait_state(&manager, "mock", McpServerState::Connected, 30).await;
+    // 排空初始通知：此后收到的 Connected(tool_count=4) 必来自重枚举
+    while rx.try_recv().is_ok() {}
+
+    let extend = registry
+        .get("mcp__mock__extend")
+        .await
+        .expect("extend registered");
+    let ctx = parrot_core::tool::ToolContext::new(std::path::PathBuf::from("."), 1024);
+    let out = extend.call(serde_json::json!({}), &ctx).await.unwrap();
+    assert_eq!(out.content, "extended");
+    assert!(!out.is_error);
+
+    // 重枚举把 extend 换成 extra；echo 等未变更工具必须保留
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let extra = registry.get("mcp__mock__extra").await.is_some();
+        let echo = registry.get("mcp__mock__echo").await.is_some();
+        if extra && echo {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timeout waiting for re-enumeration"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        registry.get("mcp__mock__extend").await.is_none(),
+        "swap 后 extend 应下线"
+    );
+
+    let mut re_broadcast = false;
+    while let Ok(n) = rx.try_recv() {
+        if n.id == "mock" && n.state == McpServerState::Connected && n.tool_count == 4 {
+            re_broadcast = true;
+        }
+    }
+    assert!(re_broadcast, "重枚举后应重新广播 Connected(tool_count=4)");
+
+    manager.shutdown().await;
+}
+
+/// start_all 丢弃的 server（空 id / 重复 id）必须在 /mcp 状态快照里可见并带原因。
+#[tokio::test]
+async fn dropped_servers_visible_in_status() {
+    let registry = Arc::new(ToolRegistry::new());
+    let mut bad = mock_config();
+    bad.id = "nope".into();
+    bad.command = "this_binary_definitely_does_not_exist_12345".into();
+    let empty = McpServerConfig {
+        id: "".into(),
+        ..mock_config()
+    };
+    let manager = parrot_mcp::start_all(registry, vec![empty, bad.clone(), bad]).await;
+
+    let snap = manager.status_snapshot().await;
+    let empty_entry = snap
+        .iter()
+        .find(|s| s.id.is_empty())
+        .expect("空 id server 应可见");
+    assert_eq!(empty_entry.state, McpServerState::Failed);
+    assert!(
+        empty_entry.detail.contains("id 为空"),
+        "detail: {:?}",
+        empty_entry.detail
+    );
+
+    let nope = snap
+        .iter()
+        .find(|s| s.id == "nope")
+        .expect("重复 id server 应可见");
+    assert_eq!(nope.state, McpServerState::Failed);
+    assert!(!nope.detail.is_empty(), "detail: {:?}", nope.detail);
+
     manager.shutdown().await;
 }

@@ -88,10 +88,28 @@ pub async fn start_all(registry: Arc<ToolRegistry>, servers: Vec<McpServerConfig
     for server in servers {
         if server.id.is_empty() {
             tracing::warn!("MCP server id 为空，跳过");
+            set_status_map(
+                &status,
+                &notices,
+                "",
+                McpServerState::Failed,
+                "配置错误: id 为空",
+                0,
+            )
+            .await;
             continue;
         }
         if !seen.insert(server.id.clone()) {
             tracing::warn!("MCP server id '{}' 重复，跳过", server.id);
+            set_status_map(
+                &status,
+                &notices,
+                &server.id,
+                McpServerState::Failed,
+                "配置错误: id 重复",
+                0,
+            )
+            .await;
             continue;
         }
         let service_cell = Arc::new(OnceCell::new());
