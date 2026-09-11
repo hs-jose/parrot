@@ -5,6 +5,8 @@ pub use config::AppConfig;
 pub use config::DaemonConfig;
 pub use config::ExternalHookConfig;
 pub use config::HooksConfig;
+pub use config::McpConfig;
+pub use config::McpServerConfig;
 pub use config::ProviderConfig;
 pub use config::SandboxConfig;
 pub use config::SessionConfig;
