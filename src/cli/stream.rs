@@ -110,6 +110,23 @@ pub(crate) async fn print_stream(
                 AgentEvent::CompactionStart { .. } => {}
                 AgentEvent::CompactionSummary { .. } => {}
             },
+            Some(ServerMessage::McpNotice {
+                id,
+                state,
+                detail,
+                tool_count,
+            }) => {
+                let suffix = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {detail}")
+                };
+                writeln!(
+                    stdout,
+                    "\n[MCP] {id}: {state:?}（{tool_count} 个工具）{suffix}"
+                )?;
+                stdout.flush()?;
+            }
             Some(ServerMessage::Error { message, .. }) => {
                 writeln!(stdout, "\nError: {}", message)?;
                 stdout.flush()?;

@@ -924,7 +924,8 @@ mod tests {
         let mut input = ratatui_textarea::TextArea::default();
         input.insert_char('/');
         terminal.draw(|f| draw(f, &mut app, &input)).unwrap();
-        // 60x20 下行 11=/help（选中）、行 12=/usage：描述首字必须同列。
+        // 60x20 下弹窗贴输入框上方，5 条命令高 7（含边框）：
+        // 行 10=/help（选中）、行 11=/usage：描述首字必须同列。
         // CJK 宽字符的续格单元是空符号，所以只按首字定位列。
         let desc_col = |needle: char, y: u16| {
             row_text(&terminal, y)
@@ -933,8 +934,8 @@ mod tests {
                 .expect("描述首字应存在于该行")
         };
         assert_eq!(
-            desc_col('显', 11),
-            desc_col('查', 12),
+            desc_col('显', 10),
+            desc_col('查', 11),
             "不同命令行的描述起始列应对齐"
         );
     }

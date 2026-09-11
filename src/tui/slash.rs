@@ -7,6 +7,7 @@ pub(crate) enum SlashAction {
     Help,
     Usage,
     Abort,
+    Mcp,
     Exit,
 }
 
@@ -35,6 +36,11 @@ pub(crate) const REGISTRY: &[SlashCommand] = &[
         name: "abort",
         description: "中断当前进行中的轮次",
         action: SlashAction::Abort,
+    },
+    SlashCommand {
+        name: "mcp",
+        description: "查看 MCP server 状态",
+        action: SlashAction::Mcp,
     },
     SlashCommand {
         name: "exit",
@@ -103,6 +109,12 @@ pub(crate) async fn execute(
                 app.entries
                     .push(ChatEntry::Info("当前没有进行中的轮次".into()));
             }
+            Ok(Some(false))
+        }
+        SlashAction::Mcp => {
+            conn.sender.send(ClientMessage::ListMcpServers).await?;
+            app.entries
+                .push(ChatEntry::Info("已请求 MCP server 状态…".into()));
             Ok(Some(false))
         }
         SlashAction::Exit => Ok(Some(true)),
@@ -392,7 +404,7 @@ mod tests {
 
     #[test]
     fn filter_same_query_preserves_selection() {
-        let mut p = SlashPopup::filtered(""); // 空 query 全量 4 条
+        let mut p = SlashPopup::filtered(""); // 空 query 全量条目
         p.move_down();
         p.filter(""); // run_loop 每键后 sync 会以同 query 重入 filter
         assert_eq!(p.selected(), 1, "同 query 重入 filter 不得重置选中位");

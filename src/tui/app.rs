@@ -256,6 +256,43 @@ impl App {
                     }
                 }
             }
+            ServerMessage::McpNotice {
+                id,
+                state,
+                detail,
+                tool_count,
+            } => {
+                let suffix = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {detail}")
+                };
+                self.entries.push(ChatEntry::Info(format!(
+                    "MCP {id}: {state:?}（{tool_count} 个工具）{suffix}"
+                )));
+            }
+            ServerMessage::McpServers { entries } => {
+                if entries.is_empty() {
+                    self.entries
+                        .push(ChatEntry::Info("MCP: 未配置任何 server".into()));
+                } else {
+                    let lines: Vec<String> = entries
+                        .iter()
+                        .map(|e| {
+                            let suffix = if e.detail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {}", e.detail)
+                            };
+                            format!(
+                                "· {} {:?}（{} 个工具）{}",
+                                e.id, e.state, e.tool_count, suffix
+                            )
+                        })
+                        .collect();
+                    self.entries.push(ChatEntry::Info(lines.join("\n")));
+                }
+            }
             // TUI 默认不处理其他 ServerMessage（HelloAck 已在握手期完成；SessionList/History 等由列表页消费）
             _ => {}
         }
@@ -477,7 +514,7 @@ mod tests {
     use parrot_protocol::agent_event::{
         AgentEndReason, IntegrityIssue, IntegrityIssueKind, MessageStopReason, TurnStopReason,
     };
-    use parrot_protocol::types::{ToolOutput, Usage};
+    use parrot_protocol::types::{McpServerState, McpServerStatusWire, ToolOutput, Usage};
     use uuid::Uuid;
 
     fn sid() -> SessionId {
@@ -765,6 +802,44 @@ mod tests {
             exit_code: 0,
         });
         assert_eq!(app.entries.len(), 1);
+    }
+
+    #[test]
+    fn mcp_notice_renders_info_line() {
+        let mut app = App::new(sid());
+        app.apply_server_message(ServerMessage::McpNotice {
+            id: "playwright".into(),
+            state: McpServerState::Failed,
+            detail: "spawn 失败: program not found".into(),
+            tool_count: 0,
+        });
+        let last = app.entries.last().unwrap();
+        match last {
+            ChatEntry::Info(text) => {
+                assert!(text.contains("MCP playwright"), "got: {text}");
+                assert!(text.contains("spawn 失败"), "失败详情必须可见: {text}");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_servers_reply_renders_status_table() {
+        let mut app = App::new(sid());
+        app.apply_server_message(ServerMessage::McpServers {
+            entries: vec![McpServerStatusWire {
+                id: "mock".into(),
+                state: McpServerState::Connected,
+                detail: String::new(),
+                tool_count: 3,
+            }],
+        });
+        match app.entries.last().unwrap() {
+            ChatEntry::Info(text) => {
+                assert!(text.contains("mock") && text.contains("3"), "got: {text}");
+            }
+            other => panic!("expected Info, got: {other:?}"),
+        }
     }
 
     #[test]
