@@ -420,6 +420,12 @@ async fn handle_connection(
                 send_session_cmd(&mgr, &client.sender, session_id, SessionCmd::Abort, "abort")
                     .await;
             }
+            ClientMessage::Model { session_id, model } => {
+                warn!(
+                    "Model switch to `{}` for session {} not yet wired; ignoring",
+                    model, session_id
+                );
+            }
             ClientMessage::Shell {
                 session_id,
                 command,

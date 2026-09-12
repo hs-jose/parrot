@@ -18,6 +18,12 @@ pub enum ClientMessage {
     Abort {
         session_id: SessionId,
     },
+    /// Switch the active model of a running session at runtime. Response:
+    /// `ServerMessage::ModelSet` or `Error{SessionNotFound}`.
+    Model {
+        session_id: SessionId,
+        model: String,
+    },
     ListModels,
     ListTools {
         session_id: SessionId,

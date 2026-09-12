@@ -21,6 +21,12 @@ pub enum ServerMessage {
     ModelList {
         models: Vec<ModelInfo>,
     },
+    /// Ack for `ClientMessage::Model`: the session's active model is now
+    /// `model`.
+    ModelSet {
+        session_id: SessionId,
+        model: String,
+    },
     ToolList {
         session_id: SessionId,
         tools: Vec<ToolDefinitionWire>,

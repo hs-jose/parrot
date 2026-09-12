@@ -623,3 +623,47 @@ fn client_list_mcp_servers_roundtrip() {
     let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
     assert_eq!(msg, decoded);
 }
+
+// ---------------------------------------------------------------------------
+// Runtime model switch (multi-provider plan Task 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn client_model_roundtrip() {
+    let id = uuid::Uuid::new_v4();
+    let msg = ClientMessage::Model {
+        session_id: id,
+        model: "claude-haiku-3-5".into(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.contains(r#""type":"Model""#),
+        "expected Model tag in: {json}"
+    );
+    assert!(
+        json.contains(r#""session_id":"#),
+        "expected session_id in: {json}"
+    );
+    assert!(
+        json.contains(r#""model":"claude-haiku-3-5""#),
+        "expected model field in: {json}"
+    );
+    let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn server_model_set_roundtrip() {
+    let id = uuid::Uuid::new_v4();
+    let msg = ServerMessage::ModelSet {
+        session_id: id,
+        model: "claude-sonnet-4-6".into(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.contains(r#""type":"ModelSet""#),
+        "expected ModelSet tag in: {json}"
+    );
+    let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(msg, decoded);
+}
