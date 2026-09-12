@@ -26,6 +26,18 @@ pub fn entry_to_model_info(entry: &ModelEntry, provider_id: &str) -> ModelInfo {
     }
 }
 
+/// 按模型 id 查找 Detailed 条目（Simple 简写无元数据，永不命中）。
+/// 供两个适配器在 build_request 前读取 thinking / reasoning_effort。
+pub fn find_detailed<'a>(
+    entries: &'a [ModelEntry],
+    model: &str,
+) -> Option<&'a parrot_config::config::DetailedModelEntry> {
+    entries.iter().find_map(|e| match e {
+        ModelEntry::Detailed(d) if d.id == model => Some(d),
+        _ => None,
+    })
+}
+
 pub fn merge_models(
     remote: Vec<ModelInfo>,
     config_models: &[ModelEntry],
@@ -128,5 +140,26 @@ mod tests {
         assert_eq!(info.name, "m");
         assert_eq!(info.provider, "prov");
         assert_eq!(info.context_window, 0);
+    }
+
+    #[test]
+    fn find_detailed_matches_by_id() {
+        let entries = vec![
+            ModelEntry::Simple("m1".into()),
+            detailed("m2", Some(200_000), None),
+        ];
+        let found = find_detailed(&entries, "m2").expect("found");
+        assert_eq!(found.id, "m2");
+        assert_eq!(found.context_window, Some(200_000));
+    }
+
+    #[test]
+    fn find_detailed_misses_simple_and_unknown() {
+        let entries = vec![ModelEntry::Simple("m1".into()), detailed("m2", None, None)];
+        assert!(
+            find_detailed(&entries, "m1").is_none(),
+            "Simple 条目无元数据"
+        );
+        assert!(find_detailed(&entries, "m3").is_none());
     }
 }
