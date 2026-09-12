@@ -18,7 +18,7 @@ host = "0.0.0.0"
 port = 9999
 auth_token_file = "/tmp/test-token"
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "sk-test-key"
@@ -42,8 +42,7 @@ keep_recent_turns = 4
 "#;
     let config: AppConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(config.daemon.port, 9999);
-    assert_eq!(config.providers.len(), 1);
-    assert_eq!(config.providers[0].id, "anthropic");
+    assert_eq!(config.provider.id, "anthropic");
     assert!(config.tools.file_write_allowed);
     assert_eq!(config.tools.max_file_size_mb, 20);
     assert_eq!(config.session.keep_recent_turns, 4);
@@ -58,7 +57,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = "/tmp/token"
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "${TEST_PARROT_KEY}"
@@ -82,7 +81,7 @@ keep_recent_turns = 6
 "#;
     let mut config: AppConfig = toml::from_str(toml_str).unwrap();
     config.resolve_env_vars().unwrap();
-    assert_eq!(config.providers[0].api_key, "resolved-key-123");
+    assert_eq!(config.provider.api_key, "resolved-key-123");
     std::env::remove_var("TEST_PARROT_KEY");
 }
 
@@ -94,7 +93,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = "/tmp/parrot/token"
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
@@ -153,7 +152,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = "/tmp/parrot/token"
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
@@ -206,7 +205,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = "/tmp/parrot/token"
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "key"
@@ -240,7 +239,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -277,7 +276,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"

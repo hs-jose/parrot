@@ -8,7 +8,8 @@ pub mod openai;
 pub mod retry;
 
 pub async fn register_all(registry: &ProviderRegistry, config: &AppConfig) {
-    for provider_config in &config.providers {
+    // `[provider]` 缺失 ⇒ Default（id 空）⇒ 跳过（等价于旧的空数组）。
+    for provider_config in std::iter::once(&config.provider).filter(|p| !p.id.is_empty()) {
         let models = if provider_config.models.is_empty() {
             vec![provider_config.default_model.clone()]
         } else {
@@ -89,7 +90,7 @@ mod tests {
     async fn openai_protocol_registers_openai_provider() {
         let registry = ProviderRegistry::new();
         let mut config = AppConfig::default_config();
-        config.providers.push(provider("ds", "openai"));
+        config.provider = provider("ds", "openai");
         register_all(&registry, &config).await;
         let p = registry.resolve("ds-model").await.expect("resolved");
         assert_eq!(p.provider_id(), "ds");
@@ -99,7 +100,7 @@ mod tests {
     async fn anthropic_protocol_registers_anthropic_provider() {
         let registry = ProviderRegistry::new();
         let mut config = AppConfig::default_config();
-        config.providers.push(provider("claude-proxy", "anthropic"));
+        config.provider = provider("claude-proxy", "anthropic");
         register_all(&registry, &config).await;
         let p = registry
             .resolve("claude-proxy-model")
@@ -112,16 +113,24 @@ mod tests {
     async fn unknown_protocol_is_skipped() {
         let registry = ProviderRegistry::new();
         let mut config = AppConfig::default_config();
-        config.providers.push(provider("x", "gemini"));
+        config.provider = provider("x", "gemini");
+        register_all(&registry, &config).await;
+        assert!(registry.provider_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_provider_registers_nothing() {
+        let registry = ProviderRegistry::new();
+        let config = AppConfig::default_config();
         register_all(&registry, &config).await;
         assert!(registry.provider_ids().await.is_empty());
     }
 
     #[tokio::test]
     async fn cross_protocol_fields_warn_but_register() {
+        // anthropic 协议配 reasoning_effort：warn 但照常注册
         let registry = ProviderRegistry::new();
         let mut config = AppConfig::default_config();
-        // anthropic 协议配 reasoning_effort：warn 但照常注册
         let mut p = provider("a", "anthropic");
         p.models = vec![parrot_config::ModelEntry::Detailed(
             parrot_config::config::DetailedModelEntry {
@@ -133,8 +142,13 @@ mod tests {
                 reasoning_effort: Some(parrot_config::ReasoningEffort::Low),
             },
         )];
-        config.providers.push(p);
-        // openai 协议配 thinking：同理
+        config.provider = p;
+        register_all(&registry, &config).await;
+        assert!(registry.resolve("a-model").await.is_some());
+
+        // openai 协议配 thinking：同理（另一个 config ⇒ 另一个 registry）
+        let registry2 = ProviderRegistry::new();
+        let mut config2 = AppConfig::default_config();
         let mut q = provider("b", "openai");
         q.models = vec![parrot_config::ModelEntry::Detailed(
             parrot_config::config::DetailedModelEntry {
@@ -148,10 +162,8 @@ mod tests {
                 reasoning_effort: None,
             },
         )];
-        config.providers.push(q);
-        register_all(&registry, &config).await;
-        assert_eq!(registry.provider_ids().await.len(), 2);
-        assert!(registry.resolve("a-model").await.is_some());
-        assert!(registry.resolve("b-model").await.is_some());
+        config2.provider = q;
+        register_all(&registry2, &config2).await;
+        assert!(registry2.resolve("b-model").await.is_some());
     }
 }

@@ -6,7 +6,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub daemon: DaemonConfig,
-    pub providers: Vec<ProviderConfig>,
+    /// 单 provider 表（`[provider]`）。缺失 ⇒ Default（id 为空，
+    /// register_all 时跳过，等价于旧的空 providers 数组）。
+    #[serde(default)]
+    pub provider: ProviderConfig,
     pub tools: ToolsConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -23,7 +26,7 @@ pub struct DaemonConfig {
     pub auth_token_file: String,
 }
 
-/// [[providers]] models 条目。字符串简写（上下文未知）或含元数据的表。
+/// [provider] models 条目。字符串简写（上下文未知）或含元数据的表。
 /// 两家协议的 GET /models 都不返回 context window，配置是唯一可靠来源
 /// （spec §3.1）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,10 +99,24 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelEntry>,
-    /// 会话默认请求 max_tokens（daemon 用第一个 provider 的该值构造
-    /// GenerateConfig；缺省 8192）。thinking budget 需小于此值。
+    /// 会话默认请求 max_tokens（daemon 用该值构造 GenerateConfig；
+    /// 缺省 8192）。thinking budget 需小于此值。
     #[serde(default)]
     pub max_tokens: Option<u32>,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            protocol: "anthropic".to_string(),
+            api_key: String::new(),
+            default_model: String::new(),
+            base_url: None,
+            models: Vec::new(),
+            max_tokens: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,12 +296,11 @@ impl AppConfig {
     }
 
     pub fn resolve_env_vars(&mut self) -> Result<(), ConfigError> {
-        for provider in &mut self.providers {
-            if provider.api_key.starts_with("${") && provider.api_key.ends_with('}') {
-                let var_name = &provider.api_key[2..provider.api_key.len() - 1];
-                if let Ok(value) = std::env::var(var_name) {
-                    provider.api_key = value;
-                }
+        let provider = &mut self.provider;
+        if provider.api_key.starts_with("${") && provider.api_key.ends_with('}') {
+            let var_name = &provider.api_key[2..provider.api_key.len() - 1];
+            if let Ok(value) = std::env::var(var_name) {
+                provider.api_key = value;
             }
         }
         Ok(())
@@ -322,7 +338,7 @@ impl AppConfig {
                 port: 9876,
                 auth_token_file: String::new(),
             },
-            providers: vec![],
+            provider: ProviderConfig::default(),
             tools: ToolsConfig {
                 shell_allowed: false,
                 file_write_allowed: false,
@@ -394,7 +410,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -429,7 +445,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -475,7 +491,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -515,7 +531,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -562,7 +578,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -613,7 +629,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -665,7 +681,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 api_key = "x"
 default_model = "m"
@@ -718,7 +734,7 @@ keep_recent_turns = 6
 "#;
         let with_knob = format!(
             r#"{base}
-[[providers]]
+[provider]
 id = "a"
 protocol = "anthropic"
 api_key = "x"
@@ -727,11 +743,11 @@ max_tokens = 72000
 "#
         );
         let c: AppConfig = toml::from_str(&with_knob).unwrap();
-        assert_eq!(c.providers[0].max_tokens, Some(72_000));
+        assert_eq!(c.provider.max_tokens, Some(72_000));
 
         let without_knob = format!(
             r#"{base}
-[[providers]]
+[provider]
 id = "a"
 protocol = "anthropic"
 api_key = "x"
@@ -739,10 +755,7 @@ default_model = "m"
 "#
         );
         let c: AppConfig = toml::from_str(&without_knob).unwrap();
-        assert_eq!(
-            c.providers[0].max_tokens, None,
-            "缺省 None ⇒ runtime 回退 8192"
-        );
+        assert_eq!(c.provider.max_tokens, None, "缺省 None ⇒ runtime 回退 8192");
     }
 
     #[test]
@@ -753,7 +766,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "ollama"
 protocol = "openai"
 base_url = "http://localhost:11434/v1"
@@ -776,7 +789,7 @@ max_history_tokens = 100000
 keep_recent_turns = 6
 "#;
         let c: AppConfig = toml::from_str(toml).unwrap();
-        assert_eq!(c.providers[0].api_key, "");
+        assert_eq!(c.provider.api_key, "");
     }
 
     #[test]
@@ -787,7 +800,7 @@ host = "127.0.0.1"
 port = 9876
 auth_token_file = ""
 
-[[providers]]
+[provider]
 id = "anthropic"
 protocol = "anthropic"
 api_key = "x"
@@ -795,14 +808,6 @@ default_model = "m"
 models = [
   "claude-sonnet-4-6",
   { id = "deepseek-v4-flash[1m]", context_window = 1000000, max_output_tokens = 8192, thinking = { budget_tokens = 64000 } },
-]
-
-[[providers]]
-id = "openai-official"
-protocol = "openai"
-api_key = "x"
-default_model = "gpt-5"
-models = [
   { id = "gpt-5", name = "GPT-5", reasoning_effort = "high" },
 ]
 
@@ -823,7 +828,7 @@ max_history_tokens = 100000
 keep_recent_turns = 6
 "#;
         let c: AppConfig = toml::from_str(toml).unwrap();
-        let p0 = &c.providers[0];
+        let p0 = &c.provider;
         assert_eq!(p0.models[0], ModelEntry::Simple("claude-sonnet-4-6".into()));
         match &p0.models[1] {
             ModelEntry::Detailed(d) => {
@@ -835,7 +840,7 @@ keep_recent_turns = 6
             }
             other => panic!("expected Detailed, got {other:?}"),
         }
-        match &c.providers[1].models[0] {
+        match &p0.models[2] {
             ModelEntry::Detailed(d) => {
                 assert_eq!(d.id, "gpt-5");
                 assert_eq!(d.name.as_deref(), Some("GPT-5"));
@@ -844,10 +849,125 @@ keep_recent_turns = 6
             other => panic!("expected Detailed, got {other:?}"),
         }
         // 序列化回 TOML 值不丢字段（roundtrip）
-        let back = toml::Value::try_from(&c.providers[1].models[0]).unwrap();
+        let back = toml::Value::try_from(&p0.models[2]).unwrap();
         assert_eq!(
             back.get("reasoning_effort").and_then(|v| v.as_str()),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn provider_single_table_parses_all_fields() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[provider]
+id = "anthropic"
+protocol = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+base_url = "https://example.com"
+models = ["m1"]
+max_tokens = 72000
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.provider.id, "anthropic");
+        assert_eq!(c.provider.protocol, "anthropic");
+        assert_eq!(c.provider.api_key, "x");
+        assert_eq!(c.provider.default_model, "claude-sonnet-4-6");
+        assert_eq!(c.provider.base_url.as_deref(), Some("https://example.com"));
+        assert_eq!(c.provider.models.len(), 1);
+        assert_eq!(c.provider.max_tokens, Some(72_000));
+    }
+
+    #[test]
+    fn missing_provider_section_defaults_empty_id() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert!(
+            c.provider.id.is_empty(),
+            "[provider] 缺失 ⇒ Default，id 为空（register 时跳过）"
+        );
+        assert_eq!(c.provider.protocol, "anthropic");
+    }
+
+    #[test]
+    fn legacy_providers_array_is_silently_ignored() {
+        // serde 默认忽略 unknown fields：旧 `[[providers]]` 数组会被静默
+        // 忽略，provider 落到 Default（id 空）⇒ register 时跳过。
+        // Task 3 在 register_all 侧补 "空 id ⇒ warn + skip" 行为。
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+protocol = "anthropic"
+api_key = "x"
+default_model = "claude-sonnet-4-6"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert!(
+            c.provider.id.is_empty(),
+            "旧 [[providers]] 数组被 serde 忽略 ⇒ provider 为 Default"
         );
     }
 }

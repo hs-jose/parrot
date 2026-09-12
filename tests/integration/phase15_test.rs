@@ -159,7 +159,7 @@ fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Pa
     config.daemon.port = port;
     config.daemon.auth_token_file = token_path.to_string_lossy().to_string();
     config.session.data_dir = data_dir.to_string_lossy().to_string();
-    config.providers.push(parrot_config::ProviderConfig {
+    config.provider = parrot_config::ProviderConfig {
         id: "mock".to_string(),
         protocol: "anthropic".to_string(),
         api_key: String::new(),
@@ -167,7 +167,7 @@ fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Pa
         base_url: None,
         models: vec!["mock-model".into()],
         max_tokens: None,
-    });
+    };
     config
 }
 

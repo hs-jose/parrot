@@ -70,9 +70,8 @@ pub async fn run_with_confirm_timeout(
     confirm_timeout: Duration,
     mcp: parrot_mcp::McpManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let default_config = config
-        .providers
-        .first()
+    let default_config = Some(&config.provider)
+        .filter(|p| !p.id.is_empty())
         .map(|p| GenerateConfig {
             model: p.default_model.clone(),
             temperature: None,
