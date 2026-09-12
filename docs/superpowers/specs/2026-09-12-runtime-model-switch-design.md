@@ -6,7 +6,7 @@
 
 ## 1. 目标
 
-已存在的会话可在 turn 边界切换模型（`ClientMessage::Model`）。单 provider + 透传使切换只是字符串变更；`[1m]` 的 thinking / effort / context_window 元数据在请求时按模型 id 查找，切换后自动生效。
+已存在的会话可在 turn 边界切换模型（`ClientMessage::Model`）。单 provider + 透传使切换只是字符串变更；`[1m]` 的 thinking / effort 元数据在请求时按模型 id 查找，切换后自动生效（context_window 的压缩预算不重算，见 §2.5）。
 
 ## 2. 设计
 
@@ -35,6 +35,7 @@ runtime 新 arm：校验会话存在 → 转发 `SessionCmd::SetModel` → 回 `
 
 - 不在 turn 中途热切（warn+忽略）
 - 不改 `temperature`/`max_tokens` 运行时切换（max_tokens 仍来自 provider 配置）
+- **压缩预算不随切换重算**：`resolve_model_context_window` 与 `ContextManager` 在会话启动时确定（engine run 起点），切到不同 context window 的模型不会更新预算——配置的 `max_history_tokens` 上限主导，切到更小窗口模型的长会话可能超窗报 API 错误（已知边界，后续按需加预算重算）
 - resume 语义不变（meta.json 的 model 仅记录，恢复仍跟随 daemon 当前默认——runtime.rs 现有行为）
 
 ## 3. 测试
