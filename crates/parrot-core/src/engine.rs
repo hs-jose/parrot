@@ -9,7 +9,9 @@ use crate::provider::{ProviderRegistry, ProviderStreamEvent};
 use crate::session::{ConfirmConfig, SessionCmd};
 use crate::tool::{SharedFilesRead, ToolContext, ToolRegistry};
 use crate::tool_output::truncate_tool_content;
-use crate::types::{ChatMessage, ChatRole, GenerateConfig, ToolCallInfo as CoreToolCallInfo};
+use crate::types::{
+    ChatMessage, ChatRole, GenerateConfig, ModelInfo, ToolCallInfo as CoreToolCallInfo,
+};
 use parrot_protocol::agent_event::{
     AgentEndReason, AgentEvent, IntegrityIssue, MessageDeltaPayload, MessageStopReason,
     ToolCallInfo, TurnStopReason,
@@ -317,14 +319,12 @@ impl ReActEngine {
     }
 
     /// 模型的 context window（由其 provider 上报），未知时为 None。
-    /// provider 未收录的模型保持配置预算不变。
+    /// `context_window == 0` 表示远端/配置均未知，视为未收录，
+    /// 保持配置预算不变（spec §3.5）。
     async fn resolve_model_context_window(&self) -> Option<u32> {
         let provider = self.provider_registry.resolve(&self.config.model).await?;
         let models = provider.list_models().await.ok()?;
-        models
-            .iter()
-            .find(|m| m.id == self.config.model)
-            .map(|m| m.context_window)
+        model_context_window(&models, &self.config.model)
     }
 
     /// Pi 式上下文压缩(spec §3.1):超阈值时把切点前历史交给当前模型
@@ -1049,6 +1049,13 @@ fn system_prompt_hash(prompt: &str) -> String {
     hex::encode(&full[..16])
 }
 
+fn model_context_window(models: &[ModelInfo], model: &str) -> Option<u32> {
+    models
+        .iter()
+        .find(|m| m.id == model && m.context_window > 0)
+        .map(|m| m.context_window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,5 +1066,38 @@ mod tests {
         assert_eq!(context_budget(100_000, Some(200_000)), 100_000);
         assert_eq!(context_budget(2_000_000, Some(200_000)), 200_000);
         assert_eq!(context_budget(50, Some(200_000)), 50);
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::*;
+
+    fn model(id: &str, cw: u32) -> ModelInfo {
+        ModelInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: "p".into(),
+            context_window: cw,
+            max_output_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn known_window_returned() {
+        let models = vec![model("m1", 200_000)];
+        assert_eq!(model_context_window(&models, "m1"), Some(200_000));
+    }
+
+    #[test]
+    fn zero_window_treated_as_unknown() {
+        let models = vec![model("m1", 0)];
+        assert_eq!(model_context_window(&models, "m1"), None);
+    }
+
+    #[test]
+    fn unknown_model_returns_none() {
+        let models = vec![model("m1", 200_000)];
+        assert_eq!(model_context_window(&models, "m2"), None);
     }
 }
