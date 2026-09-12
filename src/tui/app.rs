@@ -241,6 +241,9 @@ impl App {
                 self.apply_event(event);
             }
             ServerMessage::Error { message, .. } => {
+                // Chat 被 daemon 拒绝时不会有任何 turn 事件，不清 pending_turn
+                // 会永久卡住 /model 拦截；错误路径下放行（宁冒提前解锁的窄窗口）。
+                self.pending_turn = false;
                 self.entries.push(ChatEntry::Error(message));
             }
             ServerMessage::ShellResult {
@@ -919,6 +922,21 @@ mod tests {
             },
         });
         assert!(!app.pending_turn, "AgentEnd 应清除 pending_turn");
+    }
+
+    #[test]
+    fn pending_turn_cleared_by_server_error() {
+        let mut app = App::new(sid());
+        app.pending_turn = true;
+        app.apply_server_message(ServerMessage::Error {
+            session_id: None,
+            code: parrot_protocol::types::ErrorCode::InvalidRequest,
+            message: "chat rejected".into(),
+        });
+        assert!(
+            !app.pending_turn,
+            "Error 应清除 pending_turn，避免 /model 永久被拦截"
+        );
     }
 
     #[test]
