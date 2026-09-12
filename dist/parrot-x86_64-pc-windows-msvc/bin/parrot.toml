@@ -19,8 +19,9 @@ working_dir = "."
 allowlist = []
 require_confirmation = ["git push", "rm"]
 
-[[providers]]
+[provider]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "deepseek-v4-flash"
 base_url = "https://api.deepseek.com/anthropic"

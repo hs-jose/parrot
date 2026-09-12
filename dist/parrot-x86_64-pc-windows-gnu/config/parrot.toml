@@ -24,8 +24,9 @@ require_confirmation = ["git push", "rm"]
 # Provider 配置示例：安装后会读到这里。`api_key` 支持 `${ENV_VAR}`
 # 占位符，从环境变量读取（推荐：避免把 key 留在磁盘上）。取消下面的
 # 注释并按需修改即可使用。
-[[providers]]
+[provider]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "claude-sonnet-4-6"
 # base_url = "https://api.anthropic.com"
