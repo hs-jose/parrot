@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use parrot_config::ModelEntry;
 use parrot_core::error::ProviderError;
-use parrot_core::provider::{ChatStream, LlmProvider, ProviderStopReason};
+use parrot_core::provider::{ChatStream, LlmProvider, ProviderStopReason, ProviderStreamEvent};
 use parrot_core::tool::ToolDefinition;
 use parrot_core::types::{ChatMessage, ChatRole, GenerateConfig, ModelInfo, ToolCallInfo};
+use parrot_protocol::types::Usage;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -40,8 +41,6 @@ struct OpenAiChatResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiResponseMessage,
-    #[allow(dead_code)]
-    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,15 +227,272 @@ impl OpenAiProvider {
         }
         Ok(response)
     }
+
+    async fn fetch_remote_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        let url = format!("{}/models", self.base_url);
+        let response = crate::retry::with_retry(|| self.get_models_page(&url)).await?;
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        Ok(parse_openai_models(&json)
+            .into_iter()
+            .map(|(id, name)| ModelInfo {
+                id,
+                name,
+                provider: self.provider_id.clone(),
+                context_window: 0,
+                max_output_tokens: 0,
+            })
+            .collect())
+    }
+
+    async fn get_models_page(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+        let mut builder = self.client.get(url);
+        if let Some(auth) = Self::auth_header(&self.api_key) {
+            builder = builder.header("authorization", auth);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5000);
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: retry_after,
+            });
+        }
+        if status.is_client_error() || status.is_server_error() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(response)
+    }
 }
 
-#[allow(dead_code)]
 fn stop_reason_from_openai(reason: &str) -> ProviderStopReason {
     match reason {
         "tool_calls" => ProviderStopReason::ToolUse,
         "length" => ProviderStopReason::MaxTokens,
         _ => ProviderStopReason::EndTurn,
     }
+}
+
+#[derive(Debug)]
+struct OpenToolCall {
+    index: usize,
+    id: String,
+    args: String,
+}
+
+/// OpenAI Chat Completions SSE 分片聚合器（spec §3.2）。
+/// feed 逐 chunk 产出事件；finish 在流结束时收尾（关未闭合的
+/// tool_calls、发 Finish）。usage 从任意带 usage 的 chunk 累积，
+/// 取不到则 0/0。
+#[derive(Debug)]
+struct OpenAiStreamAggregator {
+    open_calls: Vec<OpenToolCall>,
+    stop_reason: Option<ProviderStopReason>,
+    usage: Usage,
+}
+
+impl OpenAiStreamAggregator {
+    fn new() -> Self {
+        Self {
+            open_calls: Vec::new(),
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        }
+    }
+
+    fn end_event(call: OpenToolCall) -> ProviderStreamEvent {
+        let arguments = serde_json::from_str::<Value>(&call.args)
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+        ProviderStreamEvent::ToolCallEnd {
+            id: call.id,
+            arguments,
+        }
+    }
+
+    fn close_all(&mut self) -> Vec<ProviderStreamEvent> {
+        std::mem::take(&mut self.open_calls)
+            .into_iter()
+            .map(Self::end_event)
+            .collect()
+    }
+
+    fn feed(&mut self, chunk: &Value) -> Vec<ProviderStreamEvent> {
+        let mut events = Vec::new();
+        if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
+            self.usage.input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            self.usage.output_tokens = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+        }
+        if let Some(reason) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+        {
+            self.stop_reason = Some(stop_reason_from_openai(reason));
+            events.extend(self.close_all());
+        }
+        let Some(delta) = chunk.pointer("/choices/0/delta") else {
+            return events;
+        };
+        if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                events.push(ProviderStreamEvent::TextDelta {
+                    delta: text.to_string(),
+                });
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in calls {
+                let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let slot = self.open_calls.iter().position(|c| c.index == index);
+                let slot_idx = match slot {
+                    Some(i) => i,
+                    None => {
+                        let id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = tc
+                            .pointer("/function/name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        events.push(ProviderStreamEvent::ToolCallStart {
+                            id: id.clone(),
+                            name,
+                        });
+                        self.open_calls.push(OpenToolCall {
+                            index,
+                            id,
+                            args: String::new(),
+                        });
+                        self.open_calls.len() - 1
+                    }
+                };
+                if let Some(args) = tc
+                    .pointer("/function/arguments")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    let call = &mut self.open_calls[slot_idx];
+                    call.args.push_str(args);
+                    events.push(ProviderStreamEvent::ToolCallDelta {
+                        id: call.id.clone(),
+                        args_delta: args.to_string(),
+                    });
+                }
+            }
+        }
+        events
+    }
+
+    fn finish(&mut self) -> Vec<ProviderStreamEvent> {
+        let mut events = self.close_all();
+        events.push(ProviderStreamEvent::Finish {
+            stop_reason: self
+                .stop_reason
+                .take()
+                .unwrap_or(ProviderStopReason::EndTurn),
+            usage: std::mem::take(&mut self.usage),
+        });
+        events
+    }
+}
+
+async fn parse_sse_stream(
+    response: reqwest::Response,
+    tx: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
+) -> Result<(), ProviderError> {
+    use futures_util::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut aggregator = OpenAiStreamAggregator::new();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| ProviderError::StreamError(e.to_string()))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(event_end) = buffer.find("\n\n") {
+            let event_text = buffer[..event_end].to_string();
+            buffer = buffer[event_end + 2..].to_string();
+
+            for line in event_text.lines() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    continue;
+                }
+                let Ok(json) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if let Some(msg) = extract_stream_error(&json) {
+                    tracing::error!("OpenAI stream error: {}", msg);
+                    return Ok(());
+                }
+                for event in aggregator.feed(&json) {
+                    let _ = tx.send(event).await;
+                }
+            }
+        }
+    }
+
+    for event in aggregator.finish() {
+        let _ = tx.send(event).await;
+    }
+    Ok(())
+}
+
+/// 解析 GET /models 响应：(id, name) 列表。openai 无 display name，name 取 id。
+fn parse_openai_models(json: &Value) -> Vec<(String, String)> {
+    json.get("data")
+        .and_then(|v| v.as_array())
+        .map(|data| {
+            data.iter()
+                .filter_map(|m| {
+                    m.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| (id.to_string(), id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 识别流中的 error 事件体（部分兼容服务流中发 JSON error）。
+fn extract_stream_error(json: &Value) -> Option<String> {
+    let error = json.get("error")?;
+    Some(
+        error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown stream error")
+            .to_string(),
+    )
 }
 
 #[async_trait]
@@ -246,26 +502,45 @@ impl LlmProvider for OpenAiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        // Task 5 换成远端拉取+合并；先按配置列表直接构造（fail-open 语义一致）
-        Ok(self
-            .config_models
-            .iter()
-            .map(|m| crate::models::entry_to_model_info(m, &self.provider_id))
-            .collect())
+        match self.fetch_remote_models().await {
+            Ok(remote) => Ok(crate::models::merge_models(
+                remote,
+                &self.config_models,
+                &self.provider_id,
+            )),
+            Err(e) => {
+                tracing::warn!("openai list_models 远端拉取失败({e})，回退配置 models");
+                Ok(self
+                    .config_models
+                    .iter()
+                    .map(|m| crate::models::entry_to_model_info(m, &self.provider_id))
+                    .collect())
+            }
+        }
     }
 
     async fn chat_stream(
         &self,
-        _model: &str,
-        _messages: &[ChatMessage],
-        _tools: &[ToolDefinition],
-        _config: &GenerateConfig,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        config: &GenerateConfig,
     ) -> Result<ChatStream, ProviderError> {
-        // Task 5 实现
-        Err(ProviderError::Api {
-            status: 501,
-            body: "chat_stream not implemented yet".into(),
-        })
+        let request = Self::build_request(model, messages, tools, config, Some(true));
+        tracing::info!(
+            "openai chat_stream: provider={}, model={}, messages={}",
+            self.provider_id,
+            model,
+            messages.len()
+        );
+        let response = self.send_request(&request).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            if let Err(e) = parse_sse_stream(response, tx).await {
+                tracing::error!("openai SSE stream error: {}", e);
+            }
+        });
+        Ok(ChatStream { inner: rx })
     }
 
     async fn chat(
@@ -434,5 +709,142 @@ mod tests {
             Some("Bearer sk-abc".to_string())
         );
         assert_eq!(OpenAiProvider::auth_header(""), None);
+    }
+
+    #[test]
+    fn aggregator_streams_text_then_finish() {
+        let mut agg = OpenAiStreamAggregator::new();
+        let mut events = agg.feed(&json!({"choices":[{"delta":{"content":"Hel"}}]}));
+        events.extend(agg.feed(&json!({"choices":[{"delta":{"content":"lo"}}]})));
+        events.extend(
+            agg.feed(&json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2}})),
+        );
+        events.extend(agg.finish());
+        assert_eq!(
+            events,
+            vec![
+                ProviderStreamEvent::TextDelta {
+                    delta: "Hel".into()
+                },
+                ProviderStreamEvent::TextDelta { delta: "lo".into() },
+                ProviderStreamEvent::Finish {
+                    stop_reason: ProviderStopReason::EndTurn,
+                    usage: Usage {
+                        input_tokens: 7,
+                        output_tokens: 2
+                    },
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregator_aggregates_parallel_tool_calls() {
+        let mut agg = OpenAiStreamAggregator::new();
+        let mut events = agg.feed(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"name":"echo","arguments":""}}
+        ]}}]}));
+        events.extend(agg.feed(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"{\"x\":"}}
+        ]}}]})));
+        events.extend(agg.feed(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":1,"id":"call_b","function":{"name":"ls","arguments":"{\"path\":\".\""}}
+        ]}}]})));
+        events.extend(agg.feed(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"1}"}},
+            {"index":1,"function":{"arguments":",\"depth\":2}"}}
+        ]}}]})));
+        events.extend(agg.feed(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})));
+        events.extend(agg.finish());
+        assert_eq!(
+            events,
+            vec![
+                ProviderStreamEvent::ToolCallStart {
+                    id: "call_a".into(),
+                    name: "echo".into()
+                },
+                ProviderStreamEvent::ToolCallDelta {
+                    id: "call_a".into(),
+                    args_delta: "{\"x\":".into()
+                },
+                ProviderStreamEvent::ToolCallStart {
+                    id: "call_b".into(),
+                    name: "ls".into()
+                },
+                ProviderStreamEvent::ToolCallDelta {
+                    id: "call_b".into(),
+                    args_delta: "{\"path\":\".\"".into()
+                },
+                ProviderStreamEvent::ToolCallDelta {
+                    id: "call_a".into(),
+                    args_delta: "1}".into()
+                },
+                ProviderStreamEvent::ToolCallDelta {
+                    id: "call_b".into(),
+                    args_delta: ",\"depth\":2}".into()
+                },
+                ProviderStreamEvent::ToolCallEnd {
+                    id: "call_a".into(),
+                    arguments: json!({"x": 1}),
+                },
+                ProviderStreamEvent::ToolCallEnd {
+                    id: "call_b".into(),
+                    arguments: json!({"path": ".", "depth": 2}),
+                },
+                ProviderStreamEvent::Finish {
+                    stop_reason: ProviderStopReason::ToolUse,
+                    usage: Usage {
+                        input_tokens: 0,
+                        output_tokens: 0
+                    },
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregator_parses_bad_arguments_as_empty_object() {
+        let mut agg = OpenAiStreamAggregator::new();
+        let mut events = agg.feed(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"name":"f","arguments":"not-json"}}
+        ]}}]}));
+        events.extend(agg.feed(&json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})));
+        events.extend(agg.finish());
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProviderStreamEvent::ToolCallEnd { arguments, .. }
+                if arguments.is_object() && arguments.as_object().unwrap().is_empty()
+        )));
+    }
+
+    #[test]
+    fn parse_openai_models_extracts_data_list() {
+        let json = json!({"object":"list","data":[{"id":"gpt-5"},{"id":"deepseek-chat","object":"model"}]});
+        let models = parse_openai_models(&json);
+        assert_eq!(
+            models,
+            vec![
+                ("gpt-5".to_string(), "gpt-5".to_string()),
+                ("deepseek-chat".to_string(), "deepseek-chat".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_error_detection() {
+        let err = json!({"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}});
+        assert_eq!(
+            extract_stream_error(&err),
+            Some("rate limit exceeded".to_string())
+        );
+        let ok = json!({"choices":[{"delta":{"content":"x"}}]});
+        assert_eq!(extract_stream_error(&ok), None);
+        // error 无 message 字段时给兜底文案
+        let bare = json!({"error": {"code": 500}});
+        assert_eq!(
+            extract_stream_error(&bare),
+            Some("unknown stream error".to_string())
+        );
     }
 }
