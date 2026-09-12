@@ -81,6 +81,7 @@ mod tests {
             default_model: format!("{id}-model"),
             base_url: None,
             models: vec![format!("{id}-model").into()],
+            max_tokens: None,
         }
     }
 

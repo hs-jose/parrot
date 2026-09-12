@@ -96,6 +96,10 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelEntry>,
+    /// 会话默认请求 max_tokens（daemon 用第一个 provider 的该值构造
+    /// GenerateConfig；缺省 8192）。thinking budget 需小于此值。
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,6 +689,59 @@ keep_recent_turns = 6
         assert!(
             toml::from_str::<AppConfig>(toml).is_err(),
             "protocol 缺失必须解析失败"
+        );
+    }
+
+    #[test]
+    fn provider_max_tokens_parse_and_default() {
+        let base = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let with_knob = format!(
+            r#"{base}
+[[providers]]
+id = "a"
+protocol = "anthropic"
+api_key = "x"
+default_model = "m"
+max_tokens = 72000
+"#
+        );
+        let c: AppConfig = toml::from_str(&with_knob).unwrap();
+        assert_eq!(c.providers[0].max_tokens, Some(72_000));
+
+        let without_knob = format!(
+            r#"{base}
+[[providers]]
+id = "a"
+protocol = "anthropic"
+api_key = "x"
+default_model = "m"
+"#
+        );
+        let c: AppConfig = toml::from_str(&without_knob).unwrap();
+        assert_eq!(
+            c.providers[0].max_tokens, None,
+            "缺省 None ⇒ runtime 回退 8192"
         );
     }
 

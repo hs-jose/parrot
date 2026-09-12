@@ -375,6 +375,7 @@ fn test_config(port: u16, data_dir: &Path, token_path: &Path) -> AppConfig {
         default_model: "claude-sonnet-4-6".to_string(),
         base_url: None,
         models: vec!["claude-sonnet-4-6".into()],
+        max_tokens: None,
     });
     config
 }

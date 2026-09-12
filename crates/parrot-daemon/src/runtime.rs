@@ -76,7 +76,7 @@ pub async fn run_with_confirm_timeout(
         .map(|p| GenerateConfig {
             model: p.default_model.clone(),
             temperature: None,
-            max_tokens: Some(8192),
+            max_tokens: Some(p.max_tokens.unwrap_or(8192)),
             stop_sequences: None,
         })
         .unwrap_or_default();

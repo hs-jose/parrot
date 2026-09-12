@@ -224,6 +224,7 @@ fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Pa
         default_model: "mock-model".to_string(),
         base_url: None,
         models: vec!["mock-model".into()],
+        max_tokens: None,
     });
     config
 }
