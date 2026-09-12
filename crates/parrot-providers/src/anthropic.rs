@@ -242,7 +242,14 @@ impl AnthropicProvider {
     async fn fetch_remote_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let mut all = Vec::new();
         let mut after_id: Option<String> = None;
+        const MAX_PAGES: u32 = 50;
+        let mut pages = 0u32;
         loop {
+            pages += 1;
+            if pages > MAX_PAGES {
+                tracing::warn!("anthropic list_models 超过 {MAX_PAGES} 页，停止分页");
+                break;
+            }
             let mut url = format!("{}/v1/models?limit=1000", self.base_url);
             if let Some(after) = &after_id {
                 url.push_str("&after_id=");
