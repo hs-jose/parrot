@@ -198,8 +198,9 @@ impl ReActEngine {
         // 预算 = min([session] max_history_tokens, 模型 context_window)。
         // 配置值是主旋钮，模型窗口只能进一步收紧。
         let model_window = self.resolve_model_context_window().await;
-        let budget = context_budget(self.context_limits.max_history_tokens, model_window);
-        let context_manager = ContextManager::new(budget, self.context_limits.keep_recent_turns);
+        let mut budget = context_budget(self.context_limits.max_history_tokens, model_window);
+        let mut context_manager =
+            ContextManager::new(budget, self.context_limits.keep_recent_turns);
 
         // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
         // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
@@ -302,6 +303,11 @@ impl ReActEngine {
                         "switching model at turn boundary"
                     );
                     self.config.model = model;
+                    // 模型与其上下文大小配置一体：预算按新模型 window 同步重算。
+                    let model_window = self.resolve_model_context_window().await;
+                    budget = context_budget(self.context_limits.max_history_tokens, model_window);
+                    context_manager =
+                        ContextManager::new(budget, self.context_limits.keep_recent_turns);
                 }
                 None => {
                     let mut reason = self.end_reason.lock().unwrap();

@@ -37,6 +37,10 @@ struct MockProvider {
     first_tool: Option<(String, Value)>,
     /// Reported via `list_models`; caps the engine's context budget.
     context_window: u32,
+    /// Per-model context windows; when non-empty, `list_models` reports one
+    /// entry per pair instead of the single default `mock-model`. Lets tests
+    /// give two model ids different windows.
+    model_windows: Vec<(String, u32)>,
     /// Text returned by the non-stream `chat()` (compaction summary call).
     summary_text: Option<String>,
     /// When true, `chat()` returns Err (simulates summary failure).
@@ -53,6 +57,7 @@ impl MockProvider {
             captured_configs: tokio::sync::Mutex::new(Vec::new()),
             first_tool: Some(("echo".to_string(), json!({"message": "hello"}))),
             context_window: 200_000,
+            model_windows: Vec::new(),
             summary_text: None,
             fail_chat: false,
         }
@@ -70,6 +75,11 @@ impl MockProvider {
 
     fn with_context_window(mut self, window: u32) -> Self {
         self.context_window = window;
+        self
+    }
+
+    fn with_model_window(mut self, id: &str, window: u32) -> Self {
+        self.model_windows.push((id.to_string(), window));
         self
     }
 
@@ -109,6 +119,19 @@ impl LlmProvider for MockProvider {
     async fn list_models(
         &self,
     ) -> Result<Vec<parrot_core::types::ModelInfo>, parrot_core::error::ProviderError> {
+        if !self.model_windows.is_empty() {
+            return Ok(self
+                .model_windows
+                .iter()
+                .map(|(id, window)| parrot_core::types::ModelInfo {
+                    id: id.clone(),
+                    name: id.clone(),
+                    provider: "mock".to_string(),
+                    context_window: *window,
+                    max_output_tokens: 8192,
+                })
+                .collect());
+        }
         Ok(vec![parrot_core::types::ModelInfo {
             id: "mock-model".to_string(),
             name: "Mock Model".to_string(),
@@ -1639,5 +1662,114 @@ async fn set_model_mid_turn_is_ignored() {
         models,
         vec!["mock-model".to_string(), "mock-model".to_string()],
         "mid-turn SetModel must not affect the current call nor the next turn"
+    );
+}
+
+/// Switching model at a turn boundary must also switch the model's context
+/// size config: the prune budget is recomputed from the new model's window.
+/// `max_history_tokens` is huge here, so only the model window can bind.
+#[tokio::test]
+async fn set_model_recomputes_compaction_budget() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(
+        MockProvider::new()
+            .text_only()
+            .with_model_window("large-model", 1_000_000)
+            .with_model_window("small-model", 1),
+    );
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(
+            provider,
+            vec!["large-model".to_string(), "small-model".to_string()],
+        )
+        .await;
+
+    let config = GenerateConfig {
+        model: "large-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("sys".to_string()),
+        data_dir,
+        working_dir,
+    )
+    .with_context_limits(parrot_core::compaction::ContextLimits {
+        max_history_tokens: u32::MAX,
+        keep_recent_turns: 1,
+        compaction: parrot_core::compaction::CompactionConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    });
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    // Two turns under the large window: nothing is pruned.
+    for q in ["q1", "q2"] {
+        cmd_tx
+            .send(SessionCmd::Chat {
+                message: q.to_string(),
+            })
+            .await
+            .unwrap();
+        collect_until_turn_end(&mut event_rx).await;
+    }
+    let before_switch = mock.captured_calls().await;
+    assert!(
+        before_switch[1].iter().any(|m| m.content == "q1"),
+        "before the switch the 1M-token window must keep the old turn"
+    );
+
+    // Switch to the 1-token-window model at the turn boundary.
+    cmd_tx
+        .send(SessionCmd::SetModel {
+            model: "small-model".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Along the same input as before, the small window must now prune
+    // everything but the newest turn.
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "q3".to_string(),
+        })
+        .await
+        .unwrap();
+    collect_until_turn_end(&mut event_rx).await;
+
+    drop(cmd_tx);
+    drain_until_agent_end(&mut event_rx).await;
+    let _ = engine_task.await;
+
+    let calls = mock.captured_calls().await;
+    let after_switch = calls.last().expect("turn 3 provider call");
+    assert!(
+        after_switch.iter().any(|m| m.content == "q3"),
+        "the new turn must remain"
+    );
+    assert!(
+        !after_switch.iter().any(|m| m.content.starts_with("q1")),
+        "after the switch to a 1-token window q1 must be pruned, got: {:?}",
+        after_switch
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !after_switch.iter().any(|m| m.content.starts_with("q2")),
+        "after the switch to a 1-token window q2 must be pruned"
     );
 }
