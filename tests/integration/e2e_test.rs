@@ -13,7 +13,7 @@ use parrot_config::AppConfig;
 use parrot_protocol::agent_event::{
     AgentEndReason, AgentEvent, MessageDeltaPayload, PersistedAgentEvent, TurnStopReason,
 };
-use parrot_protocol::types::SessionConfig;
+use parrot_protocol::types::{ErrorCode, SessionConfig};
 use parrot_protocol::{ClientMessage, ServerMessage};
 
 #[test]
@@ -2052,6 +2052,280 @@ async fn e2e_bad_mcp_server_surfaces_failure() {
         "失败详情过线: {:?}",
         entries[0].detail
     );
+
+    daemon_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// E2E: runtime model switch (ClientMessage::Model)
+// ---------------------------------------------------------------------------
+
+/// Records the `model` argument of every `chat_stream` call and replies with a
+/// single EndTurn text. Proves a `Model` switch reaches the engine task.
+struct RecordingProvider {
+    seen_models: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingProvider {
+    fn new() -> Self {
+        Self {
+            seen_models: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen_models(&self) -> Vec<String> {
+        self.seen_models.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    fn provider_id(&self) -> &str {
+        "mock"
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        Ok(vec![ModelInfo {
+            id: "mock-model".to_string(),
+            name: "Mock Model".to_string(),
+            provider: "mock".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 8192,
+        }])
+    }
+
+    async fn chat_stream(
+        &self,
+        model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatStream, ProviderError> {
+        self.seen_models.lock().unwrap().push(model.to_string());
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
+        tokio::spawn(async move {
+            tx.send(ProviderStreamEvent::TextDelta {
+                delta: "ok".to_string(),
+            })
+            .await
+            .ok();
+            tx.send(ProviderStreamEvent::Finish {
+                stop_reason: ProviderStopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            })
+            .await
+            .ok();
+        });
+        Ok(ChatStream { inner: rx })
+    }
+
+    async fn chat(
+        &self,
+        _model: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatMessage, ProviderError> {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn e2e_model_message_sets_model_and_updates_meta() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("data");
+    let token_path = tmp.path().join("token");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config = test_config(0, &data_dir, &token_path);
+
+    let provider = Arc::new(RecordingProvider::new());
+    let (mut rx, tx, _token, daemon_handle) = spawn_daemon_with_provider_and_config(
+        Arc::clone(&provider) as Arc<dyn LlmProvider>,
+        config,
+    )
+    .await;
+
+    tx.send(ClientMessage::CreateSession {
+        config: Some(SessionConfig {
+            model: None,
+            provider: None,
+            system_prompt: None,
+        }),
+    })
+    .await
+    .expect("send CreateSession");
+    let session_id = expect_server_message(
+        &mut rx,
+        |m| {
+            if let ServerMessage::SessionCreated { session_id } = m {
+                Some(*session_id)
+            } else {
+                None
+            }
+        },
+        "SessionCreated",
+    )
+    .await;
+
+    tx.send(ClientMessage::Model {
+        session_id,
+        model: "mock-model-2".to_string(),
+    })
+    .await
+    .expect("send Model");
+
+    let acked = expect_server_message(
+        &mut rx,
+        |m| {
+            if let ServerMessage::ModelSet {
+                session_id: sid,
+                model,
+            } = m
+            {
+                if *sid == session_id {
+                    return Some(model.clone());
+                }
+            }
+            None
+        },
+        "ModelSet",
+    )
+    .await;
+    assert_eq!(acked, "mock-model-2");
+
+    // meta.json must record the new model + resolved provider.
+    let store = parrot_daemon::session_store::SessionStore::new(data_dir.join("sessions"));
+    let meta = store
+        .read_meta(session_id)
+        .expect("read meta")
+        .expect("meta.json should exist");
+    assert_eq!(meta.model, "mock-model-2");
+    assert_eq!(meta.provider, "mock");
+
+    // The next turn must reach the provider with the switched model id.
+    tx.send(ClientMessage::Chat {
+        session_id,
+        message: "hello".to_string(),
+    })
+    .await
+    .expect("send Chat");
+    expect_agent_event(
+        &mut rx,
+        |ev| {
+            if let AgentEvent::TurnEnd {
+                session_id: sid, ..
+            } = ev
+            {
+                if *sid == session_id {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "TurnEnd after model switch",
+    )
+    .await;
+    assert_eq!(provider.seen_models(), vec!["mock-model-2".to_string()]);
+
+    daemon_handle.abort();
+}
+
+#[tokio::test]
+async fn e2e_model_message_rejects_empty_or_blank_model() {
+    let provider = Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>;
+    let (mut rx, tx, _token, daemon_handle) = spawn_daemon_with_provider(provider).await;
+
+    tx.send(ClientMessage::CreateSession {
+        config: Some(SessionConfig {
+            model: None,
+            provider: None,
+            system_prompt: None,
+        }),
+    })
+    .await
+    .expect("send CreateSession");
+    let session_id = expect_server_message(
+        &mut rx,
+        |m| {
+            if let ServerMessage::SessionCreated { session_id } = m {
+                Some(*session_id)
+            } else {
+                None
+            }
+        },
+        "SessionCreated",
+    )
+    .await;
+
+    for bad_model in ["", "   "] {
+        tx.send(ClientMessage::Model {
+            session_id,
+            model: bad_model.to_string(),
+        })
+        .await
+        .expect("send Model");
+
+        let (code, message) = expect_server_message(
+            &mut rx,
+            |m| {
+                if let ServerMessage::Error {
+                    session_id: sid,
+                    code,
+                    message,
+                } = m
+                {
+                    if *sid == Some(session_id) {
+                        return Some((code.clone(), message.clone()));
+                    }
+                }
+                None
+            },
+            "Error(empty model)",
+        )
+        .await;
+        assert_eq!(code, ErrorCode::InvalidRequest);
+        assert!(
+            message.to_lowercase().contains("empty"),
+            "expected a clear message about the empty model, got: {message}"
+        );
+    }
+
+    daemon_handle.abort();
+}
+
+#[tokio::test]
+async fn e2e_model_message_unknown_session_errors() {
+    let provider = Arc::new(MockProvider::new()) as Arc<dyn LlmProvider>;
+    let (mut rx, tx, _token, daemon_handle) = spawn_daemon_with_provider(provider).await;
+
+    let missing = uuid::Uuid::new_v4();
+    tx.send(ClientMessage::Model {
+        session_id: missing,
+        model: "mock-model-2".to_string(),
+    })
+    .await
+    .expect("send Model");
+
+    let (sid, code) = expect_server_message(
+        &mut rx,
+        |m| {
+            if let ServerMessage::Error {
+                session_id, code, ..
+            } = m
+            {
+                Some((*session_id, code.clone()))
+            } else {
+                None
+            }
+        },
+        "Error(SessionNotFound)",
+    )
+    .await;
+    assert_eq!(sid, Some(missing));
+    assert_eq!(code, ErrorCode::SessionNotFound);
 
     daemon_handle.abort();
 }

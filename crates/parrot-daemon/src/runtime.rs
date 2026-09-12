@@ -421,10 +421,55 @@ async fn handle_connection(
                     .await;
             }
             ClientMessage::Model { session_id, model } => {
-                warn!(
-                    "Model switch to `{}` for session {} not yet wired; ignoring",
-                    model, session_id
-                );
+                let mgr = session_manager.read().await;
+                if mgr.get_handle(&session_id).is_none() {
+                    drop(mgr);
+                    send_error(
+                        &client.sender,
+                        Some(session_id),
+                        ErrorCode::SessionNotFound,
+                        "Session not found",
+                    )
+                    .await;
+                } else if model.trim().is_empty() {
+                    drop(mgr);
+                    send_error(
+                        &client.sender,
+                        Some(session_id),
+                        ErrorCode::InvalidRequest,
+                        "Model must not be empty",
+                    )
+                    .await;
+                } else {
+                    send_session_cmd(
+                        &mgr,
+                        &client.sender,
+                        session_id,
+                        SessionCmd::SetModel {
+                            model: model.clone(),
+                        },
+                        "set_model",
+                    )
+                    .await;
+                    drop(mgr);
+
+                    let provider_id = provider_registry
+                        .resolve(&model)
+                        .await
+                        .map(|p| p.provider_id().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if let Err(e) = session_store.update_meta(session_id, |m| {
+                        m.model = model.clone();
+                        m.provider = provider_id;
+                    }) {
+                        warn!("Failed to update meta.json for {}: {}", session_id, e);
+                    }
+
+                    let _ = client
+                        .sender
+                        .send(ServerMessage::ModelSet { session_id, model })
+                        .await;
+                }
             }
             ClientMessage::Shell {
                 session_id,
