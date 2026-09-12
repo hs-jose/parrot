@@ -49,7 +49,8 @@ Parrot 目前只有 Anthropic 一个 LLM provider 实现。`parrot-core` 已预�
 - `ProviderConfig` 增加 **必填** 字段 `protocol: String`，取值 `"anthropic"` | `"openai"`（OpenAI 兼容）。缺省时 TOML 反序列化直接报错，迫使配置显式声明协议。
 - `id` 只做唯一标识（provider_id、日志、model 路由），不再承担协议分发职责。
 - `api_key` 加 `#[serde(default)]`——Ollama 等本地服务无需密钥，空字符串表示免鉴权。
-- **models 条目支持可选元数据**：`models: Vec<ModelEntry>`，`ModelEntry` 为 untagged 枚举——字符串简写（`"model-id"`，上下文未知）或表（`{ id, name?, context_window?, max_output_tokens? }`）。背景：两家协议的 `GET /models` 都不返回 context window，配置是唯一可靠来源；尤其 `[1m]` 等 1M 上下文变体必须显式配置。
+- **models 条目支持可选元数据**：`models: Vec<ModelEntry>`，`ModelEntry` 为 untagged 枚举——字符串简写（`"model-id"`，上下文未知）或表（`{ id, name?, context_window?, max_output_tokens?, thinking?, reasoning_effort? }`）。背景：两家协议的 `GET /models` 都不返回 context window，配置是唯一可靠来源；尤其 `[1m]` 等 1M 上下文变体必须显式配置。
+- **思考/effort 扩展点（本期仅配置建模，不注入请求）**：`ModelEntry` 预留 `thinking`（anthropic 协议：`{ budget_tokens: u32 }`）与 `reasoning_effort`（openai 协议：`"low"|"medium"|"high"`）两个可选字段。本期解析并保存，适配器**不读取**；后续需求接入时按「当前模型的 ModelEntry → 请求体注入」实现（anthropic 注 `thinking` 块并保证 max_tokens > budget，openai 注 `reasoning_effort` 字段）。未配置 = 不发送该参数。
 - 其余字段不变。多 provider 即多个 `[[providers]]` 条目。
 
 ```toml
@@ -60,7 +61,18 @@ api_key = "${ANTHROPIC_API_KEY}"
 default_model = "claude-sonnet-4-6"
 models = [
   "claude-sonnet-4-6",
-  { id = "deepseek-v4-flash[1m]", context_window = 1000000, max_output_tokens = 8192 },
+  { id = "deepseek-v4-flash[1m]", context_window = 1000000, max_output_tokens = 8192,
+    thinking = { budget_tokens = 64000 } },
+]
+
+[[providers]]
+id = "openai-official"
+protocol = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+default_model = "gpt-5"
+models = [
+  { id = "gpt-5", reasoning_effort = "high" },
 ]
 
 [[providers]]
@@ -87,7 +99,7 @@ models = ["qwen3", "llama4"]
 
 **兼容性说明**：`protocol` 必填意味着现有配置文件与打包模板需同步补上该字段（仓库内模板与测试 fixture 一起改）。这是有意的破坏性变更——显式协议声明避免 id 推断的歧义（如给 Anthropic 代理配自定义 id 时会被误路由）。
 
-**models 元数据合并规则**：`list_models` 以远端结果为基底，配置中带元数据的条目按 `id` 覆盖/补充（`context_window`/`max_output_tokens`/`name` 逐字段覆盖）；配置有而远端无的条目追加。仅字符串简写的条目只用于合并时补 `name`（取 id），不产生 context window 信息。
+**models 元数据合并规则**：`list_models` 以远端结果为基底，配置中带元数据的条目按 `id` 覆盖/补充（`context_window`/`max_output_tokens`/`name` 逐字段覆盖）；配置有而远端无的条目追加。仅字符串简写的条目只用于合并时补 `name`（取 id），不产生 context window 信息。`thinking`/`reasoning_effort` 属于请求期参数，不参与 `list_models` 合并（本期不注入请求，见 §3.1 扩展点说明）。
 
 注意：OpenAI 官方端点是 `https://api.openai.com/v1`（`base_url` 需含 `/v1`，适配器不再追加）；Anthropic 保持 `base_url` 不含 `/v1`（适配器内拼 `/v1/messages`），维持现有行为不变。
 
@@ -184,7 +196,7 @@ match provider_config.protocol.as_str() {
   - SSE 解析：文本 delta、并行 tool_calls 分片聚合（多 index 交错）、finish_reason 三态映射、usage 提取、error 事件
   - 空 api_key 不发 Authorization header（mock 或构造层断言）
 - **anthropic list_models 单测**：远端成功解析、分页、失败回退 config_models、再兜底硬编码
-- **models 元数据单测**（两个适配器共用逻辑则只测一处）：字符串/表两种 ModelEntry 解析、合并覆盖（配置覆盖远端、追加独有）、fail-open 回退
+- **models 元数据单测**（两个适配器共用逻辑则只测一处）：字符串/表两种 ModelEntry 解析、合并覆盖（配置覆盖远端、追加独有）、fail-open 回退；`thinking`/`reasoning_effort` 字段解析与 roundtrip（本期不注入请求，仅验证配置可解析）
 - **config 测试**：`api_key` 缺省时解析成功；`protocol` 缺失时解析失败（必填）；models 混合字符串/表条目解析；多 `[[providers]]` 共存
 - **lib.rs 接线测试**：`protocol = "openai"` 注册为 OpenAiProvider、`protocol = "anthropic"` 注册为 AnthropicProvider、未知 protocol 跳过（可用 registry 查询 provider_id 验证）
 - **既有配置 fixture**：仓库内 parrot.toml 模板与测试用 TOML 全部补 `protocol` 字段
