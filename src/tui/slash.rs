@@ -141,7 +141,7 @@ pub(crate) async fn execute(
         SlashAction::Model => {
             match arg {
                 Some(model) => {
-                    if app.is_turn_active() {
+                    if app.is_turn_active() || app.pending_turn {
                         app.entries
                             .push(ChatEntry::Info("当前轮进行中，请稍后再切换".into()));
                     } else {
@@ -460,6 +460,30 @@ mod tests {
             other => panic!("expected Info, got {other:?}"),
         }
         assert!(server_rx.try_recv().is_err(), "轮中不得发送 Model");
+    }
+
+    #[tokio::test]
+    async fn execute_model_pending_turn_pushes_info_without_sending() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = App::new(SessionId::new_v4());
+        app.pending_turn = true;
+        let cmd = find("model").unwrap();
+        assert_eq!(
+            execute(cmd, Some("gpt-5"), &mut app, &mut conn)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        match app.entries.last() {
+            Some(ChatEntry::Info(s)) => {
+                assert!(s.contains("当前轮进行中，请稍后再切换"), "{s}");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+        assert!(
+            server_rx.try_recv().is_err(),
+            "预 TurnStart 窗口（pending_turn）不得发送 Model"
+        );
     }
 
     #[test]

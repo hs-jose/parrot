@@ -19,7 +19,10 @@ pub enum ClientMessage {
         session_id: SessionId,
     },
     /// Switch the active model of a running session at runtime. Response:
-    /// `ServerMessage::ModelSet` or `Error{SessionNotFound}`.
+    /// `ServerMessage::ModelSet` (receipt ack; the engine applies the switch at
+    /// the next turn boundary and ignores mid-turn requests),
+    /// `Error{SessionNotFound}`, or `Error{InvalidRequest}` when `model` is
+    /// empty or blank.
     Model {
         session_id: SessionId,
         model: String,

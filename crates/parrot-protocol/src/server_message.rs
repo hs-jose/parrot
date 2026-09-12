@@ -21,8 +21,10 @@ pub enum ServerMessage {
     ModelList {
         models: Vec<ModelInfo>,
     },
-    /// Ack for `ClientMessage::Model`: the session's active model is now
-    /// `model`.
+    /// Receipt ack for `ClientMessage::Model`: the request was received. The
+    /// engine applies the switch at the next turn boundary; a request that
+    /// arrives while a turn is in flight is ignored. This ack therefore does
+    /// not mean the active model has changed.
     ModelSet {
         session_id: SessionId,
         model: String,

@@ -2172,7 +2172,7 @@ async fn e2e_model_message_sets_model_and_updates_meta() {
 
     tx.send(ClientMessage::Model {
         session_id,
-        model: "mock-model-2".to_string(),
+        model: "  mock-model-2  ".to_string(),
     })
     .await
     .expect("send Model");
@@ -2290,6 +2290,10 @@ async fn e2e_model_message_rejects_empty_or_blank_model() {
         assert!(
             message.to_lowercase().contains("empty"),
             "expected a clear message about the empty model, got: {message}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "empty/blank model must not produce a ModelSet ack"
         );
     }
 

@@ -421,6 +421,7 @@ async fn handle_connection(
                     .await;
             }
             ClientMessage::Model { session_id, model } => {
+                let model = model.trim().to_string();
                 let mgr = session_manager.read().await;
                 if mgr.get_handle(&session_id).is_none() {
                     drop(mgr);
@@ -431,7 +432,7 @@ async fn handle_connection(
                         "Session not found",
                     )
                     .await;
-                } else if model.trim().is_empty() {
+                } else if model.is_empty() {
                     drop(mgr);
                     send_error(
                         &client.sender,

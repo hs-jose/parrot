@@ -326,12 +326,21 @@ async fn handle_key(
                         if let Some(should_quit) = handle_command(app, conn, &text).await? {
                             return Ok(Some(should_quit));
                         }
-                        conn.sender
+                        // 从发出 Chat 到引擎发出 TurnStart 之间，daemon 可能还在
+                        // 跑 hook/压缩。此窗口内 `turn_active` 仍为 false，用
+                        // `pending_turn` 标出「已提交、尚未开轮」，供 /model 拦截。
+                        app.pending_turn = true;
+                        if let Err(e) = conn
+                            .sender
                             .send(ClientMessage::Chat {
                                 session_id: app.session_id,
                                 message: text,
                             })
-                            .await?;
+                            .await
+                        {
+                            app.pending_turn = false;
+                            return Err(e.into());
+                        }
                     }
                     Ok(None)
                 }
@@ -537,6 +546,53 @@ mod tests {
             other => panic!("expected Info, got {other:?}"),
         }
         assert!(server_rx.try_recv().is_err(), "轮中不得发送 Model");
+    }
+
+    #[tokio::test]
+    async fn enter_chat_sets_pending_turn_until_turn_start() {
+        use parrot_protocol::agent_event::AgentEvent;
+
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let mut input = TextArea::default();
+        input.insert_str("hello");
+        handle_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert!(app.pending_turn, "发送 Chat 后应置 pending_turn");
+        match server_rx.try_recv().unwrap() {
+            ClientMessage::Chat { message, .. } => assert_eq!(message, "hello"),
+            other => panic!("expected Chat, got {other:?}"),
+        }
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: app.session_id,
+            turn_id: uuid::Uuid::new_v4(),
+            user_message: "hello".into(),
+        });
+        assert!(!app.pending_turn, "TurnStart 应清除 pending_turn");
+    }
+
+    #[tokio::test]
+    async fn enter_chat_send_failure_clears_pending_turn() {
+        let (mut conn, server_rx) = test_conn();
+        drop(server_rx);
+        let mut app = app::App::new(SessionId::new_v4());
+        let mut input = TextArea::default();
+        input.insert_str("hello");
+        let result = handle_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut input,
+            &mut conn,
+        )
+        .await;
+        assert!(result.is_err(), "channel 关闭时 send 应失败");
+        assert!(!app.pending_turn, "发送失败应回滚 pending_turn");
     }
 
     #[tokio::test]

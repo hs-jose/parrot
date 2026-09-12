@@ -78,6 +78,10 @@ pub(crate) struct App {
     pub total_usage: Usage,
     /// 当前是否处于一轮对话中（`TurnStart` → `TurnEnd`）。
     turn_active: bool,
+    /// 已发出 `Chat` 但尚未收到 `TurnStart`（daemon 侧 hook/压缩窗口）。
+    /// 与 `turn_active` 共同构成「轮次进行中」判定，避免预 TurnStart 窗口
+    /// 切换模型被引擎丢弃、状态栏却显示切换成功。
+    pub pending_turn: bool,
     /// 正在执行、尚未 `ToolEnd` 的工具数量。
     tools_in_flight: u32,
     /// 上下文压缩摘要调用进行中（`CompactionStart` → `CompactionSummary`/`TurnStart`）。
@@ -107,6 +111,7 @@ impl App {
             provider: String::new(),
             total_usage: Usage::default(),
             turn_active: false,
+            pending_turn: false,
             tools_in_flight: 0,
             compacting: false,
             selected_tool: None,
@@ -327,12 +332,14 @@ impl App {
                 // AgentEnd 的 total_usage 是整段会话权威合计，覆盖本地累加值。
                 self.total_usage = total_usage;
                 self.turn_active = false;
+                self.pending_turn = false;
                 self.tools_in_flight = 0;
                 self.discard_incomplete_assistant();
                 self.ended = true;
             }
             AgentEvent::TurnStart { user_message, .. } => {
                 self.turn_active = true;
+                self.pending_turn = false;
                 self.tools_in_flight = 0;
                 self.compacting = false;
                 self.entries.push(ChatEntry::User {
@@ -360,6 +367,7 @@ impl App {
                     .output_tokens
                     .saturating_add(usage.output_tokens);
                 self.turn_active = false;
+                self.pending_turn = false;
                 self.tools_in_flight = 0;
                 if let TurnStopReason::Error(msg) = stop_reason {
                     self.entries.push(ChatEntry::Error(msg));
@@ -875,6 +883,42 @@ mod tests {
             user_message: "hi".into(),
         });
         assert!(app.is_turn_active());
+    }
+
+    #[test]
+    fn pending_turn_cleared_by_turn_events() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.pending_turn = true;
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            user_message: "hi".into(),
+        });
+        assert!(!app.pending_turn, "TurnStart 应清除 pending_turn");
+
+        app.pending_turn = true;
+        app.apply_event(AgentEvent::TurnEnd {
+            session_id: sid_v,
+            turn_id: Uuid::new_v4(),
+            stop_reason: TurnStopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        });
+        assert!(!app.pending_turn, "TurnEnd 应清除 pending_turn");
+
+        app.pending_turn = true;
+        app.apply_event(AgentEvent::AgentEnd {
+            session_id: sid_v,
+            reason: AgentEndReason::ClientClose,
+            total_usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        });
+        assert!(!app.pending_turn, "AgentEnd 应清除 pending_turn");
     }
 
     #[test]
