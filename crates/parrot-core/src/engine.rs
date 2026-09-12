@@ -24,8 +24,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-const MAX_REACT_ITERATIONS: u32 = 20;
-
 /// 实际生效的上下文裁剪预算：`[session] max_history_tokens` 配置值，
 /// 当 provider 上报模型 context window 时再取二者较小值。配置是主旋钮，
 /// 模型窗口只能收紧。
@@ -391,8 +389,8 @@ impl ReActEngine {
     }
 
     /// ReAct 主循环：跑一轮 LLM，把 assistant 消息塞进 context；
-    /// 若有工具调用就依次跑，然后下一轮；直到 EndTurn / 无工具调用 /
-    /// 达到 MAX_REACT_ITERATIONS。任何子步骤抛 `Aborted` 都原样往外抛，
+    /// 若有工具调用就依次跑，然后下一轮；直到 EndTurn / 无工具调用。
+    /// 任何子步骤抛 `Aborted` 都原样往外抛，
     /// 由 `run` 转成 `TurnEnd{Aborted}`。
     #[allow(clippy::too_many_arguments)]
     async fn handle_turn(
@@ -441,7 +439,7 @@ impl ReActEngine {
             }
         }
 
-        for _ in 0..MAX_REACT_ITERATIONS {
+        loop {
             context_manager.prune(context);
 
             let msg = self
@@ -485,8 +483,6 @@ impl ReActEngine {
 
             let _ = event_log.maybe_snapshot(context);
         }
-
-        Ok((TurnStopReason::MaxIterations, turn_usage))
     }
 
     /// 流式跑一轮 LLM 调用：发 MessageStart，把 provider 的 delta 转发出去，
