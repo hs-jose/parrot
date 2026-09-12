@@ -5,6 +5,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "deepseek-v4-flash"
 base_url = "https://api.deepseek.com/anthropic"
