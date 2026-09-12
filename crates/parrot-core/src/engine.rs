@@ -906,8 +906,8 @@ struct StreamedMessage {
 
 /// 把 future 和 `cmd_rx` 上的 Abort 命令赛跑。三种结果：
 /// - Abort 先到 → `Aborted`（调用方自己清理）。
-/// - 操作中途来了条 Chat → warn 后照常 await 操作完成，**之后不再受理
-///   Abort**（沿用重构前的语义，避免一条噪音 Chat 改变取消语义）。
+/// - 操作中途来了条 Chat 或 SetModel → warn 后照常 await 操作完成，**之后
+///   不再受理 Abort**（沿用重构前的语义，避免一条噪音命令改变取消语义）。
 /// - 操作先完成 → `Completed(value)`。
 enum Abortable<T> {
     Completed(T),

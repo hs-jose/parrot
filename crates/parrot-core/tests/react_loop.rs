@@ -1407,9 +1407,9 @@ async fn set_model_between_turns_switches_provider_model() {
 
     let config = GenerateConfig {
         model: "mock-model".to_string(),
-        temperature: None,
-        max_tokens: Some(8192),
-        stop_sequences: None,
+        temperature: Some(0.5),
+        max_tokens: Some(4096),
+        stop_sequences: Some(vec!["STOP".to_string()]),
     };
     let engine = ReActEngine::new(
         uuid::Uuid::new_v4(),
@@ -1465,9 +1465,13 @@ async fn set_model_between_turns_switches_provider_model() {
     // Other GenerateConfig fields must survive the switch untouched.
     let configs = mock.captured_configs().await;
     assert_eq!(configs.len(), 2);
-    assert_eq!(configs[1].max_tokens, Some(8192), "max_tokens preserved");
-    assert_eq!(configs[1].temperature, None, "temperature preserved");
-    assert_eq!(configs[1].stop_sequences, None, "stop_sequences preserved");
+    assert_eq!(configs[1].max_tokens, Some(4096), "max_tokens preserved");
+    assert_eq!(configs[1].temperature, Some(0.5), "temperature preserved");
+    assert_eq!(
+        configs[1].stop_sequences,
+        Some(vec!["STOP".to_string()]),
+        "stop_sequences preserved"
+    );
 }
 
 /// Provider whose stream holds the `Finish` behind a gate, so the test can
