@@ -20,9 +20,10 @@ pub async fn register_all(registry: &ProviderRegistry, config: &AppConfig) {
         match provider_config.id.as_str() {
             "anthropic" => {
                 let provider = crate::anthropic::AnthropicProvider::new(
+                    provider_config.id.clone(),
                     provider_config.api_key.clone(),
                     provider_config.base_url.clone(),
-                    provider_config.default_model.clone(),
+                    provider_config.models.clone(),
                 );
                 registry.register(Arc::new(provider), models).await;
             }

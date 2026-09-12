@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use parrot_config::ModelEntry;
 use parrot_core::error::ProviderError;
 use parrot_core::provider::{ChatStream, LlmProvider, ProviderStopReason, ProviderStreamEvent};
 use parrot_core::tool::ToolDefinition;
@@ -10,8 +11,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub struct AnthropicProvider {
+    provider_id: String,
     api_key: String,
     base_url: String,
+    config_models: Vec<ModelEntry>,
     client: Client,
 }
 
@@ -61,11 +64,18 @@ struct AnthropicContent {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String, base_url: Option<String>, _default_model: String) -> Self {
+    pub fn new(
+        provider_id: String,
+        api_key: String,
+        base_url: Option<String>,
+        config_models: Vec<ModelEntry>,
+    ) -> Self {
         let base_url = base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string());
         Self {
+            provider_id,
             api_key,
             base_url,
+            config_models,
             client: Client::new(),
         }
     }
@@ -227,38 +237,129 @@ impl AnthropicProvider {
         }
         Ok(response)
     }
-}
 
-#[async_trait]
-impl LlmProvider for AnthropicProvider {
-    fn provider_id(&self) -> &str {
-        "anthropic"
+    /// 远端分页拉取 /v1/models。任一页失败即整体失败（fail-open 在调用方）。
+    async fn fetch_remote_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        let mut all = Vec::new();
+        let mut after_id: Option<String> = None;
+        loop {
+            let mut url = format!("{}/v1/models?limit=1000", self.base_url);
+            if let Some(after) = &after_id {
+                url.push_str("&after_id=");
+                url.push_str(after);
+            }
+            let response = crate::retry::with_retry(|| self.get_models_page(&url)).await?;
+            let json: Value = response
+                .json()
+                .await
+                .map_err(|e| ProviderError::Network(e.to_string()))?;
+            let (page_models, has_more, last_id) = parse_anthropic_models_page(&json);
+            all.extend(page_models.into_iter().map(|(id, name)| ModelInfo {
+                id,
+                name,
+                provider: self.provider_id.clone(),
+                context_window: 0,
+                max_output_tokens: 0,
+            }));
+            if !has_more {
+                break;
+            }
+            match last_id {
+                Some(id) => after_id = Some(id),
+                None => break,
+            }
+        }
+        Ok(all)
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(vec![
+    async fn get_models_page(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+        let mut request = self
+            .client
+            .get(url)
+            .header("anthropic-version", "2023-06-01");
+        if !self.api_key.is_empty() {
+            request = request.header("x-api-key", &self.api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5000);
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: retry_after,
+            });
+        }
+        if status.is_client_error() || status.is_server_error() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(response)
+    }
+
+    fn fallback_models(config_models: &[ModelEntry], provider_id: &str) -> Vec<ModelInfo> {
+        if !config_models.is_empty() {
+            return config_models
+                .iter()
+                .map(|m| crate::models::entry_to_model_info(m, provider_id))
+                .collect();
+        }
+        vec![
             ModelInfo {
                 id: "claude-sonnet-4-6".to_string(),
                 name: "Claude Sonnet 4.6".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider_id.to_string(),
                 context_window: 200000,
                 max_output_tokens: 8192,
             },
             ModelInfo {
                 id: "claude-opus-4".to_string(),
                 name: "Claude Opus 4".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider_id.to_string(),
                 context_window: 200000,
                 max_output_tokens: 8192,
             },
             ModelInfo {
                 id: "claude-haiku-3-5".to_string(),
                 name: "Claude Haiku 3.5".to_string(),
-                provider: "anthropic".to_string(),
+                provider: provider_id.to_string(),
                 context_window: 200000,
                 max_output_tokens: 8192,
             },
-        ])
+        ]
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AnthropicProvider {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        match self.fetch_remote_models().await {
+            Ok(remote) => Ok(crate::models::merge_models(
+                remote,
+                &self.config_models,
+                &self.provider_id,
+            )),
+            Err(e) => {
+                tracing::warn!("anthropic list_models 远端拉取失败({e})，回退配置 models");
+                Ok(Self::fallback_models(
+                    &self.config_models,
+                    &self.provider_id,
+                ))
+            }
+        }
     }
 
     async fn chat_stream(
@@ -372,6 +473,33 @@ impl LlmProvider for AnthropicProvider {
             ..ChatMessage::new(ChatRole::Assistant, text_content)
         })
     }
+}
+
+/// 解析一页 /v1/models 响应：(id, name) 列表、has_more、last_id。
+fn parse_anthropic_models_page(json: &Value) -> (Vec<(String, String)>, bool, Option<String>) {
+    let mut models = Vec::new();
+    if let Some(data) = json.get("data").and_then(|v| v.as_array()) {
+        for m in data {
+            let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let name = m
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
+            models.push((id.to_string(), name));
+        }
+    }
+    let has_more = json
+        .get("has_more")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let last_id = json
+        .get("last_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    (models, has_more, last_id)
 }
 
 async fn parse_sse_stream(
@@ -551,4 +679,70 @@ async fn parse_sse_stream(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parrot_config::DetailedModelEntry;
+    use serde_json::json;
+
+    #[test]
+    fn parse_models_page_extracts_ids_and_pagination() {
+        let json = json!({
+            "data": [
+                {"id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6", "type": "model"},
+                {"id": "claude-opus-4", "display_name": "Claude Opus 4", "type": "model"}
+            ],
+            "has_more": true,
+            "last_id": "claude-opus-4"
+        });
+        let (models, has_more, last_id) = parse_anthropic_models_page(&json);
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0],
+            (
+                "claude-sonnet-4-6".to_string(),
+                "Claude Sonnet 4.6".to_string()
+            )
+        );
+        assert!(has_more);
+        assert_eq!(last_id.as_deref(), Some("claude-opus-4"));
+    }
+
+    #[test]
+    fn parse_models_page_end_of_pages() {
+        let json = json!({"data": [{"id": "m1"}], "has_more": false});
+        let (models, has_more, last_id) = parse_anthropic_models_page(&json);
+        assert_eq!(models.len(), 1);
+        assert!(!has_more);
+        assert_eq!(last_id, None);
+        // display_name 缺省回退 id
+        assert_eq!(models[0].1, "m1");
+    }
+
+    #[test]
+    fn fallback_prefers_config_models() {
+        let entries = vec![ModelEntry::Detailed(DetailedModelEntry {
+            id: "deepseek-v4-flash[1m]".into(),
+            name: None,
+            context_window: Some(1_000_000),
+            max_output_tokens: Some(8192),
+            thinking: None,
+            reasoning_effort: None,
+        })];
+        let models = AnthropicProvider::fallback_models(&entries, "claude-proxy");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "deepseek-v4-flash[1m]");
+        assert_eq!(models[0].context_window, 1_000_000);
+        assert_eq!(models[0].provider, "claude-proxy");
+    }
+
+    #[test]
+    fn fallback_hardcoded_when_config_empty() {
+        let models = AnthropicProvider::fallback_models(&[], "anthropic");
+        assert_eq!(models.len(), 3);
+        assert!(models.iter().all(|m| m.provider == "anthropic"));
+        assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
+    }
 }
