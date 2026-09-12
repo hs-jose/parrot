@@ -13,7 +13,7 @@
 ### 2.1 协议
 
 - `ClientMessage::Model { session_id: SessionId, model: String }`
-- `ServerMessage::ModelSet { session_id: SessionId, model: String }`——daemon 收到即回（确认已入队），实际生效点是下一轮 turn
+- `ServerMessage::ModelSet { session_id: SessionId, model: String }`——daemon 收到即回（确认已接收），实际生效点是下一轮 turn；**轮次进行中发送会被忽略**（引擎丢弃），故 TUI 在 turn 活跃时本地拦截、不发送（方案 A：轮中拒绝）
 
 ### 2.2 会话命令（parrot-core）
 
@@ -29,8 +29,8 @@ runtime 新 arm：校验会话存在 → 转发 `SessionCmd::SetModel` → 回 `
 
 ### 2.4 TUI
 
-- `/model <name>`：发送 `ClientMessage::Model`；daemon `ModelSet` 到达时 push Info 条目「model 已切换为 X」
-- 帮助文本更新（/help 列表）
+- `/model <name>`：**turn 活跃时**（`app.is_turn_active()`）push Info「当前轮进行中，请稍后再切换」且不发送；否则发送 `ClientMessage::Model`；daemon `ModelSet` 到达时 push Info 条目「model 已切换为 X」并更新状态栏 model
+- 帮助文本更新：不枚举（用户已重写 /help；命令发现走弹窗 REGISTRY）
 
 ### 2.5 非目标
 
