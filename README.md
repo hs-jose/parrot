@@ -35,8 +35,9 @@ Create `parrot.toml` in the current directory or `~/.config/parrot/parrot.toml`:
 host = "127.0.0.1"
 port = 9876
 
-[[providers]]
+[provider]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "claude-sonnet-4-6"
 
