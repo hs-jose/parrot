@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parrot_config::ModelEntry;
+use parrot_config::{ModelEntry, ReasoningEffort};
 use parrot_core::error::ProviderError;
 use parrot_core::provider::{ChatStream, LlmProvider, ProviderStopReason, ProviderStreamEvent};
 use parrot_core::tool::ToolDefinition;
@@ -31,6 +31,8 @@ struct OpenAiRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +172,7 @@ impl OpenAiProvider {
         tools: &[ToolDefinition],
         config: &GenerateConfig,
         stream: Option<bool>,
+        reasoning_effort: Option<&ReasoningEffort>,
     ) -> OpenAiRequest {
         OpenAiRequest {
             model: model.to_string(),
@@ -179,6 +182,7 @@ impl OpenAiProvider {
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             stop: config.stop_sequences.clone(),
+            reasoning_effort: reasoning_effort.cloned(),
         }
     }
 
@@ -526,7 +530,10 @@ impl LlmProvider for OpenAiProvider {
         tools: &[ToolDefinition],
         config: &GenerateConfig,
     ) -> Result<ChatStream, ProviderError> {
-        let request = Self::build_request(model, messages, tools, config, Some(true));
+        let reasoning_effort = crate::models::find_detailed(&self.config_models, model)
+            .and_then(|d| d.reasoning_effort.as_ref());
+        let request =
+            Self::build_request(model, messages, tools, config, Some(true), reasoning_effort);
         tracing::info!(
             "openai chat_stream: provider={}, model={}, messages={}",
             self.provider_id,
@@ -550,7 +557,9 @@ impl LlmProvider for OpenAiProvider {
         tools: &[ToolDefinition],
         config: &GenerateConfig,
     ) -> Result<ChatMessage, ProviderError> {
-        let request = Self::build_request(model, messages, tools, config, None);
+        let reasoning_effort = crate::models::find_detailed(&self.config_models, model)
+            .and_then(|d| d.reasoning_effort.as_ref());
+        let request = Self::build_request(model, messages, tools, config, None, reasoning_effort);
         let response = self.send_request(&request).await?;
         let body: OpenAiChatResponse = response
             .json()
@@ -648,13 +657,39 @@ mod tests {
             stop_sequences: Some(vec!["STOP".into()]),
         };
         let messages = vec![msg(ChatRole::User, "hi")];
-        let req = OpenAiProvider::build_request("gpt-5", &messages, &[], &config, Some(true));
+        let req = OpenAiProvider::build_request("gpt-5", &messages, &[], &config, Some(true), None);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value["model"], "gpt-5");
         assert_eq!(value["stream"], true);
         assert_eq!(value["max_tokens"], 1024);
         assert_eq!(value["stop"], json!(["STOP"]));
         assert!(value.get("tools").is_none());
+    }
+
+    #[test]
+    fn build_request_injects_reasoning_effort_when_present() {
+        use parrot_config::ReasoningEffort;
+        let config = GenerateConfig::default();
+        let messages = vec![msg(ChatRole::User, "hi")];
+        let req = OpenAiProvider::build_request(
+            "gpt-5",
+            &messages,
+            &[],
+            &config,
+            None,
+            Some(&ReasoningEffort::High),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn build_request_omits_reasoning_effort_when_absent() {
+        let config = GenerateConfig::default();
+        let messages = vec![msg(ChatRole::User, "hi")];
+        let req = OpenAiProvider::build_request("gpt-5", &messages, &[], &config, None, None);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(value.get("reasoning_effort").is_none());
     }
 
     #[test]
