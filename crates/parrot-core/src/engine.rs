@@ -294,6 +294,15 @@ impl ReActEngine {
                 Some(SessionCmd::Abort) => {
                     // Top-level abort with no active turn — ignore.
                 }
+                Some(SessionCmd::SetModel { model }) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        old_model = %self.config.model,
+                        new_model = %model,
+                        "switching model at turn boundary"
+                    );
+                    self.config.model = model;
+                }
                 None => {
                     let mut reason = self.end_reason.lock().unwrap();
                     if !matches!(*reason, AgentEndReason::DaemonShutdown) {
@@ -544,6 +553,11 @@ impl ReActEngine {
                     SessionCmd::Chat { .. } => {
                         tracing::warn!(
                             "Chat command received while a turn is in flight; ignoring"
+                        );
+                    }
+                    SessionCmd::SetModel { .. } => {
+                        tracing::warn!(
+                            "SetModel command received while a turn is in flight; ignoring"
                         );
                     }
                 },
@@ -911,6 +925,10 @@ where
             SessionCmd::Abort => Abortable::Aborted,
             SessionCmd::Chat { .. } => {
                 tracing::warn!("Chat command received during operation; ignoring");
+                Abortable::Completed(fut.as_mut().await)
+            }
+            SessionCmd::SetModel { .. } => {
+                tracing::warn!("SetModel command received during operation; ignoring");
                 Abortable::Completed(fut.as_mut().await)
             }
         },

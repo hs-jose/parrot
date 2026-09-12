@@ -29,6 +29,10 @@ struct MockProvider {
     captured_messages: tokio::sync::Mutex<Vec<parrot_core::types::ChatMessage>>,
     /// Every provider call's messages (chat + chat_stream), in order.
     captured_calls: tokio::sync::Mutex<Vec<Vec<parrot_core::types::ChatMessage>>>,
+    /// Every chat_stream call's model id, in order.
+    captured_models: tokio::sync::Mutex<Vec<String>>,
+    /// Every chat_stream call's GenerateConfig, in order.
+    captured_configs: tokio::sync::Mutex<Vec<GenerateConfig>>,
     /// Scripted first-call tool call; `None` ⇒ every call is plain text.
     first_tool: Option<(String, Value)>,
     /// Reported via `list_models`; caps the engine's context budget.
@@ -45,6 +49,8 @@ impl MockProvider {
             call_count: AtomicU32::new(0),
             captured_messages: tokio::sync::Mutex::new(Vec::new()),
             captured_calls: tokio::sync::Mutex::new(Vec::new()),
+            captured_models: tokio::sync::Mutex::new(Vec::new()),
+            captured_configs: tokio::sync::Mutex::new(Vec::new()),
             first_tool: Some(("echo".to_string(), json!({"message": "hello"}))),
             context_window: 200_000,
             summary_text: None,
@@ -81,6 +87,14 @@ impl MockProvider {
         self.captured_calls.lock().await.clone()
     }
 
+    async fn captured_models(&self) -> Vec<String> {
+        self.captured_models.lock().await.clone()
+    }
+
+    async fn captured_configs(&self) -> Vec<GenerateConfig> {
+        self.captured_configs.lock().await.clone()
+    }
+
     async fn captured_messages(&self) -> Vec<parrot_core::types::ChatMessage> {
         self.captured_messages.lock().await.clone()
     }
@@ -106,11 +120,13 @@ impl LlmProvider for MockProvider {
 
     async fn chat_stream(
         &self,
-        _model: &str,
+        model: &str,
         messages: &[parrot_core::types::ChatMessage],
         _tools: &[ToolDefinition],
-        _config: &GenerateConfig,
+        config: &GenerateConfig,
     ) -> Result<ChatStream, parrot_core::error::ProviderError> {
+        self.captured_models.lock().await.push(model.to_string());
+        self.captured_configs.lock().await.push(config.clone());
         self.captured_calls.lock().await.push(messages.to_vec());
         *self.captured_messages.lock().await = messages.to_vec();
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
@@ -1371,4 +1387,253 @@ async fn abort_during_tool_execution_keeps_pairs_intact() {
     );
     assert!(dropped.is_empty());
     assert_eq!(keep.len(), total, "不得丢弃任何事件");
+}
+
+// ---------------------------------------------------------------------------
+// SessionCmd::SetModel (runtime model switch) tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_model_between_turns_switches_provider_model() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(MockProvider::new().text_only());
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("sys".to_string()),
+        data_dir,
+        working_dir,
+    );
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    // Turn 1 with the original model.
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "q1".to_string(),
+        })
+        .await
+        .unwrap();
+    collect_until_turn_end(&mut event_rx).await;
+
+    // Switch model at the turn boundary (idle between turns).
+    cmd_tx
+        .send(SessionCmd::SetModel {
+            model: "new-model".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Turn 2 must reach the provider with the NEW model id.
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "q2".to_string(),
+        })
+        .await
+        .unwrap();
+    collect_until_turn_end(&mut event_rx).await;
+
+    drop(cmd_tx);
+    drain_until_agent_end(&mut event_rx).await;
+    let _ = engine_task.await;
+
+    let models = mock.captured_models().await;
+    assert_eq!(
+        models,
+        vec!["mock-model".to_string(), "new-model".to_string()],
+        "turn 2 must be served with the switched model"
+    );
+
+    // Other GenerateConfig fields must survive the switch untouched.
+    let configs = mock.captured_configs().await;
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[1].max_tokens, Some(8192), "max_tokens preserved");
+    assert_eq!(configs[1].temperature, None, "temperature preserved");
+    assert_eq!(configs[1].stop_sequences, None, "stop_sequences preserved");
+}
+
+/// Provider whose stream holds the `Finish` behind a gate, so the test can
+/// deliver a command while the engine is inside the mid-stream select loop.
+struct GatedProvider {
+    captured_models: tokio::sync::Mutex<Vec<String>>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl LlmProvider for GatedProvider {
+    fn provider_id(&self) -> &str {
+        "mock"
+    }
+
+    async fn list_models(
+        &self,
+    ) -> Result<Vec<parrot_core::types::ModelInfo>, parrot_core::error::ProviderError> {
+        Ok(vec![parrot_core::types::ModelInfo {
+            id: "mock-model".to_string(),
+            name: "Mock Model".to_string(),
+            provider: "mock".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 8192,
+        }])
+    }
+
+    async fn chat_stream(
+        &self,
+        model: &str,
+        _messages: &[parrot_core::types::ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatStream, parrot_core::error::ProviderError> {
+        self.captured_models.lock().await.push(model.to_string());
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
+        let gate = Arc::clone(&self.gate);
+        tokio::spawn(async move {
+            tx.send(ProviderStreamEvent::TextDelta {
+                delta: "partial".to_string(),
+            })
+            .await
+            .ok();
+            gate.notified().await;
+            tx.send(ProviderStreamEvent::Finish {
+                stop_reason: ProviderStopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
+            })
+            .await
+            .ok();
+        });
+        Ok(ChatStream { inner: rx })
+    }
+
+    async fn chat(
+        &self,
+        _model: &str,
+        _messages: &[parrot_core::types::ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<parrot_core::types::ChatMessage, parrot_core::error::ProviderError> {
+        Ok(parrot_core::types::ChatMessage {
+            role: parrot_core::types::ChatRole::Assistant,
+            content: "ok".to_string(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        })
+    }
+}
+
+/// Mid-turn `SetModel` must be warned about and ignored: the current call
+/// keeps the old model, and the command is NOT deferred — the next turn
+/// also uses the old model.
+#[tokio::test]
+async fn set_model_mid_turn_is_ignored() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mock = Arc::new(GatedProvider {
+        captured_models: tokio::sync::Mutex::new(Vec::new()),
+        gate: Arc::clone(&gate),
+    });
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("sys".to_string()),
+        data_dir,
+        working_dir,
+    );
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    // Start the turn; the first MessageDelta proves the engine is inside
+    // the mid-stream select loop.
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "q1".to_string(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let ev = event_rx.recv().await.expect("engine alive mid-stream");
+        if matches!(ev, AgentEvent::MessageDelta { .. }) {
+            break;
+        }
+    }
+
+    // Deliver SetModel mid-stream, then release the gated Finish.
+    cmd_tx
+        .send(SessionCmd::SetModel {
+            model: "new-model".to_string(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    gate.notify_one();
+
+    let events = collect_until_turn_end(&mut event_rx).await;
+    let stop = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::TurnEnd { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("first TurnEnd present");
+    assert_eq!(stop, TurnStopReason::EndTurn, "turn completes normally");
+
+    // The command was ignored, not deferred: turn 2 still uses the old model.
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "q2".to_string(),
+        })
+        .await
+        .unwrap();
+    gate.notify_one();
+    collect_until_turn_end(&mut event_rx).await;
+
+    drop(cmd_tx);
+    drain_until_agent_end(&mut event_rx).await;
+    let _ = engine_task.await;
+
+    let models = mock.captured_models.lock().await.clone();
+    assert_eq!(
+        models,
+        vec!["mock-model".to_string(), "mock-model".to_string()],
+        "mid-turn SetModel must not affect the current call nor the next turn"
+    );
 }

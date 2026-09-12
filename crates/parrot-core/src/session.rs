@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub enum SessionCmd {
     Chat { message: String },
     Abort,
+    SetModel { model: String },
 }
 
 pub struct SessionHandle {
