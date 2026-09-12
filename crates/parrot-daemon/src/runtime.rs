@@ -30,7 +30,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let provider_registry = Arc::new(ProviderRegistry::new());
 
     parrot_tools::register_all(&tool_registry, &config).await;
-    parrot_providers::register_all(&provider_registry, &config).await;
+    parrot_providers::register_provider(&provider_registry, &config).await;
 
     let mcp = parrot_mcp::start_all(Arc::clone(&tool_registry), config.mcp.servers.clone()).await;
     run_with_confirm_timeout(
