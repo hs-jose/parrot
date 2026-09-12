@@ -161,10 +161,11 @@ fn test_config(port: u16, data_dir: &std::path::Path, token_path: &std::path::Pa
     config.session.data_dir = data_dir.to_string_lossy().to_string();
     config.providers.push(parrot_config::ProviderConfig {
         id: "mock".to_string(),
+        protocol: "anthropic".to_string(),
         api_key: String::new(),
         default_model: "mock-model".to_string(),
         base_url: None,
-        models: vec!["mock-model".to_string()],
+        models: vec!["mock-model".into()],
     });
     config
 }

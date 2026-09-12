@@ -23,15 +23,79 @@ pub struct DaemonConfig {
     pub auth_token_file: String,
 }
 
+/// [[providers]] models 条目。字符串简写（上下文未知）或含元数据的表。
+/// 两家协议的 GET /models 都不返回 context window，配置是唯一可靠来源
+/// （spec §3.1）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ModelEntry {
+    Simple(String),
+    Detailed(DetailedModelEntry),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DetailedModelEntry {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// 思考模式扩展点（anthropic 协议）。本期只解析保存，不注入请求。
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+    /// effort 扩展点（openai 协议）。本期只解析保存，不注入请求。
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThinkingConfig {
+    pub budget_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ModelEntry {
+    pub fn id(&self) -> &str {
+        match self {
+            ModelEntry::Simple(id) => id,
+            ModelEntry::Detailed(d) => &d.id,
+        }
+    }
+}
+
+impl From<String> for ModelEntry {
+    fn from(s: String) -> Self {
+        ModelEntry::Simple(s)
+    }
+}
+
+impl From<&str> for ModelEntry {
+    fn from(s: &str) -> Self {
+        ModelEntry::Simple(s.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
+    /// 必填：`"anthropic"` | `"openai"`（OpenAI 兼容）。缺失即解析报错。
+    pub protocol: String,
+    #[serde(default)]
     pub api_key: String,
     pub default_model: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
-    pub models: Vec<String>,
+    pub models: Vec<ModelEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +392,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "claude-sonnet-4-6"
 
@@ -362,6 +427,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "claude-sonnet-4-6"
 
@@ -407,6 +473,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "claude-sonnet-4-6"
 
@@ -446,6 +513,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "claude-sonnet-4-6"
 
@@ -492,6 +560,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "m"
 
@@ -541,7 +610,8 @@ port = 9876
 auth_token_file = ""
 
 [[providers]]
-id = "p"
+id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "m"
 
@@ -580,6 +650,147 @@ command = "mock-server"
         assert!(
             c.mcp.servers.is_empty(),
             "无 [mcp] 段 ⇒ servers 为空，零行为变化"
+        );
+    }
+
+    #[test]
+    fn provider_requires_protocol() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+api_key = "x"
+default_model = "m"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        assert!(
+            toml::from_str::<AppConfig>(toml).is_err(),
+            "protocol 缺失必须解析失败"
+        );
+    }
+
+    #[test]
+    fn provider_api_key_defaults_empty() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "ollama"
+protocol = "openai"
+base_url = "http://localhost:11434/v1"
+default_model = "qwen3"
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.providers[0].api_key, "");
+    }
+
+    #[test]
+    fn models_mixed_entries_parse() {
+        let toml = r#"
+[daemon]
+host = "127.0.0.1"
+port = 9876
+auth_token_file = ""
+
+[[providers]]
+id = "anthropic"
+protocol = "anthropic"
+api_key = "x"
+default_model = "m"
+models = [
+  "claude-sonnet-4-6",
+  { id = "deepseek-v4-flash[1m]", context_window = 1000000, max_output_tokens = 8192, thinking = { budget_tokens = 64000 } },
+]
+
+[[providers]]
+id = "openai-official"
+protocol = "openai"
+api_key = "x"
+default_model = "gpt-5"
+models = [
+  { id = "gpt-5", name = "GPT-5", reasoning_effort = "high" },
+]
+
+[tools]
+shell_allowed = false
+file_write_allowed = false
+web_allowed = true
+max_file_size_mb = 10
+
+[tools.sandbox]
+working_dir = "."
+allowlist = []
+require_confirmation = []
+
+[session]
+data_dir = ""
+max_history_tokens = 100000
+keep_recent_turns = 6
+"#;
+        let c: AppConfig = toml::from_str(toml).unwrap();
+        let p0 = &c.providers[0];
+        assert_eq!(p0.models[0], ModelEntry::Simple("claude-sonnet-4-6".into()));
+        match &p0.models[1] {
+            ModelEntry::Detailed(d) => {
+                assert_eq!(d.id, "deepseek-v4-flash[1m]");
+                assert_eq!(d.context_window, Some(1_000_000));
+                assert_eq!(d.max_output_tokens, Some(8192));
+                assert_eq!(d.thinking.as_ref().unwrap().budget_tokens, 64000);
+                assert!(d.reasoning_effort.is_none());
+            }
+            other => panic!("expected Detailed, got {other:?}"),
+        }
+        match &c.providers[1].models[0] {
+            ModelEntry::Detailed(d) => {
+                assert_eq!(d.id, "gpt-5");
+                assert_eq!(d.name.as_deref(), Some("GPT-5"));
+                assert_eq!(d.reasoning_effort, Some(ReasoningEffort::High));
+            }
+            other => panic!("expected Detailed, got {other:?}"),
+        }
+        // 序列化回 TOML 值不丢字段（roundtrip）
+        let back = toml::Value::try_from(&c.providers[1].models[0]).unwrap();
+        assert_eq!(
+            back.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high")
         );
     }
 }

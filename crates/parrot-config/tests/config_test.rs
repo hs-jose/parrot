@@ -20,6 +20,7 @@ auth_token_file = "/tmp/test-token"
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "sk-test-key"
 default_model = "claude-sonnet-4-6"
 
@@ -59,6 +60,7 @@ auth_token_file = "/tmp/token"
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${TEST_PARROT_KEY}"
 default_model = "claude-sonnet-4-6"
 
@@ -94,6 +96,7 @@ auth_token_file = "/tmp/parrot/token"
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "claude-x"
 
@@ -152,6 +155,7 @@ auth_token_file = "/tmp/parrot/token"
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "claude-x"
 
@@ -204,6 +208,7 @@ auth_token_file = "/tmp/parrot/token"
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "key"
 default_model = "claude-x"
 
@@ -237,6 +242,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "claude-sonnet-4-6"
 
@@ -273,6 +279,7 @@ auth_token_file = ""
 
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "x"
 default_model = "claude-sonnet-4-6"
 

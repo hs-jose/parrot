@@ -370,10 +370,11 @@ fn test_config(port: u16, data_dir: &Path, token_path: &Path) -> AppConfig {
     config.session.data_dir = data_dir.to_string_lossy().to_string();
     config.providers.push(parrot_config::ProviderConfig {
         id: "anthropic".to_string(),
+        protocol: "anthropic".to_string(),
         api_key: String::new(),
         default_model: "claude-sonnet-4-6".to_string(),
         base_url: None,
-        models: vec!["claude-sonnet-4-6".to_string()],
+        models: vec!["claude-sonnet-4-6".into()],
     });
     config
 }
