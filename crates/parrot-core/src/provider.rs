@@ -125,11 +125,107 @@ impl ProviderRegistry {
         if let Some(provider_id) = map.get(model) {
             return providers.get(provider_id).cloned();
         }
+        // 单 provider 透传：models 列表只管展示与元数据，不做过准入
+        if providers.len() == 1 {
+            return providers.values().next().cloned();
+        }
         None
     }
     /// 枚举所有已注册 provider 的 id。daemon 聚合各 provider 的
     /// `list_models()` 响应 `ClientMessage::ListModels` 时使用。
     pub async fn provider_ids(&self) -> Vec<String> {
         self.providers.read().await.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ProviderError;
+
+    /// 纯内存 mock provider：所有调用返回错误/空，仅供 registry 路由测试。
+    struct StubProvider {
+        id: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StubProvider {
+        fn provider_id(&self) -> &str {
+            self.id
+        }
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn chat_stream(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _config: &GenerateConfig,
+        ) -> Result<ChatStream, ProviderError> {
+            Err(ProviderError::Network("stub".to_string()))
+        }
+        async fn chat(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            _config: &GenerateConfig,
+        ) -> Result<ChatMessage, ProviderError> {
+            Err(ProviderError::Network("stub".to_string()))
+        }
+    }
+
+    fn stub(id: &'static str) -> Arc<dyn LlmProvider> {
+        Arc::new(StubProvider { id })
+    }
+
+    #[tokio::test]
+    async fn resolve_map_hit_single_provider() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register(stub("only"), vec!["claude-3".to_string()])
+            .await;
+        let resolved = registry.resolve("claude-3").await.unwrap();
+        assert_eq!(resolved.provider_id(), "only");
+    }
+
+    #[tokio::test]
+    async fn resolve_passthrough_unknown_model_single_provider() {
+        let registry = ProviderRegistry::new();
+        registry.register(stub("only"), vec![]).await;
+        let resolved = registry.resolve("unknown-model").await.unwrap();
+        assert_eq!(resolved.provider_id(), "only");
+    }
+
+    #[tokio::test]
+    async fn resolve_map_hit_multi_provider() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register(stub("a"), vec!["model-a".to_string()])
+            .await;
+        registry
+            .register(stub("b"), vec!["model-b".to_string()])
+            .await;
+        let resolved = registry.resolve("model-b").await.unwrap();
+        assert_eq!(resolved.provider_id(), "b");
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_model_multi_provider_is_none() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register(stub("a"), vec!["model-a".to_string()])
+            .await;
+        registry
+            .register(stub("b"), vec!["model-b".to_string()])
+            .await;
+        assert!(registry.resolve("unknown-model").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_zero_providers_is_none() {
+        let registry = ProviderRegistry::new();
+        assert!(registry.resolve("any-model").await.is_none());
     }
 }
