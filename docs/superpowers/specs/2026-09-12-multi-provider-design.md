@@ -49,6 +49,7 @@ Parrot 目前只有 Anthropic 一个 LLM provider 实现。`parrot-core` 已预�
 - `ProviderConfig` 增加 **必填** 字段 `protocol: String`，取值 `"anthropic"` | `"openai"`（OpenAI 兼容）。缺省时 TOML 反序列化直接报错，迫使配置显式声明协议。
 - `id` 只做唯一标识（provider_id、日志、model 路由），不再承担协议分发职责。
 - `api_key` 加 `#[serde(default)]`——Ollama 等本地服务无需密钥，空字符串表示免鉴权。
+- **models 条目支持可选元数据**：`models: Vec<ModelEntry>`，`ModelEntry` 为 untagged 枚举——字符串简写（`"model-id"`，上下文未知）或表（`{ id, name?, context_window?, max_output_tokens? }`）。背景：两家协议的 `GET /models` 都不返回 context window，配置是唯一可靠来源；尤其 `[1m]` 等 1M 上下文变体必须显式配置。
 - 其余字段不变。多 provider 即多个 `[[providers]]` 条目。
 
 ```toml
@@ -57,7 +58,10 @@ id = "anthropic"
 protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "claude-sonnet-4-6"
-models = ["claude-sonnet-4-6", "claude-opus-4"]
+models = [
+  "claude-sonnet-4-6",
+  { id = "deepseek-v4-flash[1m]", context_window = 1000000, max_output_tokens = 8192 },
+]
 
 [[providers]]
 id = "deepseek"
@@ -83,6 +87,8 @@ models = ["qwen3", "llama4"]
 
 **兼容性说明**：`protocol` 必填意味着现有配置文件与打包模板需同步补上该字段（仓库内模板与测试 fixture 一起改）。这是有意的破坏性变更——显式协议声明避免 id 推断的歧义（如给 Anthropic 代理配自定义 id 时会被误路由）。
 
+**models 元数据合并规则**：`list_models` 以远端结果为基底，配置中带元数据的条目按 `id` 覆盖/补充（`context_window`/`max_output_tokens`/`name` 逐字段覆盖）；配置有而远端无的条目追加。仅字符串简写的条目只用于合并时补 `name`（取 id），不产生 context window 信息。
+
 注意：OpenAI 官方端点是 `https://api.openai.com/v1`（`base_url` 需含 `/v1`，适配器不再追加）；Anthropic 保持 `base_url` 不含 `/v1`（适配器内拼 `/v1/messages`），维持现有行为不变。
 
 ### 3.2 OpenAI 兼容适配器（parrot-providers/src/openai.rs，新文件）
@@ -92,7 +98,7 @@ pub struct OpenAiProvider {
     provider_id: String,   // 即配置里的 id（"openai"/"deepseek"/…）
     api_key: String,       // 可为空
     base_url: String,
-    config_models: Vec<String>, // 配置的 models / default_model，list_models 失败时兜底
+    config_models: Vec<ModelEntry>, // 配置的 models（含元数据），list_models 失败/合并时使用
     client: reqwest::Client,
 }
 ```
@@ -130,8 +136,9 @@ pub struct OpenAiProvider {
 - 复用 `crate::retry::with_retry`，语义与 anthropic 相同：429 尊重 retry-after、5xx/网络错误退避重试、流开始后不重试（`ProviderError::StreamError` 不重试）。
 
 **list_models**
-- `GET {base_url}/models`，解析 `{"data":[{"id",...}]}`；`ModelInfo` 的 `context_window`/`max_output_tokens` 未知填 0（引擎 `resolve_model_context_window` 对 0 视为未知处理，见 §3.5）
-- 失败 fail-open：回退 `config_models`（再兜底空列表）。`name` 取 id 原值。
+- `GET {base_url}/models`，解析 `{"data":[{"id",...}]}`；远端无 context window 信息，`ModelInfo` 的 `context_window`/`max_output_tokens` 填 0
+- 与 `config_models` 合并（规则见 §3.1）：配置元数据按 id 覆盖，配置独有条目追加
+- 远端请求失败 fail-open：直接由 `config_models` 构造结果。`name` 取 id 原值（配置未指定时）
 
 ### 3.3 register_all 接线（parrot-providers/src/lib.rs）
 
@@ -149,16 +156,17 @@ match provider_config.protocol.as_str() {
 
 ### 3.4 Anthropic 对齐（anthropic.rs 小改）
 
-- 构造函数签名改为 `new(api_key, base_url, models: Vec<String>)`（替换被丢弃的 `_default_model: String`），保存为 `config_models`。
+- 构造函数签名改为 `new(provider_id, api_key, base_url, models: Vec<ModelEntry>)`（替换被丢弃的 `_default_model: String`）；`provider_id()` 返回配置 id 而非硬编码 `"anthropic"`（支持 claude-proxy 场景）。
 - `list_models`：
   1. `GET {base_url}/v1/models`（带 `x-api-key` / `anthropic-version` header，`limit=1000`，`after_id` 分页追平）
-  2. 解析 `{"data":[{"id","display_name",...}]}`
-  3. 失败 fail-open：回退 `config_models`；`config_models` 也为空则回退当前硬编码 3 模型（保持现状兜底）
+  2. 解析 `{"data":[{"id","display_name",...}]}`；远端同样无 context window，填 0
+  3. 与 `config_models` 合并（规则见 §3.1）
+  4. 远端请求失败 fail-open：直接由 `config_models` 构造结果；`config_models` 也为空则回退当前硬编码 3 模型（保持现状兜底）
 - 其余（请求构造、SSE 解析、重试）不动。
 
 ### 3.5 引擎 context window 语义
 
-`ModelInfo.context_window = 0` 表示未知。`engine.rs resolve_model_context_window` 现有逻辑 `find(...).map(...)` 会把 0 当真实预算传给压缩模块——需加一层过滤：`filter(|m| m.context_window > 0)`，0 视为「未收录」保持配置预算不变。
+`ModelInfo.context_window = 0` 表示未知。`engine.rs resolve_model_context_window` 现有逻辑 `find(...).map(...)` 会把 0 当真实预算传给压缩模块——需加一层过滤：`filter(|m| m.context_window > 0)`，0 视为「未收录」保持配置预算不变。需要真实预算的模型（如 1M 上下文变体）在配置 `models` 中以表形式显式声明 `context_window`（§3.1）。
 
 ### 3.6 错误处理
 
@@ -176,7 +184,8 @@ match provider_config.protocol.as_str() {
   - SSE 解析：文本 delta、并行 tool_calls 分片聚合（多 index 交错）、finish_reason 三态映射、usage 提取、error 事件
   - 空 api_key 不发 Authorization header（mock 或构造层断言）
 - **anthropic list_models 单测**：远端成功解析、分页、失败回退 config_models、再兜底硬编码
-- **config 测试**：`api_key` 缺省时解析成功；`protocol` 缺失时解析失败（必填）；多 `[[providers]]` 共存
+- **models 元数据单测**（两个适配器共用逻辑则只测一处）：字符串/表两种 ModelEntry 解析、合并覆盖（配置覆盖远端、追加独有）、fail-open 回退
+- **config 测试**：`api_key` 缺省时解析成功；`protocol` 缺失时解析失败（必填）；models 混合字符串/表条目解析；多 `[[providers]]` 共存
 - **lib.rs 接线测试**：`protocol = "openai"` 注册为 OpenAiProvider、`protocol = "anthropic"` 注册为 AnthropicProvider、未知 protocol 跳过（可用 registry 查询 provider_id 验证）
 - **既有配置 fixture**：仓库内 parrot.toml 模板与测试用 TOML 全部补 `protocol` 字段
 - **全量**：`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check`
@@ -188,7 +197,7 @@ match provider_config.protocol.as_str() {
 | `crates/parrot-providers/src/openai.rs` | 新增：OpenAI 兼容适配器 |
 | `crates/parrot-providers/src/lib.rs` | 修改：register_all 按 protocol 分发 |
 | `crates/parrot-providers/src/anthropic.rs` | 修改：构造函数签名（含 provider_id）+ list_models 远端拉取 |
-| `crates/parrot-config/src/config.rs` | 修改：`protocol` 必填字段 + `api_key` serde default |
+| `crates/parrot-config/src/config.rs` | 修改：`protocol` 必填字段 + `api_key` serde default + `ModelEntry` 类型 |
 | `crates/parrot-core/src/engine.rs` | 修改：context_window=0 过滤 |
 | 仓库内 parrot.toml 模板 / 测试 TOML fixture | 修改：补 `protocol` 字段 |
 | 设计文档 §3 表格 | 无需更新（StreamEvent 映射未变） |
