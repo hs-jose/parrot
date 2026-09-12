@@ -284,7 +284,7 @@ async fn handle_key(
                             *input = TextArea::default();
                             app.slash_popup = None;
                             app.slash_dismissed_query = None;
-                            return slash::execute(cmd, app, conn).await;
+                            return slash::execute(cmd, None, app, conn).await;
                         }
                         // 无选中项（列表空）→ 不拦截，走普通 Enter 路径
                     }
@@ -388,12 +388,12 @@ async fn handle_command(
 ) -> Result<Option<bool>, Box<dyn std::error::Error>> {
     let trimmed = text.trim_start();
     if let Some(rest) = trimmed.strip_prefix('/') {
-        let cmd = rest.trim();
-        match slash::find(cmd) {
-            Some(c) => slash::execute(c, app, conn).await,
+        let (name, arg) = slash::parse_invocation(rest);
+        match slash::find(name) {
+            Some(c) => slash::execute(c, arg, app, conn).await,
             None => {
                 app.entries.push(app::ChatEntry::Info(format!(
-                    "未知命令 /{cmd}，输入 /help 查看可用命令"
+                    "未知命令 /{name}，输入 /help 查看可用命令"
                 )));
                 Ok(Some(false))
             }
@@ -483,6 +483,36 @@ mod tests {
         let mut app = app::App::new(SessionId::new_v4());
         let quit = handle_command(&mut app, &mut conn, "/exit").await.unwrap();
         assert_eq!(quit, Some(true));
+    }
+
+    #[tokio::test]
+    async fn handle_command_model_without_arg_pushes_usage_without_sending() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let quit = handle_command(&mut app, &mut conn, "/model").await.unwrap();
+        assert_eq!(quit, Some(false));
+        match app.entries.last() {
+            Some(app::ChatEntry::Info(s)) => assert!(s.contains("/model <name>"), "{s}"),
+            other => panic!("expected Info, got {other:?}"),
+        }
+        assert!(server_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_command_model_with_arg_sends_model_message() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        let quit = handle_command(&mut app, &mut conn, "/model gpt-5")
+            .await
+            .unwrap();
+        assert_eq!(quit, Some(false));
+        match server_rx.try_recv().unwrap() {
+            ClientMessage::Model { session_id, model } => {
+                assert_eq!(session_id, app.session_id);
+                assert_eq!(model, "gpt-5");
+            }
+            other => panic!("expected Model, got {other:?}"),
+        }
     }
 
     #[tokio::test]

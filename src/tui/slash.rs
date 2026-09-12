@@ -8,6 +8,7 @@ pub(crate) enum SlashAction {
     Usage,
     Abort,
     Mcp,
+    Model,
     Exit,
 }
 
@@ -43,6 +44,11 @@ pub(crate) const REGISTRY: &[SlashCommand] = &[
         action: SlashAction::Mcp,
     },
     SlashCommand {
+        name: "model",
+        description: "切换会话模型",
+        action: SlashAction::Model,
+    },
+    SlashCommand {
         name: "exit",
         description: "退出 Parrot",
         action: SlashAction::Exit,
@@ -63,9 +69,24 @@ pub(crate) fn filter(query: &str) -> Vec<&'static SlashCommand> {
         .collect()
 }
 
-/// 执行命令。返回 `Some(true)` 表示调用方应退出 TUI。
+/// 拆分命令行文本为命令名与参数：首个空白起算，参数取去空白后的剩余部分
+/// （空串视为无参数）。如 `model gpt-5` → `("model", Some("gpt-5"))`。
+pub(crate) fn parse_invocation(text: &str) -> (&str, Option<&str>) {
+    let text = text.trim();
+    match text.split_once(char::is_whitespace) {
+        Some((name, arg)) => {
+            let arg = arg.trim();
+            (name, (!arg.is_empty()).then_some(arg))
+        }
+        None => (text, None),
+    }
+}
+
+/// 执行命令。`arg` 为命令名之后的参数（无参数为 `None`）。返回
+/// `Some(true)` 表示调用方应退出 TUI。
 pub(crate) async fn execute(
     cmd: &SlashCommand,
+    arg: Option<&str>,
     app: &mut App,
     conn: &mut Connection,
 ) -> Result<Option<bool>, Box<dyn std::error::Error>> {
@@ -115,6 +136,23 @@ pub(crate) async fn execute(
             conn.sender.send(ClientMessage::ListMcpServers).await?;
             app.entries
                 .push(ChatEntry::Info("已请求 MCP server 状态…".into()));
+            Ok(Some(false))
+        }
+        SlashAction::Model => {
+            match arg {
+                Some(model) => {
+                    conn.sender
+                        .send(ClientMessage::Model {
+                            session_id: app.session_id,
+                            model: model.to_string(),
+                        })
+                        .await?;
+                }
+                None => {
+                    app.entries
+                        .push(ChatEntry::Info("用法: /model <name>".into()));
+                }
+            }
             Ok(Some(false))
         }
         SlashAction::Exit => Ok(Some(true)),
@@ -279,7 +317,10 @@ mod tests {
         let (mut conn, _rx) = test_conn();
         let mut app = App::new(SessionId::new_v4());
         let cmd = find("exit").unwrap();
-        assert_eq!(execute(cmd, &mut app, &mut conn).await.unwrap(), Some(true));
+        assert_eq!(
+            execute(cmd, None, &mut app, &mut conn).await.unwrap(),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -288,7 +329,7 @@ mod tests {
         let mut app = App::new(SessionId::new_v4());
         let cmd = find("help").unwrap();
         assert_eq!(
-            execute(cmd, &mut app, &mut conn).await.unwrap(),
+            execute(cmd, None, &mut app, &mut conn).await.unwrap(),
             Some(false)
         );
         match app.entries.last() {
@@ -313,7 +354,7 @@ mod tests {
         };
         let cmd = find("usage").unwrap();
         assert_eq!(
-            execute(cmd, &mut app, &mut conn).await.unwrap(),
+            execute(cmd, None, &mut app, &mut conn).await.unwrap(),
             Some(false)
         );
         match app.entries.last() {
@@ -328,7 +369,7 @@ mod tests {
         let mut app = App::new(SessionId::new_v4());
         let cmd = find("abort").unwrap();
         assert_eq!(
-            execute(cmd, &mut app, &mut conn).await.unwrap(),
+            execute(cmd, None, &mut app, &mut conn).await.unwrap(),
             Some(false)
         );
         assert!(matches!(app.entries.last(), Some(ChatEntry::Info(_))));
@@ -346,13 +387,61 @@ mod tests {
         });
         let cmd = find("abort").unwrap();
         assert_eq!(
-            execute(cmd, &mut app, &mut conn).await.unwrap(),
+            execute(cmd, None, &mut app, &mut conn).await.unwrap(),
             Some(false)
         );
         match server_rx.try_recv().unwrap() {
             ClientMessage::Abort { .. } => {}
             other => panic!("expected Abort, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_model_without_arg_pushes_usage_without_sending() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = App::new(SessionId::new_v4());
+        let cmd = find("model").unwrap();
+        assert_eq!(
+            execute(cmd, None, &mut app, &mut conn).await.unwrap(),
+            Some(false)
+        );
+        match app.entries.last() {
+            Some(ChatEntry::Info(s)) => assert!(s.contains("/model <name>"), "{s}"),
+            other => panic!("expected Info, got {other:?}"),
+        }
+        assert!(server_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_model_with_arg_sends_model_message() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = App::new(SessionId::new_v4());
+        let cmd = find("model").unwrap();
+        assert_eq!(
+            execute(cmd, Some("gpt-5"), &mut app, &mut conn)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        match server_rx.try_recv().unwrap() {
+            ClientMessage::Model { session_id, model } => {
+                assert_eq!(session_id, app.session_id);
+                assert_eq!(model, "gpt-5");
+            }
+            other => panic!("expected Model, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_invocation_splits_name_and_arg() {
+        assert_eq!(parse_invocation("model"), ("model", None));
+        assert_eq!(parse_invocation("model gpt-5"), ("model", Some("gpt-5")));
+        assert_eq!(
+            parse_invocation("model   gpt-5  "),
+            ("model", Some("gpt-5"))
+        );
+        assert_eq!(parse_invocation("model "), ("model", None));
+        assert_eq!(parse_invocation(""), ("", None));
     }
 
     #[test]

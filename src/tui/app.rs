@@ -256,6 +256,11 @@ impl App {
                     }
                 }
             }
+            ServerMessage::ModelSet { model, .. } => {
+                self.model = model.clone();
+                self.entries
+                    .push(ChatEntry::Info(format!("模型已切换为 {model}")));
+            }
             ServerMessage::McpNotice {
                 id,
                 state,
@@ -839,6 +844,23 @@ mod tests {
                 assert!(text.contains("mock") && text.contains("3"), "got: {text}");
             }
             other => panic!("expected Info, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_set_updates_model_and_pushes_info() {
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
+        app.apply_server_message(ServerMessage::ModelSet {
+            session_id: sid_v,
+            model: "gpt-5".into(),
+        });
+        assert_eq!(app.model, "gpt-5");
+        match app.entries.last() {
+            Some(ChatEntry::Info(text)) => {
+                assert!(text.contains("模型已切换为 gpt-5"), "{text}")
+            }
+            other => panic!("expected Info, got {other:?}"),
         }
     }
 
