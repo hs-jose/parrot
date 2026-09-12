@@ -516,6 +516,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_command_model_mid_turn_pushes_info_without_sending() {
+        use parrot_protocol::agent_event::AgentEvent;
+
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = app::App::new(SessionId::new_v4());
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: app.session_id,
+            turn_id: uuid::Uuid::new_v4(),
+            user_message: "hi".into(),
+        });
+        let quit = handle_command(&mut app, &mut conn, "/model gpt-5")
+            .await
+            .unwrap();
+        assert_eq!(quit, Some(false));
+        match app.entries.last() {
+            Some(app::ChatEntry::Info(s)) => {
+                assert!(s.contains("当前轮进行中，请稍后再切换"), "{s}");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+        assert!(server_rx.try_recv().is_err(), "轮中不得发送 Model");
+    }
+
+    #[tokio::test]
     async fn handle_command_unknown_pushes_info() {
         let (mut conn, _server_rx) = test_conn();
         let mut app = app::App::new(SessionId::new_v4());

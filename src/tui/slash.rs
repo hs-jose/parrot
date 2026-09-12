@@ -141,12 +141,17 @@ pub(crate) async fn execute(
         SlashAction::Model => {
             match arg {
                 Some(model) => {
-                    conn.sender
-                        .send(ClientMessage::Model {
-                            session_id: app.session_id,
-                            model: model.to_string(),
-                        })
-                        .await?;
+                    if app.is_turn_active() {
+                        app.entries
+                            .push(ChatEntry::Info("当前轮进行中，请稍后再切换".into()));
+                    } else {
+                        conn.sender
+                            .send(ClientMessage::Model {
+                                session_id: app.session_id,
+                                model: model.to_string(),
+                            })
+                            .await?;
+                    }
                 }
                 None => {
                     app.entries
@@ -430,6 +435,31 @@ mod tests {
             }
             other => panic!("expected Model, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_model_mid_turn_pushes_info_without_sending() {
+        let (mut conn, mut server_rx) = test_conn();
+        let mut app = App::new(SessionId::new_v4());
+        app.apply_event(AgentEvent::TurnStart {
+            session_id: app.session_id,
+            turn_id: uuid::Uuid::new_v4(),
+            user_message: "hi".into(),
+        });
+        let cmd = find("model").unwrap();
+        assert_eq!(
+            execute(cmd, Some("gpt-5"), &mut app, &mut conn)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        match app.entries.last() {
+            Some(ChatEntry::Info(s)) => {
+                assert!(s.contains("当前轮进行中，请稍后再切换"), "{s}");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+        assert!(server_rx.try_recv().is_err(), "轮中不得发送 Model");
     }
 
     #[test]
