@@ -29,7 +29,7 @@ runtime 新 arm：校验会话存在 → 转发 `SessionCmd::SetModel` → 回 `
 
 ### 2.4 TUI
 
-- `/model <name>`：**turn 活跃时**（`app.is_turn_active()`）push Info「当前轮进行中，请稍后再切换」且不发送；否则发送 `ClientMessage::Model`；daemon `ModelSet` 到达时 push Info 条目「model 已切换为 X」并更新状态栏 model
+- `/model <name>`：**busy 时**（`app.is_turn_active()` 或本端已发送 Chat 至 `TurnStart/TurnEnd/AgentEnd` 到达前的 `pending_turn` 窗口——覆盖 compaction 与 turn_start hook 的 pre-TurnStart 时段）push Info「当前轮进行中，请稍后再切换」且不发送；否则发送 `ClientMessage::Model`；daemon `ModelSet` 到达时 push Info 条目「model 已切换为 X」并更新状态栏 model
 - 帮助文本更新：不枚举（用户已重写 /help；命令发现走弹窗 REGISTRY）
 
 ### 2.5 非目标
