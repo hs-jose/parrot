@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub mod anthropic;
 pub mod models;
+pub mod openai;
 pub mod retry;
 
 pub async fn register_all(registry: &ProviderRegistry, config: &AppConfig) {
