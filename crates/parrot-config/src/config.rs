@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub struct AppConfig {
     pub daemon: DaemonConfig,
     /// 单 provider 表（`[provider]`）。缺失 ⇒ Default（id 为空，
-    /// register_all 时跳过，等价于旧的空 providers 数组）。
+    /// register_provider 时跳过，等价于旧的空 providers 数组）。
     #[serde(default)]
     pub provider: ProviderConfig,
     pub tools: ToolsConfig,
@@ -934,8 +934,8 @@ keep_recent_turns = 6
     #[test]
     fn legacy_providers_array_is_silently_ignored() {
         // serde 默认忽略 unknown fields：旧 `[[providers]]` 数组会被静默
-        // 忽略，provider 落到 Default（id 空）⇒ register 时跳过。
-        // Task 3 在 register_all 侧补 "空 id ⇒ warn + skip" 行为。
+        // 忽略，provider 落到 Default（id 空）⇒ register_provider 跳过
+        // （空 id ⇒ warn + skip，已落地）。
         let toml = r#"
 [daemon]
 host = "127.0.0.1"
