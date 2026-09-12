@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parrot_config::ModelEntry;
+use parrot_config::{ModelEntry, ThinkingConfig};
 use parrot_core::error::ProviderError;
 use parrot_core::provider::{ChatStream, LlmProvider, ProviderStopReason, ProviderStreamEvent};
 use parrot_core::tool::ToolDefinition;
@@ -24,6 +24,8 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
@@ -33,6 +35,13 @@ struct AnthropicRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequences: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicThinking {
+    #[serde(rename = "type")]
+    thinking_type: String,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,11 +186,16 @@ impl AnthropicProvider {
         system: Option<String>,
         config: &GenerateConfig,
         stream: Option<bool>,
+        thinking: Option<&ThinkingConfig>,
     ) -> AnthropicRequest {
         AnthropicRequest {
             model: model.to_string(),
             messages,
             max_tokens: config.max_tokens.unwrap_or(8192),
+            thinking: thinking.map(|t| AnthropicThinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: t.budget_tokens,
+            }),
             system,
             tools,
             stream,
@@ -409,6 +423,8 @@ impl LlmProvider for AnthropicProvider {
             system,
             config,
             Some(true),
+            crate::models::find_detailed(&self.config_models, model)
+                .and_then(|d| d.thinking.as_ref()),
         );
 
         let response = self.send_request(&request).await?;
@@ -442,6 +458,8 @@ impl LlmProvider for AnthropicProvider {
             system,
             config,
             None,
+            crate::models::find_detailed(&self.config_models, model)
+                .and_then(|d| d.thinking.as_ref()),
         );
 
         let response = self.send_request(&request).await?;
@@ -751,5 +769,35 @@ mod tests {
         assert_eq!(models.len(), 3);
         assert!(models.iter().all(|m| m.provider == "anthropic"));
         assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn build_request_injects_thinking_when_present() {
+        let thinking = ThinkingConfig {
+            budget_tokens: 64_000,
+        };
+        let config = GenerateConfig::default();
+        let req = AnthropicProvider::build_request(
+            "m",
+            vec![],
+            vec![],
+            None,
+            &config,
+            None,
+            Some(&thinking),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 64_000})
+        );
+    }
+
+    #[test]
+    fn build_request_omits_thinking_when_absent() {
+        let config = GenerateConfig::default();
+        let req = AnthropicProvider::build_request("m", vec![], vec![], None, &config, None, None);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(value.get("thinking").is_none());
     }
 }
