@@ -46,28 +46,42 @@ Parrot 目前只有 Anthropic 一个 LLM provider 实现。`parrot-core` 已预�
 
 ### 3.1 配置（parrot-config）
 
-- `ProviderConfig.api_key` 加 `#[serde(default)]`——Ollama 等本地服务无需密钥，空字符串表示免鉴权。
+- `ProviderConfig` 增加 **必填** 字段 `protocol: String`，取值 `"anthropic"` | `"openai"`（OpenAI 兼容）。缺省时 TOML 反序列化直接报错，迫使配置显式声明协议。
+- `id` 只做唯一标识（provider_id、日志、model 路由），不再承担协议分发职责。
+- `api_key` 加 `#[serde(default)]`——Ollama 等本地服务无需密钥，空字符串表示免鉴权。
 - 其余字段不变。多 provider 即多个 `[[providers]]` 条目。
 
 ```toml
 [[providers]]
 id = "anthropic"
+protocol = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 default_model = "claude-sonnet-4-6"
 models = ["claude-sonnet-4-6", "claude-opus-4"]
 
 [[providers]]
 id = "deepseek"
+protocol = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "${DEEPSEEK_API_KEY}"
 default_model = "deepseek-chat"
 
 [[providers]]
+id = "claude-proxy"
+protocol = "anthropic"
+base_url = "https://my-proxy.example.com"
+api_key = "${KEY}"
+default_model = "claude-sonnet-4-6"
+
+[[providers]]
 id = "ollama"
+protocol = "openai"
 base_url = "http://localhost:11434/v1"
 default_model = "qwen3"
 models = ["qwen3", "llama4"]
 ```
+
+**兼容性说明**：`protocol` 必填意味着现有配置文件与打包模板需同步补上该字段（仓库内模板与测试 fixture 一起改）。这是有意的破坏性变更——显式协议声明避免 id 推断的歧义（如给 Anthropic 代理配自定义 id 时会被误路由）。
 
 注意：OpenAI 官方端点是 `https://api.openai.com/v1`（`base_url` 需含 `/v1`，适配器不再追加）；Anthropic 保持 `base_url` 不含 `/v1`（适配器内拼 `/v1/messages`），维持现有行为不变。
 
@@ -122,14 +136,16 @@ pub struct OpenAiProvider {
 ### 3.3 register_all 接线（parrot-providers/src/lib.rs）
 
 ```rust
-match provider_config.id.as_str() {
-    "anthropic" => /* AnthropicProvider（现状不变） */,
-    other => /* OpenAiProvider::new(other, api_key, base_url, models) */,
+match provider_config.protocol.as_str() {
+    "anthropic" => /* AnthropicProvider::new(api_key, base_url, models, id) */,
+    "openai" => /* OpenAiProvider::new(id, api_key, base_url, models) */,
+    other => tracing::warn!("Unknown protocol: {}, skipping", other),
 }
 ```
 
-- 删除 `"openai" => warn not implemented` 占位与 `unknown provider id` warn。
-- 任意非 anthropic 的 id 都走 OpenAI 兼容适配器，`id` 即 `provider_id`。用户配置错误的 id（拼错协议名）不再静默跳过，而是在请求时以 API 错误暴露——文档里说明。
+- 删除 `"openai" => warn not implemented` 占位与按 id 分发的 `unknown provider id` warn。
+- `protocol` 决定适配器，`id` 作为 `provider_id` 传入构造函数（anthropic 适配器的 `provider_id()` 也从硬编码 `"anthropic"` 改为返回配置 id，支持 claude-proxy 场景）。
+- 未知 `protocol` 值在注册时 warn 并跳过（配置错误的暴露点提前到 daemon 启动日志，而不是首次请求时）。
 
 ### 3.4 Anthropic 对齐（anthropic.rs 小改）
 
@@ -160,8 +176,9 @@ match provider_config.id.as_str() {
   - SSE 解析：文本 delta、并行 tool_calls 分片聚合（多 index 交错）、finish_reason 三态映射、usage 提取、error 事件
   - 空 api_key 不发 Authorization header（mock 或构造层断言）
 - **anthropic list_models 单测**：远端成功解析、分页、失败回退 config_models、再兜底硬编码
-- **config 测试**：`api_key` 缺省时解析成功；多 `[[providers]]` 共存
-- **lib.rs 接线测试**：非 anthropic id 注册为 OpenAiProvider（可用 registry 查询 provider_id 验证）
+- **config 测试**：`api_key` 缺省时解析成功；`protocol` 缺失时解析失败（必填）；多 `[[providers]]` 共存
+- **lib.rs 接线测试**：`protocol = "openai"` 注册为 OpenAiProvider、`protocol = "anthropic"` 注册为 AnthropicProvider、未知 protocol 跳过（可用 registry 查询 provider_id 验证）
+- **既有配置 fixture**：仓库内 parrot.toml 模板与测试用 TOML 全部补 `protocol` 字段
 - **全量**：`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check`
 
 ## 5. 文件清单
@@ -169,8 +186,9 @@ match provider_config.id.as_str() {
 | 文件 | 动作 |
 |---|---|
 | `crates/parrot-providers/src/openai.rs` | 新增：OpenAI 兼容适配器 |
-| `crates/parrot-providers/src/lib.rs` | 修改：register_all 接线 |
-| `crates/parrot-providers/src/anthropic.rs` | 修改：构造函数签名 + list_models 远端拉取 |
-| `crates/parrot-config/src/config.rs` | 修改：`api_key` serde default |
+| `crates/parrot-providers/src/lib.rs` | 修改：register_all 按 protocol 分发 |
+| `crates/parrot-providers/src/anthropic.rs` | 修改：构造函数签名（含 provider_id）+ list_models 远端拉取 |
+| `crates/parrot-config/src/config.rs` | 修改：`protocol` 必填字段 + `api_key` serde default |
 | `crates/parrot-core/src/engine.rs` | 修改：context_window=0 过滤 |
+| 仓库内 parrot.toml 模板 / 测试 TOML fixture | 修改：补 `protocol` 字段 |
 | 设计文档 §3 表格 | 无需更新（StreamEvent 映射未变） |
