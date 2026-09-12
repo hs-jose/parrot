@@ -42,7 +42,7 @@ pub struct DetailedModelEntry {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
-    /// 思考模式扩展点（anthropic 协议）。本期只解析保存，不注入请求。
+    /// 思考模式扩展点（anthropic 协议）。注入 anthropic 请求体；reasoning_effort 注入 openai 请求体。
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
     /// effort 扩展点（openai 协议）。本期只解析保存，不注入请求。

@@ -1,4 +1,4 @@
-use parrot_config::AppConfig;
+use parrot_config::{AppConfig, ModelEntry};
 use parrot_core::provider::ProviderRegistry;
 use std::sync::Arc;
 
@@ -18,6 +18,26 @@ pub async fn register_all(registry: &ProviderRegistry, config: &AppConfig) {
                 .map(|m| m.id().to_string())
                 .collect()
         };
+        for entry in &provider_config.models {
+            let ModelEntry::Detailed(d) = entry else {
+                continue;
+            };
+            match provider_config.protocol.as_str() {
+                "anthropic" if d.reasoning_effort.is_some() => {
+                    tracing::warn!(
+                        "provider {}: reasoning_effort 仅 openai 协议生效，已忽略",
+                        provider_config.id
+                    );
+                }
+                "openai" if d.thinking.is_some() => {
+                    tracing::warn!(
+                        "thinking 仅 anthropic 协议生效，已忽略（provider {}）",
+                        provider_config.id
+                    );
+                }
+                _ => {}
+            }
+        }
         match provider_config.protocol.as_str() {
             "anthropic" => {
                 let provider = crate::anthropic::AnthropicProvider::new(
@@ -94,5 +114,43 @@ mod tests {
         config.providers.push(provider("x", "gemini"));
         register_all(&registry, &config).await;
         assert!(registry.provider_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_protocol_fields_warn_but_register() {
+        let registry = ProviderRegistry::new();
+        let mut config = AppConfig::default_config();
+        // anthropic 协议配 reasoning_effort：warn 但照常注册
+        let mut p = provider("a", "anthropic");
+        p.models = vec![parrot_config::ModelEntry::Detailed(
+            parrot_config::config::DetailedModelEntry {
+                id: "a-model".into(),
+                name: None,
+                context_window: None,
+                max_output_tokens: None,
+                thinking: None,
+                reasoning_effort: Some(parrot_config::ReasoningEffort::Low),
+            },
+        )];
+        config.providers.push(p);
+        // openai 协议配 thinking：同理
+        let mut q = provider("b", "openai");
+        q.models = vec![parrot_config::ModelEntry::Detailed(
+            parrot_config::config::DetailedModelEntry {
+                id: "b-model".into(),
+                name: None,
+                context_window: None,
+                max_output_tokens: None,
+                thinking: Some(parrot_config::ThinkingConfig {
+                    budget_tokens: 1024,
+                }),
+                reasoning_effort: None,
+            },
+        )];
+        config.providers.push(q);
+        register_all(&registry, &config).await;
+        assert_eq!(registry.provider_ids().await.len(), 2);
+        assert!(registry.resolve("a-model").await.is_some());
+        assert!(registry.resolve("b-model").await.is_some());
     }
 }
