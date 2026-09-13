@@ -2,7 +2,7 @@ use crate::compaction::{
     apply_summary, build_summary_request, plan_compaction, wrap_summary, ContextLimits,
 };
 use crate::context::ContextManager;
-use crate::error::AgentError;
+use crate::error::{AgentError, ProviderError};
 use crate::event_log::EventLog;
 use crate::hooks::{HookEvent, HookExecution, HookRegistry, HookResult};
 use crate::provider::{ProviderRegistry, ProviderStreamEvent};
@@ -545,6 +545,7 @@ impl ReActEngine {
         let mut msg_stop = MessageStopReason::EndTurn;
         let mut msg_usage = Usage::default();
         let mut aborted = false;
+        let mut finished = false;
 
         loop {
             tokio::select! {
@@ -618,6 +619,7 @@ impl ReActEngine {
                         ProviderStreamEvent::Finish { stop_reason, usage } => {
                             msg_stop = stop_reason.into();
                             msg_usage = usage;
+                            finished = true;
                             break;
                         }
                     }
@@ -627,6 +629,12 @@ impl ReActEngine {
 
         if aborted {
             return Err(AgentError::Aborted);
+        }
+
+        if !finished {
+            return Err(AgentError::Provider(ProviderError::StreamError(
+                "stream ended without Finish".into(),
+            )));
         }
 
         let tool_calls_info: Vec<ToolCallInfo> = tool_calls

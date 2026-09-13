@@ -1665,6 +1665,136 @@ async fn set_model_mid_turn_is_ignored() {
     );
 }
 
+/// Provider whose stream channel closes without ever sending `Finish`
+/// （模拟 provider 流中 JSON 错误导致 parse 任务退出、或网络读错误）。
+struct DroppingStreamProvider;
+
+#[async_trait]
+impl LlmProvider for DroppingStreamProvider {
+    fn provider_id(&self) -> &str {
+        "mock"
+    }
+
+    async fn list_models(
+        &self,
+    ) -> Result<Vec<parrot_core::types::ModelInfo>, parrot_core::error::ProviderError> {
+        Ok(vec![parrot_core::types::ModelInfo {
+            id: "mock-model".to_string(),
+            name: "Mock Model".to_string(),
+            provider: "mock".to_string(),
+            context_window: 200_000,
+            max_output_tokens: 8192,
+        }])
+    }
+
+    async fn chat_stream(
+        &self,
+        _model: &str,
+        _messages: &[parrot_core::types::ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<ChatStream, parrot_core::error::ProviderError> {
+        let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(16);
+        tokio::spawn(async move {
+            tx.send(ProviderStreamEvent::TextDelta {
+                delta: "partial".to_string(),
+            })
+            .await
+            .ok();
+            // tx dropped here：通道关闭但从未发送 Finish。
+        });
+        Ok(ChatStream { inner: rx })
+    }
+
+    async fn chat(
+        &self,
+        _model: &str,
+        _messages: &[parrot_core::types::ChatMessage],
+        _tools: &[ToolDefinition],
+        _config: &GenerateConfig,
+    ) -> Result<parrot_core::types::ChatMessage, parrot_core::error::ProviderError> {
+        Ok(parrot_core::types::ChatMessage {
+            role: parrot_core::types::ChatRole::Assistant,
+            content: "ok".to_string(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        })
+    }
+}
+
+/// 流通道关闭而未发 Finish 时，turn 必须以 `TurnStopReason::Error` 结束，
+/// 而不是把部分文本当作正常 `MessageEnd{EndTurn}` 静默截断。
+#[tokio::test]
+async fn stream_closing_without_finish_ends_turn_with_error() {
+    let (_tmp, working_dir, data_dir) = temp_dirs();
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let mock = Arc::new(DroppingStreamProvider);
+    let provider: Arc<dyn LlmProvider> = mock.clone();
+    let provider_registry = Arc::new(ProviderRegistry::new());
+    provider_registry
+        .register(provider, vec!["mock-model".to_string()])
+        .await;
+
+    let config = GenerateConfig {
+        model: "mock-model".to_string(),
+        temperature: None,
+        max_tokens: Some(8192),
+        stop_sequences: None,
+    };
+    let engine = ReActEngine::new(
+        uuid::Uuid::new_v4(),
+        Arc::clone(&tool_registry),
+        Arc::clone(&provider_registry),
+        config,
+        Some("sys".to_string()),
+        data_dir,
+        working_dir,
+    );
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let engine_task = tokio::spawn(async move { engine.run(cmd_rx, event_tx).await });
+
+    cmd_tx
+        .send(SessionCmd::Chat {
+            message: "q1".to_string(),
+        })
+        .await
+        .unwrap();
+    let events = collect_until_turn_end(&mut event_rx).await;
+
+    drop(cmd_tx);
+    drain_until_agent_end(&mut event_rx).await;
+    let _ = engine_task.await;
+
+    let stop = events
+        .iter()
+        .find_map(|ev| match ev {
+            AgentEvent::TurnEnd { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("TurnEnd present");
+    assert!(
+        matches!(stop, TurnStopReason::Error(_)),
+        "turn must end with Error, got: {:?}",
+        stop
+    );
+
+    assert!(
+        !events.iter().any(|ev| matches!(
+            ev,
+            AgentEvent::MessageEnd {
+                stop_reason: MessageStopReason::EndTurn,
+                ..
+            }
+        )),
+        "no MessageEnd{{EndTurn}} may be emitted for a stream that never finished: {:?}",
+        events.iter().map(variant_name).collect::<Vec<_>>()
+    );
+}
+
 /// Switching model at a turn boundary must also switch the model's context
 /// size config: the prune budget is recomputed from the new model's window.
 /// `max_history_tokens` is huge here, so only the model window can bind.
