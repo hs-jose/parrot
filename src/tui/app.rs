@@ -240,10 +240,18 @@ impl App {
             ServerMessage::AgentEvent { event } => {
                 self.apply_event(event);
             }
-            ServerMessage::Error { message, .. } => {
+            ServerMessage::Error {
+                message,
+                session_id,
+                ..
+            } => {
                 // Chat 被 daemon 拒绝时不会有任何 turn 事件，不清 pending_turn
                 // 会永久卡住 /model 拦截；错误路径下放行（宁冒提前解锁的窄窗口）。
-                self.pending_turn = false;
+                // 广播（无 session_id）或匹配本会话的错误才清；其他会话的
+                // 错误与本会话的 pending 状态无关。
+                if session_id.is_none() || session_id == Some(self.session_id) {
+                    self.pending_turn = false;
+                }
                 self.entries.push(ChatEntry::Error(message));
             }
             ServerMessage::ShellResult {
@@ -926,7 +934,8 @@ mod tests {
 
     #[test]
     fn pending_turn_cleared_by_server_error() {
-        let mut app = App::new(sid());
+        let sid_v = sid();
+        let mut app = App::new(sid_v);
         app.pending_turn = true;
         app.apply_server_message(ServerMessage::Error {
             session_id: None,
@@ -937,6 +946,24 @@ mod tests {
             !app.pending_turn,
             "Error 应清除 pending_turn，避免 /model 永久被拦截"
         );
+
+        // 匹配本会话的 Error 同样清除。
+        app.pending_turn = true;
+        app.apply_server_message(ServerMessage::Error {
+            session_id: Some(sid_v),
+            code: parrot_protocol::types::ErrorCode::InvalidRequest,
+            message: "chat rejected".into(),
+        });
+        assert!(!app.pending_turn, "匹配会话的 Error 应清除 pending_turn");
+
+        // 其他会话的 Error 不得误清本会话的 pending_turn。
+        app.pending_turn = true;
+        app.apply_server_message(ServerMessage::Error {
+            session_id: Some(Uuid::new_v4()),
+            code: parrot_protocol::types::ErrorCode::InvalidRequest,
+            message: "other session error".into(),
+        });
+        assert!(app.pending_turn, "其他会话的 Error 不得清除 pending_turn");
     }
 
     #[test]
