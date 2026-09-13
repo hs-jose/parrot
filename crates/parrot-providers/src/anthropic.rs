@@ -237,6 +237,7 @@ impl AnthropicProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
+                .map(|s| s.saturating_mul(1000))
                 .unwrap_or(5000);
             return Err(ProviderError::RateLimited {
                 retry_after_ms: retry_after,
@@ -312,6 +313,7 @@ impl AnthropicProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
+                .map(|s| s.saturating_mul(1000))
                 .unwrap_or(5000);
             return Err(ProviderError::RateLimited {
                 retry_after_ms: retry_after,
