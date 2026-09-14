@@ -234,7 +234,7 @@ async fn handle_key(
 ) -> Result<Option<bool>, Box<dyn std::error::Error>> {
     match app.mode {
         Mode::ConfirmPending => match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 if let Some((id, decision)) = app.confirm_decision(ConfirmDecision::Approve) {
                     conn.sender
                         .send(ClientMessage::ConfirmToolCall {
@@ -625,6 +625,45 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[tokio::test]
+    async fn confirm_pending_enter_approves_and_sends() {
+        use parrot_protocol::agent_event::AgentEvent;
+        let (mut conn, mut server_rx) = test_conn();
+        let sid = SessionId::new_v4();
+        let mut app = app::App::new(sid);
+        app.apply_event(AgentEvent::ToolConfirmRequired {
+            session_id: sid,
+            turn_id: uuid::Uuid::new_v4(),
+            tool_call_id: "tc_1".into(),
+            tool_name: "shell_exec".into(),
+            arguments: serde_json::json!({"cmd": "ls"}),
+        });
+        assert_eq!(app.mode, app::Mode::ConfirmPending);
+
+        // Enter = approve
+        let r = handle_key(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &mut TextArea::default(),
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, None);
+        let msg = server_rx.try_recv().expect("ConfirmToolCall sent");
+        match msg {
+            ClientMessage::ConfirmToolCall {
+                tool_id, decision, ..
+            } => {
+                assert_eq!(tool_id, "tc_1");
+                assert_eq!(decision, ConfirmDecision::Approve);
+            }
+            other => panic!("expected ConfirmToolCall, got {:?}", other),
+        }
+        // 弹窗已消费，回 Normal
+        assert_eq!(app.mode, app::Mode::Normal);
     }
 
     /// 弹窗激活态的测试环境：输入 "/’" 并 sync。rx 一并返回以保持

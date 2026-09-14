@@ -616,7 +616,7 @@ fn draw_confirm_modal(f: &mut ratatui::Frame<'_>, area: Rect, text: &str) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Confirmation (y=approve / n=reject / Esc=reject) "),
+                .title(" Confirmation (y/Enter=approve / n/Esc=reject) "),
         )
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
