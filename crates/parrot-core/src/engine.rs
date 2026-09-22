@@ -1071,11 +1071,17 @@ impl Drop for AgentEndGuard {
         }
         let usage = self.total_usage.lock().unwrap().clone();
         let reason = self.reason.lock().unwrap().clone();
-        let _ = self.event_tx.try_send(AgentEvent::AgentEnd {
+        let event = AgentEvent::AgentEnd {
             session_id: self.session_id,
             reason,
             total_usage: usage,
-        });
+        };
+        // 先落后发：resume 靠 events.log 区分正常结束与崩溃。
+        // Drop 内禁止 panic：append 失败只 warn。
+        if let Err(e) = self.event_log.append(event.clone()) {
+            tracing::warn!(error = ?e, "failed to persist AgentEnd on drop");
+        }
+        let _ = self.event_tx.try_send(event);
     }
 }
 
@@ -1097,6 +1103,8 @@ fn model_context_window(models: &[ModelInfo], model: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parrot_protocol::agent_event::PersistedAgentEvent;
+    use tempfile::TempDir;
 
     #[test]
     fn context_budget_takes_min_of_config_and_model_window() {
@@ -1104,6 +1112,94 @@ mod tests {
         assert_eq!(context_budget(100_000, Some(200_000)), 100_000);
         assert_eq!(context_budget(2_000_000, Some(200_000)), 200_000);
         assert_eq!(context_budget(50, Some(200_000)), 50);
+    }
+
+    fn test_guard(dir: std::path::PathBuf) -> (AgentEndGuard, mpsc::Receiver<AgentEvent>) {
+        let (tx, rx) = mpsc::channel(8);
+        let guard = AgentEndGuard {
+            session_id: Uuid::new_v4(),
+            event_log: EventLog::new(dir),
+            event_tx: tx,
+            fired: false,
+            total_usage: Arc::new(Mutex::new(Usage::default())),
+            reason: Arc::new(Mutex::new(AgentEndReason::ClientDisconnect)),
+            hooks: Arc::new(HookRegistry::empty()),
+            working_dir: std::path::PathBuf::from("."),
+        };
+        (guard, rx)
+    }
+
+    fn is_agent_end(ev: &PersistedAgentEvent) -> bool {
+        matches!(ev.event, AgentEvent::AgentEnd { .. })
+    }
+
+    #[test]
+    fn drop_persists_agent_end_when_not_fired() {
+        let tmp = TempDir::new().expect("temp dir");
+        let dir = tmp.path().to_path_buf();
+        let (guard, _rx) = test_guard(dir.clone());
+        drop(guard);
+
+        let log = EventLog::new(dir);
+        let events = log.replay().expect("replay");
+        assert!(!events.is_empty(), "expected at least AgentEnd");
+        assert!(
+            is_agent_end(events.last().unwrap()),
+            "last event must be AgentEnd: {:?}",
+            events.last().unwrap().event
+        );
+    }
+
+    #[test]
+    fn drop_appends_after_existing_events_seq_continuous() {
+        let tmp = TempDir::new().expect("temp dir");
+        let dir = tmp.path().to_path_buf();
+        let (mut guard, _rx) = test_guard(dir.clone());
+
+        let start = AgentEvent::AgentStart {
+            session_id: guard.session_id,
+            model: "m".into(),
+            provider: "p".into(),
+            system_prompt_hash: String::new(),
+            resumed_from_seq: None,
+        };
+        guard.event_log.append(start).expect("append start");
+        let after_first = guard.event_log.replay().expect("replay mid");
+        let prev_seq = after_first.last().unwrap().seq;
+
+        drop(guard);
+
+        let events = EventLog::new(dir).replay().expect("replay final");
+        let last = events.last().unwrap();
+        assert!(is_agent_end(last));
+        assert_eq!(last.seq, prev_seq + 1, "AgentEnd seq must continue");
+    }
+
+    #[tokio::test]
+    async fn fire_and_drop_then_drop_does_not_duplicate() {
+        let tmp = TempDir::new().expect("temp dir");
+        let dir = tmp.path().to_path_buf();
+        let (guard, _rx) = test_guard(dir.clone());
+
+        guard.fire_and_drop().await;
+        // fire_and_drop 消耗 guard，返回时 Drop 见 fired=true 必须 no-op。
+
+        let events = EventLog::new(dir).replay().expect("replay");
+        let agent_ends = events.iter().filter(|e| is_agent_end(e)).count();
+        assert_eq!(agent_ends, 1, "exactly one AgentEnd after fire_and_drop");
+    }
+
+    #[test]
+    fn drop_persists_even_if_channel_closed() {
+        let tmp = TempDir::new().expect("temp dir");
+        let dir = tmp.path().to_path_buf();
+        let (guard, rx) = test_guard(dir.clone());
+        drop(rx); // 关闭接收端：try_send 必失败，落盘仍须成功
+
+        drop(guard);
+
+        let events = EventLog::new(dir).replay().expect("replay");
+        assert!(is_agent_end(events.last().unwrap()));
     }
 }
 
