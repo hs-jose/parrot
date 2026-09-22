@@ -161,6 +161,22 @@ impl ReActEngine {
             event_log = event_log.with_start_seq(self.resume_seq_offset);
         }
 
+        // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
+        // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
+        // event_log 一并移入 guard：Drop 与 fire_and_drop 共用同一实例/seq。
+        let total_usage: Arc<Mutex<Usage>> = Arc::new(Mutex::new(Usage::default()));
+        let event_tx_for_guard = event_tx.clone();
+        let mut guard = AgentEndGuard {
+            session_id,
+            event_log,
+            event_tx: event_tx_for_guard,
+            fired: false,
+            total_usage: Arc::clone(&total_usage),
+            reason: Arc::clone(&self.end_reason),
+            hooks: Arc::clone(&self.hooks),
+            working_dir: self.working_dir.clone(),
+        };
+
         let provider_id = self.resolve_provider_id().await;
         let agent_start = AgentEvent::AgentStart {
             session_id,
@@ -169,7 +185,7 @@ impl ReActEngine {
             system_prompt_hash: self.system_prompt_hash.clone(),
             resumed_from_seq: self.resumed_from_seq,
         };
-        emit_and_persist(&event_tx, &mut event_log, agent_start).await;
+        emit_and_persist(&event_tx, &mut guard.event_log, agent_start).await;
 
         let (_result, execs) = self
             .hooks
@@ -191,7 +207,7 @@ impl ReActEngine {
                 session_id,
                 issue: issue.clone(),
             };
-            emit_and_persist(&event_tx, &mut event_log, warning).await;
+            emit_and_persist(&event_tx, &mut guard.event_log, warning).await;
             tracing::warn!(session_id = %session_id, kind = ?issue.kind, "replay integrity warning emitted");
         }
 
@@ -201,20 +217,6 @@ impl ReActEngine {
         let mut budget = context_budget(self.context_limits.max_history_tokens, model_window);
         let mut context_manager =
             ContextManager::new(budget, self.context_limits.keep_recent_turns);
-
-        // RAII 守卫：确保 AgentEnd 即使 panic 也发。临界区都是 clone 取值后
-        // 立刻丢锁，不在 await 间持锁，所以用 std::sync::Mutex 是安全的。
-        let total_usage: Arc<Mutex<Usage>> = Arc::new(Mutex::new(Usage::default()));
-        let event_tx_for_guard = event_tx.clone();
-        let guard = AgentEndGuard {
-            session_id,
-            event_tx: event_tx_for_guard,
-            fired: false,
-            total_usage: Arc::clone(&total_usage),
-            reason: Arc::clone(&self.end_reason),
-            hooks: Arc::clone(&self.hooks),
-            working_dir: self.working_dir.clone(),
-        };
 
         loop {
             match cmd_rx.recv().await {
@@ -240,7 +242,7 @@ impl ReActEngine {
                                 stop_reason: TurnStopReason::BlockedHook(reason.clone()),
                                 usage: Usage::default(),
                             };
-                            emit_and_persist(&event_tx, &mut event_log, turn_end).await;
+                            emit_and_persist(&event_tx, &mut guard.event_log, turn_end).await;
                             continue;
                         }
                         HookResult::Inject { messages } => context.extend(messages),
@@ -248,14 +250,20 @@ impl ReActEngine {
                     }
                     // 压缩检查在 TurnStart 事件之前(spec §3.1):避免
                     // CompactionSummary 落入半成品 turn 被 resume 截断丢弃。
-                    self.maybe_compact(&mut context, turn_id, budget, &event_tx, &mut event_log)
-                        .await;
+                    self.maybe_compact(
+                        &mut context,
+                        turn_id,
+                        budget,
+                        &event_tx,
+                        &mut guard.event_log,
+                    )
+                    .await;
                     let turn_start = AgentEvent::TurnStart {
                         session_id,
                         turn_id,
                         user_message: message.clone(),
                     };
-                    emit_and_persist(&event_tx, &mut event_log, turn_start).await;
+                    emit_and_persist(&event_tx, &mut guard.event_log, turn_start).await;
 
                     let turn_result = self
                         .handle_turn(
@@ -264,7 +272,7 @@ impl ReActEngine {
                             &mut context,
                             &context_manager,
                             &event_tx,
-                            &mut event_log,
+                            &mut guard.event_log,
                             &mut cmd_rx,
                         )
                         .await;
@@ -290,7 +298,7 @@ impl ReActEngine {
                         stop_reason: stop_reason.clone(),
                         usage: turn_usage.clone(),
                     };
-                    emit_and_persist(&event_tx, &mut event_log, turn_end).await;
+                    emit_and_persist(&event_tx, &mut guard.event_log, turn_end).await;
                 }
                 Some(SessionCmd::Abort) => {
                     // Top-level abort with no active turn — ignore.
@@ -320,7 +328,7 @@ impl ReActEngine {
             }
         }
 
-        guard.fire_and_drop(&mut event_log).await;
+        guard.fire_and_drop().await;
     }
 
     async fn resolve_provider_id(&self) -> String {
@@ -1011,9 +1019,11 @@ async fn finish_tool_call(
 }
 
 /// RAII 守卫：drop 时发 `AgentEnd`（除非已触发）。保证 panic 或任务
-/// abort 时 `AgentEnd` 也一定发出。
+/// abort 时 `AgentEnd` 也一定发出。持有 `EventLog` 唯一所有权，以便
+/// Drop 路径与正常路径共用同一 seq 写盘。
 struct AgentEndGuard {
     session_id: Uuid,
+    event_log: EventLog,
     event_tx: mpsc::Sender<AgentEvent>,
     fired: bool,
     total_usage: Arc<Mutex<Usage>>,
@@ -1025,7 +1035,7 @@ struct AgentEndGuard {
 impl AgentEndGuard {
     /// 显式触发 AgentEnd（正常退出路径调用，避免 Drop 不可控）。
     /// 先落盘再发送：resume 时靠读 events.log 区分"会话已结束"和"daemon 崩溃"。
-    async fn fire_and_drop(mut self, event_log: &mut EventLog) {
+    async fn fire_and_drop(mut self) {
         if self.fired {
             return;
         }
@@ -1046,7 +1056,7 @@ impl AgentEndGuard {
             reason,
             total_usage: usage,
         };
-        if let Err(e) = event_log.append(event.clone()) {
+        if let Err(e) = self.event_log.append(event.clone()) {
             tracing::warn!(error = ?e, "failed to persist AgentEnd");
         }
         let _ = self.event_tx.send(event).await.ok();
