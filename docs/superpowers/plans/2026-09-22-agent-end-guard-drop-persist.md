@@ -17,7 +17,7 @@
 - Drop 内禁止 `unwrap`/`expect` 落盘结果；失败仅 `tracing::warn`。
 - Drop **不**跑 async hooks；半成品 `TurnEnd` 仍靠 `replay_for_resume`。
 - 每个 task 结束后：`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` 必须通过。
-- `fire_and_drop` 顺序不变：hooks → 落盘 → `event_tx.send` → `fired = true`。
+- `fire_and_drop` 顺序不变：hooks → 落盘 → `fired = true` → `event_tx.send`（`fired` 在落盘后立刻置位，send 前唯一 await 点 abort 时 Drop 不再二次 append）。
 - Drop 顺序：组装 event → `event_log.append` → `try_send`（先落后发）。
 
 ---
@@ -87,8 +87,8 @@ impl AgentEndGuard {
         if let Err(e) = self.event_log.append(event.clone()) {
             tracing::warn!(error = ?e, "failed to persist AgentEnd");
         }
-        let _ = self.event_tx.send(event).await.ok();
         self.fired = true;
+        let _ = self.event_tx.send(event).await.ok();
     }
 }
 ```

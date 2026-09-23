@@ -1059,8 +1059,10 @@ impl AgentEndGuard {
         if let Err(e) = self.event_log.append(event.clone()) {
             tracing::warn!(error = ?e, "failed to persist AgentEnd");
         }
-        let _ = self.event_tx.send(event).await.ok();
+        // append 成功后立刻置位：send 是唯一 await 点，abort 在此
+        // Drop 会因 fired=true 跳过，避免二次 append（EventsAfterAgentEnd）。
         self.fired = true;
+        let _ = self.event_tx.send(event).await.ok();
     }
 }
 

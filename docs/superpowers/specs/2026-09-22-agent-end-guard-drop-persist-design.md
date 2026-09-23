@@ -46,7 +46,7 @@ struct AgentEndGuard {
 ### 2.3 `fire_and_drop(mut self)`（语义不变）
 
 - 删除 `event_log` 参数；用 `self.event_log` 完成 append。
-- 顺序保持：hooks → 落盘 → `event_tx.send` → `fired = true`。
+- 顺序保持：hooks → 落盘 → `fired = true` → `event_tx.send`。`fired` 在落盘后、send（唯一 await 点）前置位，避免 abort 窗口内 Drop 二次 append。
 
 ### 2.4 `Drop`
 
